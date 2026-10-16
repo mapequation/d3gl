@@ -7,7 +7,9 @@ import { GlBufferSpy, perfHost, sweepFrames } from "../../__tests__/engine-sweep
 
 /**
  * ENGINE-level zoom sweep for #445: `nodeFill: { by, scale }`, a `flowBorder.color` accessor and
- * `flowBorder.moduleFlow` on a module map, through the real `net.setTransform()` on WebGL. The node guard
+ * `flowBorder.moduleFlow` on a module map, through the real `net.setTransform()` on WebGL — and for #494's
+ * `nodeFill: { by: "module" }`, whose module-tree aggregates take their own module's colour: the accessor is
+ * asked once per module (aggregates included) and never during a sweep, LOD on, every module open and off. The node guard
  * (`fill-by-metric-perf.test.ts`) drives the frontier build at 1M; this one drives the engine glue, where
  * an accessor re-run per re-cut (or a per-frame re-upload) would hide.
  *
@@ -58,10 +60,13 @@ function fixture(n: number) {
 
 interface Leg { uploadedBytes: number; created: number; deleted: number; worstFrameMs: number; frames: number; calls: number }
 
-const calls = { scale: 0, color: 0, moduleFlow: 0 };
-const total = () => calls.scale + calls.color + calls.moduleFlow;
+const calls = { scale: 0, color: 0, moduleFlow: 0, module: 0 };
+const total = () => calls.scale + calls.color + calls.moduleFlow + calls.module;
 let atStyle = { ...calls };
 let lodBase: Leg, lodNew: Leg, openNew: Leg, openBase: Leg, fullBase: Leg, fullNew: Leg;
+let lodModule: Leg, openModule: Leg, fullModule: Leg;
+let moduleCallsAtStyle = 0;
+let moduleCallsAtLod = 0;
 let registrationUploadedBytes = 0;
 
 beforeAll(async () => {
@@ -81,6 +86,8 @@ beforeAll(async () => {
         moduleFlow: (path) => (calls.moduleFlow++, path.length === 2 ? path[1]! / N : undefined),
       },
     };
+    // #494 review: `{ by: "module" }` — a node takes its module's colour, and a module-tree aggregate its own.
+    const byModule: NetworkStyle = { ...baseline, nodeFill: { by: "module", color: (path) => (calls.module++, ["#4878d0", "#ee854a", "#6acc64"][path.length % 3]) } };
     const net = network(perfHost(W, H), { width: W, height: H, backend: "webgl" });
     await net.whenReady();
     const atStart = spy.mark();
@@ -111,6 +118,14 @@ beforeAll(async () => {
     fullBase = runLeg();
     net.style(byMetric);
     fullNew = runLeg();
+    net.style(byModule); // LOD off: the leaves ask their bottom modules
+    moduleCallsAtStyle = calls.module;
+    fullModule = runLeg();
+    net.lod({ declutter: true }); // the module tree's aggregates ask only the modules no leaf holds
+    moduleCallsAtLod = calls.module;
+    lodModule = runLeg();
+    net.lod({ expandPx: 1e-6, declutter: false });
+    openModule = runLeg();
     net.destroy();
   } finally {
     spy.restore();
@@ -149,5 +164,19 @@ describe(`network() nodeFill { by } + moduleFlow zoom sweep at N=${N.toLocaleStr
     expect(fullNew.created).toBe(0);
     expect(fullNew.worstFrameMs, `worst frame ${fullNew.worstFrameMs.toFixed(2)}ms`).toBeLessThan(FRAME_MS_STATIC);
     expect(fullNew.worstFrameMs).toBeLessThan(3 * fullBase.worstFrameMs + perfBudget(2));
+  });
+
+  it("nodeFill { by: 'module' } (#494 review): one accessor call per module, aggregates included; none per frame", () => {
+    const bottoms = Math.ceil(N / 64);
+    const tops = Math.ceil(N / (64 * 16));
+    expect(moduleCallsAtStyle, "the leaves ask each bottom module once").toBe(bottoms);
+    expect(moduleCallsAtLod, "the root, the top modules and the bottom modules, each asked once").toBe(1 + tops + bottoms);
+    expect(lodModule.calls, "accessor calls during the module-LOD sweep").toBe(0);
+    expect(openModule.calls, "accessor calls during the all-open sweep").toBe(0);
+    expect(fullModule.calls, "accessor calls during the full-detail sweep").toBe(0);
+    expect(lodModule.worstFrameMs, `${lodModule.worstFrameMs.toFixed(2)}ms vs ${lodBase.worstFrameMs.toFixed(2)}ms baseline`).toBeLessThan(3 * lodBase.worstFrameMs + perfBudget(5));
+    expect(openModule.worstFrameMs, `${openModule.worstFrameMs.toFixed(1)}ms vs ${openBase.worstFrameMs.toFixed(1)}ms baseline`).toBeLessThan(2 * openBase.worstFrameMs + perfBudget(5));
+    expect(fullModule.uploadedBytes, "full-detail sweep re-uploaded geometry").toBeLessThan(registrationUploadedBytes / 1000);
+    expect(fullModule.worstFrameMs).toBeLessThan(3 * fullBase.worstFrameMs + perfBudget(2));
   });
 });

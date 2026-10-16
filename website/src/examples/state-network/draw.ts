@@ -27,9 +27,10 @@ const palette = (path: readonly number[]): string | undefined =>
  *   links: the memory structure in its physical context. Hover, click or drag a container: it acts as
  *   its state nodes.
  *
- * **Colours** — with no `nodeFill`, the engine colours modules itself; `nodeFill: { by: "module", color }`
- * takes your own palette (a colour per module path) for state nodes, pie wedges and physical discs in every
- * view. **Modules: Off** loads the raw state network (no Infomap yet): the views still switch, without pies.
+ * **Colours** — with no palette, the engine colours modules itself; `style({ moduleColor })` takes your own
+ * (a colour per module path) for state nodes, pie wedges, physical discs and containers in every view, and the
+ * pie wedges keep it when `nodeFill` colours the nodes by a metric. **Modules: Off** loads the raw state
+ * network (no Infomap yet): the views still switch, without pies.
  * A view switch carries the selection over (a physical node ↔ its state nodes), and every hit, selection
  * and label names its `level` ("physical" or "state"), so the tooltip and labels below need no id mapping.
  *
@@ -99,10 +100,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
       let hiFlow = 0;
       for (const f of g.graph.physical.flow!) if (f > hiFlow) hiFlow = f;
-      // Without a nodeFill the engine colours modules itself; `{ by: "module", color }` takes the app's palette
-      // in every view. The "both" view sizes its state dots to their containers itself (in world units).
+      // Without a palette the engine colours modules itself; `moduleColor` gives the app's palette to every view's
+      // nodes, containers and pie wedges (and keeps the pies in it when `nodeFill` colours nodes by a metric).
+      // The "both" view sizes its state dots to their containers itself (in world units).
       net.style({
-        nodeFill: options.colors === "Palette" ? { by: "module", color: palette } : undefined,
+        moduleColor: options.colors === "Palette" ? palette : undefined,
         directed: true,
         sizeMode: options.sizing === "World" ? "world" : "screen",
         linkStyle: halfArrow ? "half-arrow" : "line",

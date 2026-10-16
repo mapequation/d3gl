@@ -32,7 +32,13 @@ import { GlBufferSpy, perfHost, sweepFrames, zoomSteps, type GlBufferUsage } fro
  * **Reductions:** the both view draws every container with its state nodes (LOD applies to the state view,
  * #495), so the "LOD on" state here is an app that asked for LOD while in this view — the Navigator's order.
  * The leg pins that the request changes nothing: the full-detail lane and its containers stay, with the
- * same hover and zoom signatures.
+ * same hover and zoom signatures. The engine keeps the request (#494 review): the **state view** leg switches
+ * to it and finds that LOD drawn, then cuts the state graph's module tree, whose aggregates take their own
+ * module's colour — a zoom sweep with that cut (reductions ON) and without it (OFF) asks the colour accessor
+ * zero times, and over the whole run every module path is asked exactly once.
+ *
+ * The app's style is the Navigator's `sizeMode: "screen"`: the both view's nodes stay world-sized and its links
+ * keep px widths (#494 review), so every both-view leg runs the px-link-over-world-node path.
  *
  * ONE ENGINE for every leg — never a second WebGL engine after a large one (#287).
  */
@@ -67,6 +73,11 @@ const SELECT_SLACK_BYTES = 16 * 1024;
 const HOVER_MS = perfBudget(1 + (0.5 * N) / 20_000);
 const DRAG_MOVE_MS = perfBudget(2 + (4 * N) / 20_000);
 const STREAM_FRAME_MS = perfBudget(4 + (12 * N) / 20_000);
+// - a state-view zoom frame (#494 review) with module LOD re-cuts the state graph's module tree and emits the
+//   frontier: worst 4.5 / 8.6 ms → 25 / 45 ms (~5x); with LOD off the static lane writes a uniform: 0.0 / 0.0 ms,
+//   the static-emit ceiling of the other network guards.
+const STATE_LOD_FRAME_MS = perfBudget(20 + (5 * N) / 20_000);
+const STATE_OFF_FRAME_MS = perfBudget(4 + (4 * N) / 20_000);
 const SETUP_MS = perfBudget(120_000 + N / 2);
 
 /** A network whose streamed layout frame a guard can drive itself (the protected seam a real stream calls). */
@@ -186,6 +197,15 @@ let zoomOff: { baseEmits: number; colorCalls: number; gpu: GlBufferUsage; frames
 let dragOff: { moves: number; containerEmits: number; sameColumns: boolean; sameSelected: boolean; colorCalls: number; moved: boolean; worstMs: number; medianMs: number };
 let streamOff: { frames: number; colorCalls: number; containerEmits: number; radiiChanged: boolean; worstMs: number; medianMs: number };
 let lodAsked: { containersLive: boolean; nodesLive: boolean; hover: EventLeg; zoomBaseEmits: number; colorCalls: number };
+let stateView: {
+  remembered: string;
+  source: string;
+  callsAtLod: number;
+  lod: { calls: number; worstMs: number; frames: number; gpu: GlBufferUsage };
+  off: { calls: number; baseEmits: number; worstMs: number; gpu: GlBufferUsage };
+};
+let colorCallsTotal = 0;
+let modulesAsked = 0;
 
 const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
@@ -212,7 +232,8 @@ beforeAll(async () => {
     const net = new StreamProbe(h, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
     net
-      .style({ nodeFill: { by: "module", color }, linkStroke: "rgba(90,110,150,0.5)" })
+      // The Navigator's screen sizeMode: the both view's nodes stay world-sized, its links px-sized (#494 review).
+      .style({ nodeFill: { by: "module", color }, linkStroke: "rgba(90,110,150,0.5)", sizeMode: "screen" })
       .stateNetwork(fx.graph, { modules: fx.modules, view: "both" })
       .layout({ backend: "positions", positions: fx.positions });
     net.setTransform({ k: K, x: 0, y: 0 });
@@ -408,6 +429,32 @@ beforeAll(async () => {
       sweepFrames(zoomSteps(W, H, [1, 2, 4, 8, 16]), (t) => net.setTransform(t));
       lodAsked = { containersLive: live, nodesLive, hover, zoomBaseEmits: lane.baseEmits(), colorCalls: colorCalls - colorBefore };
     }
+
+    // ── The state view (#494 review): the request made in the both view applies on the switch, and a module cut
+    //    colours its aggregates by their own modules, resolved once per (tree, style), never per frame ─────────
+    {
+      net.view("state");
+      const remembered = net.lodSource;
+      const atLod = colorCalls;
+      net.lod({ modules: fx.modules, declutter: true });
+      const callsAtLod = colorCalls - atLod;
+      const source = net.lodSource;
+      const steps = zoomSteps(W, H, [0.25, 0.5, 1, 2, 4, 8, 16]);
+      sweepFrames(steps, (t) => net.setTransform(t), 1); // warm
+      let before = gl.mark();
+      let c0 = colorCalls;
+      const lodSweep = sweepFrames(steps, (t) => net.setTransform(t));
+      const lodLeg = { calls: colorCalls - c0, worstMs: lodSweep.worstFrameMs, frames: lodSweep.frames, gpu: gl.since(before) };
+      net.lod(false);
+      sweepFrames(steps, (t) => net.setTransform(t), 1);
+      lane.reset();
+      before = gl.mark();
+      c0 = colorCalls;
+      const offSweep = sweepFrames(steps, (t) => net.setTransform(t));
+      stateView = { remembered, source, callsAtLod, lod: lodLeg, off: { calls: colorCalls - c0, baseEmits: lane.baseEmits(), worstMs: offSweep.worstFrameMs, gpu: gl.since(before) } };
+    }
+    colorCallsTotal = colorCalls;
+    modulesAsked = seen.size;
     net.destroy();
     h.remove();
   } finally {
@@ -481,5 +528,23 @@ describe(`state-network both view — per-interaction cost at N=${N.toLocaleStri
     expect(lodAsked.zoomBaseEmits, "a zoom re-emitted the lane").toBe(0);
     expect(lodAsked.colorCalls).toBe(0);
     expect(lodAsked.hover.medianMs).toBeLessThan(HOVER_MS);
+  });
+
+  it("state view: the LOD asked for in the both view applies on the switch (#494 review, 2)", () => {
+    expect(stateView.remembered, "the state view came back without the app's LOD").not.toBe("none");
+    expect(stateView.source).toBe("modules");
+  });
+
+  it("state view, module LOD: aggregates take their own module colour, resolved once per module, none per frame", () => {
+    // Every module path is asked once over the whole run — state dots, physical discs, pies and aggregates.
+    expect(colorCallsTotal, "a module colour was asked more than once").toBe(modulesAsked);
+    expect(stateView.callsAtLod, "the cut's modules were never resolved: the leg is vacuous").toBeGreaterThan(0);
+    expect(stateView.lod.calls, "a zoom frame asked the colour accessor (reductions ON)").toBe(0);
+    expect(stateView.lod.gpu.created, "the LOD sweep churned GPU buffers").toBeLessThan(64);
+    expect(stateView.lod.worstMs, `LOD zoom frame ${stateView.lod.worstMs.toFixed(2)}ms`).toBeLessThan(STATE_LOD_FRAME_MS);
+    expect(stateView.off.calls, "a zoom frame asked the colour accessor (reductions OFF)").toBe(0);
+    expect(stateView.off.baseEmits, "a full-detail zoom re-emitted the lane").toBe(0);
+    expect(stateView.off.gpu.created).toBe(0);
+    expect(stateView.off.worstMs, `full-detail zoom frame ${stateView.off.worstMs.toFixed(2)}ms`).toBeLessThan(STATE_OFF_FRAME_MS);
   });
 });

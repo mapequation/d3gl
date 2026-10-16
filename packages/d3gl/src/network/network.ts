@@ -1,16 +1,16 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, linkSizeModeOf, linkRadiiWorld, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./nested-layout.js";
 import { NestedDrag, NestedDragCache } from "./nested-drag.js";
 import { easeCubicOut, positionTransition, type PositionTransition } from "./transition.js";
-import { moduleColors, nodeModules, type ModulePathNode, type ModuleColorOptions, type NodeModules } from "./module-colors.js";
+import { moduleColors, nodeModules, moduleAggregateColors, type ModulePathNode, type ModuleColorOptions, type NodeModules } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
@@ -223,6 +223,16 @@ export interface NetworkStyle {
    * flow (#445). Resolved once per call — no per-frame cost. @see {@link NodeFillSpec}
    */
   nodeFill?: NodeFillSpec;
+  /**
+   * The app's colour for a module, by its module path (#494): `(modulePath) => cssColour | undefined`, e.g.
+   * `@mapequation/c3`'s `hierarchy().colorOf`. Whatever {@link nodeFill} is, a state network's **pie wedges**
+   * take it (else they keep the engine's own colours); a `nodeFill: { by: "module" }` without its own `color`
+   * takes it; and a state network with no `nodeFill` colours its nodes, discs and containers by it instead of
+   * the engine's palette. So nodes can be filled by flow or metadata while the pies keep the app's module
+   * colours. Asked once per module per `style()` call — a later `style({ moduleColor })` recolours — never per
+   * frame; `undefined` (no colour for a module) takes the default fill.
+   */
+  moduleColor?: ModuleColor;
   /**
    * Constant border ring (#104 rework): a fixed **pixel** outline on every node/module (e.g.
    * `{ width: 1, color: "#fff" }`). Independent of {@link flowBorder} (which encodes flow);
@@ -1194,6 +1204,9 @@ export class Network extends BaseEngine {
   /** The LOD lane's last emitted style columns ({@link frontierLayers}): an unchanged column is re-emitted
    *  as the same array so its GPU re-upload is skipped. Cleared whenever the LOD lane stops emitting. */
   private readonly lodColumns = new StableColumns();
+  /** The pie layer's columns (#494): an emit hands back the previous array of a column whose values held, so the
+   *  WebGL pie skips its upload — a palette `style()` uploads the colours alone, a drag frame the centres. */
+  private readonly pieColumns = new StableColumns();
   /** Engine-owned {@link superEdges} scratch (#210): reused every LOD emit so the per-frame gather is
    *  O(frontier + drawn super-edges) — no O(tree.size) allocation per zoom frame. Shared by the WebGL
    *  lane emit and the retained-Scene registration (they never run concurrently; outputs never alias it). */
@@ -1232,13 +1245,18 @@ export class Network extends BaseEngine {
   private stateColorOpts: ModuleColorOptions | undefined = undefined;
   /** The module each node of a view's graph is coloured by (#494): a state node's enclosing module, a
    *  physical node's (first) module at the pie level. Built once per state network, on first use. */
-  private stateNodeModules: { state: NodeModules; physical: NodeModules } | null = null;
+  private stateNodeModules: { state: NodeModules; physical: NodeModules; wedge: Int32Array } | null = null;
   /** A plain network's {@link NodeModules} for `nodeFill: { by: "module" }` (#494), per hierarchy. */
   private hierarchyNodeModules: { hierarchy: object; modules: NodeModules } | null = null;
   /** The resolved module fills of a state network (#494), kept across the both view's radius-only
    *  re-resolutions (one per streamed layout frame), so a frame never asks a colour accessor again. Keyed by
    *  the fill spec; dropped by `style()` and a new state network. */
-  private stateFills: { spec: NodeFillSpec | undefined; state?: ResolvedNodeFill; physical?: ResolvedNodeFill; pie?: Uint8Array } | null = null;
+  private stateFills: { spec: NodeFillSpec | undefined; state?: ResolvedNodeFill; physical?: ResolvedNodeFill; pie?: Uint8Array; palettes: ModulePalette[] } | null = null;
+  /** {@link fillSpec}'s result for the style's (nodeFill, moduleColor) and whether a state network has modules. */
+  private fillSpecKept: { nodeFill: NodeFillSpec | undefined; moduleColor: ModuleColor | undefined; state: boolean; spec: NodeFillSpec | undefined } | null = null;
+  /** The module colours of a module tree's aggregates (#494) under a `{ by: "module" }` fill, per (tree, style):
+   *  built when the style is applied to the tree, never per frame. */
+  private moduleAggregateFill: { tree: LODTree; palette: ModulePalette; fill: FillAggregate | undefined } | null = null;
   /** `both`-view physical **container** radii (world units), sized so a physical node's confined state
    *  rosette fits inside it. Computed from the physical positions, relative to {@link stateSpacing}. */
   private containerRadii: Float32Array | null = null;
@@ -1258,6 +1276,9 @@ export class Network extends BaseEngine {
   /** `both`-view state-node `groups2` column (#494): `stateCount + physical`, so hovering a container (that
    *  id) keeps its state dots lit. Built once per state network. */
   private bothNodeGroups2: Float32Array | null = null;
+  /** The LOD the app asked for in state-network mode (#494), kept across view switches; each view applies the
+   *  part it takes ({@link viewLOD}) as {@link lodOptions}. Dropped by a new state network, as `lodOptions` is. */
+  private stateLODRequest: NetworkLODOptions | null = null;
   /** State-view rosette radius override (world units); null = auto from the physical layout scale. */
   private rosetteRadius: number | null = null;
   /** Registry key + layer name for the physical-view pie glyphs (drawn on top of the node discs). */
@@ -1318,12 +1339,19 @@ export class Network extends BaseEngine {
     this.bothDotMax = 0;
     this.bothNodeGroups2 = null;
     this.stateSpacing = 0;
+    this.pieColumns.clear(); // the previous network's wedges
   }
 
   /** Point the engine at `graph` and drop the per-graph caches (LOD tree, resolved style, parent cache).
    *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
    *  `data` it does NOT clear the state-network mode. */
   private setActiveGraph(graph: NetworkGraph): this {
+    this.adoptGraph(graph);
+    return this.rebuild();
+  }
+
+  /** {@link setActiveGraph} without its rebuild: the caller rebuilds once it is done with the new graph. */
+  private adoptGraph(graph: NetworkGraph): void {
     this.moved = null; // leaf ids of the previous graph: the rebuild below draws the new one in full
     this.haltLayout(); // any worker layout is tied to the previous graph's buffers
     this.graph = graph;
@@ -1347,6 +1375,7 @@ export class Network extends BaseEngine {
     this.laidOut = false;
     this.nestedDiscs = null;
     this.lodBorderStyle = null; // the previous graph's tree and its ring colours
+    this.moduleAggregateFill = null; // and its module colours (#494)
     this.boundaryWidths = null; // and its module-boundary widths
     this.lodTree = null;
     this.lodWorkerTree = null;
@@ -1362,7 +1391,6 @@ export class Network extends BaseEngine {
     this.linkColors = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     this.fitBound = null; // tied to the old graph
-    return this.rebuild();
   }
 
   /**
@@ -1394,6 +1422,7 @@ export class Network extends BaseEngine {
     // graph, so a stale `lod({ modules })` would fail `buildModuleLODTree`'s "record for every node" check
     // when `layout()` rebuilds the tree below. Callers re-apply `lod()` after `layout()` with fresh modules.
     this.lodOptions = null;
+    this.stateLODRequest = null;
     this.hierarchy = null; // a plain graph's hierarchy (#326) doesn't describe the state network
     // Without modules (#494): no pies and no module colours; every view still draws.
     this.stateModules = opts.modules ?? null;
@@ -1412,7 +1441,7 @@ export class Network extends BaseEngine {
    *
    *  The selection follows the switch (#316, #494): a physical node becomes all its state nodes, a state node
    *  (or a `both`-view container's state nodes) its physical node, and `on("select")` hears the mapped
-   *  selection. The hover is cleared. */
+   *  selection. The hover is cleared. The app's {@link lod} carries over: the new view applies what it takes. */
   view(view: "state" | "physical" | "both"): this {
     if (!this.stateData || view === this.activeView) return this;
     const sel = this.selectedIds(this.NODE_LAYER);
@@ -1483,10 +1512,24 @@ export class Network extends BaseEngine {
     const physical = this.activeView === "physical";
     // The view's fill and the both view's dot radii are resolved from the view at style resolution
     // ({@link resolvedStyle}, #494): a switch never writes the app's style.
-    // LOD is only defined for the state view (its nodes carry the module tree); physical/both draw full.
-    if (this.activeView !== "state" && this.lodOptions) this.lodOptions = null;
+    // The app's LOD, remembered across switches (#494), applied as far as this view takes it ({@link viewLOD}).
+    this.lodOptions = this.stateLODRequest ? this.viewLOD(this.stateLODRequest) : null;
     this.deriveStatePositions(); // view-dependent rosette (spread vs. container-confined)
-    this.setActiveGraph(physical ? sg.physical : sg.state);
+    this.adoptGraph(physical ? sg.physical : sg.state);
+    // The new graph's tree, built before the one rebuild (as lod() would after the switch): O(tree size), per switch.
+    if (this.lodOptions) this.recomputeLODGeometry();
+    this.rebuild();
+  }
+
+  /**
+   * The part of the app's LOD request `options` the active state-network view takes (#494): the state view
+   * all of it; the physical view a request that names no module partition (`modules` are the state nodes',
+   * so they cannot cut the physical graph; a structural or spatial cut can, as before); the both view none
+   * (its containers hold every state node). O(1).
+   */
+  private viewLOD(options: NetworkLODOptions): NetworkLODOptions | null {
+    if (!this.stateData || this.activeView === "state") return options;
+    return this.activeView === "physical" && !options.modules ? options : null;
   }
 
   /** Size the container / rosette radii against the current physical layout, so they track the layout scale
@@ -1589,17 +1632,29 @@ export class Network extends BaseEngine {
    * (#343) groups nodes by position — on the worker and GPU backends a worker rebuilds that tree on every
    * streamed frame, so call this before `layout()` there too. `lod(false)` turns LOD off but keeps the
    * hierarchy, so re-enabling reuses its tree.
+   *
+   * In state-network mode ({@link stateNetwork}, #494) the request holds across {@link view} switches, and each
+   * view applies what it can: the state view all of it, the physical view a structural or spatial cut (not a
+   * `modules` partition, which names state nodes), the both view none (its containers hold every state node).
+   * Call it once, in any view. A new {@link stateNetwork} drops it.
    */
   lod(options: NetworkLODOptions | false): this {
-    // The `both` view draws every container with its state nodes inside (#494): LOD does not apply there, and
-    // asking for it must not swap the containers for a frontier of state nodes. A view switch starts without LOD.
-    if (options && this.stateData && this.activeView === "both") return this;
+    if (this.stateData) {
+      // State-network mode (#494): the request is remembered across view switches, and each view applies what
+      // it can take ({@link viewLOD}) — so an app calls lod() once, in any view. A view that takes none (the
+      // both view, whose containers hold every state node) keeps drawing in full: nothing to change here.
+      this.stateLODRequest = options || null;
+      const applied = options ? this.viewLOD(options) : null;
+      if (!applied && !this.lodOptions) return this;
+      options = applied ?? false;
+    }
     if (!options) {
       this.releaseStreamedTrees(true); // nothing draws a spatial worker tree any more (#343)
       this.leafIncidence = null;
       this.leafEdgeEntries = null;
       this.lodOptions = null;
       this.lodTree = null;
+      this.moduleAggregateFill = null; // holds the tree (#494)
       this.lodWorkerTree = null;
       this.lodWorkerSource = null;
       this.lodSpatial = false;
@@ -2918,6 +2973,14 @@ export class Network extends BaseEngine {
     const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width))) : resolved.nodeRadii;
     const pie = physicalPieInstances(this.pieWedges, graph.positions, radii, this.pieColors() ?? undefined);
     if (pie.count === 0) return null;
+    // Unchanged columns go out as the arrays last emitted (one compare pass each, O(wedges), on an emit that is
+    // O(wedges) already), so the GPU layer re-uploads only what changed.
+    const cols = this.pieColumns;
+    pie.centers = cols.float32("centers", pie.centers);
+    pie.radii = cols.float32("radii", pie.radii);
+    pie.angles = cols.float32("angles", pie.angles);
+    pie.colors = cols.uint8("colors", pie.colors);
+    if (pie.groups) pie.groups = cols.float32("groups", pie.groups);
     // #175: the per-wedge `selected` flags travel ON the emit (like the nodes' via attachNoLodHighlight).
     // A flag-less emit would zero-fill the GPU column (HighlightBuffers.write) on the next layout/drag
     // frame and dim the selected pie too. Cached per selection version, so a position-only frame hands
@@ -2969,7 +3032,7 @@ export class Network extends BaseEngine {
    *  engine's own with no `nodeFill`), else the app's single colour, else the default. Per-node RGBA or one CSS. */
   private containerFill(): { rgba: Uint8Array | null; css: string } {
     const sg = this.stateData;
-    const spec = this.styleOpts.nodeFill;
+    const spec = this.fillSpec();
     if (sg && (spec === undefined || isModuleFill(spec))) {
       const fill = this.resolvedFill(sg.physical);
       return { rgba: fill.nodeColors ?? null, css: fill.nodeFill };
@@ -4776,8 +4839,8 @@ export class Network extends BaseEngine {
     // When sizing by an additive metric, aggregates size by the leaf scale on their summed value
     // (flow-sized modules); else null ⇒ the area-additive √Σr² fallback.
     const radiusAggregate = resolved.nodeRadiusAggregate ?? undefined;
-    // `nodeFill: { by, scale }` (#445): aggregates fill by the scale on their summed metric, likewise.
-    const fillAggregate = resolved.nodeFillAggregate;
+    // `nodeFill: { by, scale }` (#445): aggregates fill by the scale on their summed metric, likewise; and under
+    // `{ by: "module" }` a module tree's aggregates take their own module's colour (#494, {@link lodFillAggregate}).
     // Declutter importance (per-leaf, summed up the tree): defaults to the size metric — see resolveImportance.
     const leafWeight = resolved.importance;
     // Tree choice — the priority chain (epic #98): a module hierarchy (an explicit `lod({ modules })`,
@@ -4813,7 +4876,7 @@ export class Network extends BaseEngine {
           header.crowding = true;
         }
       } else {
-        computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate);
+        computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodFillAggregate(this.lodWorkerTree, resolved));
         this.applyLODBorderStyle(this.lodWorkerTree, resolved);
         // A streaming worker writes no crowding (#426); once it has settled (idle, writing nothing) the
         // crowding is computed here, once — at the settle, and for a new style.
@@ -4876,7 +4939,7 @@ export class Network extends BaseEngine {
       this.lodSpatial = false;
       this.lodModules = false;
     }
-    computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds, fillAggregate);
+    computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds, this.lodFillAggregate(this.lodTree, resolved));
     this.applyLODBorderStyle(this.lodTree, resolved);
     this.updateLODCrowding(this.lodTree);
     this.lodHasGeometry = true;
@@ -5045,19 +5108,22 @@ export class Network extends BaseEngine {
     // constant-px render — including the non-linear tip/bend terms a naive per-size ÷k would distort
     // (the gap would grow with zoom). Refreshed on backend switch (here), at interaction-end
     // (setInteracting) and on demand (syncScreenGeometry).
-    const bake = halfArrow && style.sizeMode === "screen" ? this.transform.k || 1 : 1;
+    // The links' own units (#494: the both view's px links over world-sized dots, whose radii then bake ×k too).
+    const linkMode = linkSizeModeOf(style);
+    const bake = halfArrow && linkMode === "screen" ? this.transform.k || 1 : 1;
     // The plain line-style arrowhead bakes the same way (its tip + node-boundary setback are px in
     // screen mode); baked geometry is world-coord, so the layer renders "world" and re-bakes on zoom-end.
-    const arrowBake = !halfArrow && style.directed && style.sizeMode === "screen" ? this.transform.k || 1 : 1;
+    const arrowBake = !halfArrow && style.directed && linkMode === "screen" ? this.transform.k || 1 : 1;
+    const radiiWorld = linkRadiiWorld(style);
     this.registerLayer({
       name: "links",
       data: edgeIds,
       ids: edgeIds,
-      sizeMode: halfArrow ? "world" : style.sizeMode,
+      sizeMode: halfArrow ? "world" : linkMode,
       ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit || !drawLinks) return;
-        if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend, bake);
+        if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend, bake, radiiWorld ? bake : 1);
         else emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
     });
@@ -5066,10 +5132,10 @@ export class Network extends BaseEngine {
       data: edgeIds,
       ids: edgeIds,
       // Baked screen-mode arrows live in world coords (like the half-arrow); world mode passes through.
-      sizeMode: arrowBake !== 1 ? "world" : style.sizeMode,
+      sizeMode: arrowBake !== 1 ? "world" : linkMode,
       fill: (e) => linkColorAt(e as number),
       build: (g) => {
-        if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
+        if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake, radiiWorld ? arrowBake : 1);
       },
     });
     // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the
@@ -5318,7 +5384,7 @@ export class Network extends BaseEngine {
     });
     // nodeFill: a single colour, a per-node accessor, { by, scale } or { by: "module" } → packed RGBA (+ how
     // aggregates fill). In a state network, per level and kept across radius-only re-resolutions (#494).
-    const { nodeFill, nodeColors, fillAggregate: nodeFillAggregate } = this.resolvedFill(graph);
+    const { nodeFill, nodeColors, fillAggregate: nodeFillAggregate, modulePalette: nodeModulePalette } = this.resolvedFill(graph);
     // The both view draws its state dots at the engine's world-unit radii, sized to their containers (#494).
     const bothDots = this.stateData && this.activeView === "both" && graph === this.stateData.state ? this.bothDots() : null;
     // Constant border (px). flowBorder wins if both are set.
@@ -5326,6 +5392,7 @@ export class Network extends BaseEngine {
     const constBorder: ConstBorder | null =
       nb && !this.styleOpts.flowBorder ? { width: nb.width, color: rgbaBytes(nb.color ?? "#ffffff") } : null;
     const nodeRadiusSpec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
+    const appSizeMode = this.styleOpts.sizeMode ?? "world";
     return {
       nodeRadii: bothDots ?? resolveNodeRadii(graph, nodeRadiusSpec),
       nodeRadiusAggregate: bothDots ? null : resolveNodeRadiusAggregate(graph, nodeRadiusSpec),
@@ -5333,6 +5400,7 @@ export class Network extends BaseEngine {
       nodeFill,
       nodeColors,
       nodeFillAggregate,
+      nodeModulePalette,
       linkWidth,
       linkWidthOf,
       linkStroke,
@@ -5344,8 +5412,10 @@ export class Network extends BaseEngine {
       // visible for thin links (sublinear) without ballooning for thick ones.
       arrowSize: this.styleOpts.arrowSize ?? 5 * Math.cbrt(linkWidth),
       directed: this.styleOpts.directed ?? graph.directed,
-      // The both view is a world-unit picture (dots confined to world-sized containers), whatever the app's sizeMode.
-      sizeMode: bothDots ? "world" : (this.styleOpts.sizeMode ?? "world"),
+      // The both view's nodes are a world-unit picture (dots confined to world-sized containers), whatever the
+      // app's sizeMode; its links and arrowheads keep the app's sizeMode (#494), px-wide over world-sized dots.
+      sizeMode: bothDots ? "world" : appSizeMode,
+      ...(bothDots && appSizeMode !== "world" ? { linkSizeMode: appSizeMode } : {}),
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
       constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,
@@ -5353,14 +5423,49 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The node fill of `graph` (#494). A plain network resolves the style's `nodeFill`, a module fill through
-   * the hierarchy `data()` holds. In a state network, each level (the state graph, the physical graph) is
+   * How `tree`'s aggregates are filled under `resolved` (#445, #494): `{ by, scale }` by the scale on their summed
+   * metric; a module colour on a module tree by each aggregate's own module's colour (`color(hit.path)`, from the
+   * nodes' {@link ModulePalette}, so a module they resolved is not asked again) — kept per (tree, palette), so a
+   * frame's style pass copies it and asks no accessor; anything else (a spatial or structural tree, whose
+   * aggregates are no modules) by its members' colour mean.
+   */
+  private lodFillAggregate(tree: LODTree, resolved: ResolvedNetworkStyle): FillAggregate | undefined {
+    const palette = resolved.nodeModulePalette;
+    if (!palette || !tree.branch) return resolved.nodeFillAggregate;
+    const kept = this.moduleAggregateFill;
+    if (kept && kept.tree === tree && kept.palette === palette) return kept.fill;
+    const aggregateRGBA = moduleAggregateColors(tree, palette.paths, (m) => paletteRGBA(palette, m), (path) => pathRGBA(palette, path));
+    const fill = aggregateRGBA ? { aggregateRGBA } : undefined;
+    this.moduleAggregateFill = { tree, palette, fill };
+    return fill;
+  }
+
+  /**
+   * The node fill the style resolves (#494): `nodeFill`, except that a `{ by: "module" }` without its own `color`
+   * takes the style's `moduleColor`, and a state network with modules and no `nodeFill` colours its modules by
+   * `moduleColor` when the app set one (else by the engine's own palette). Kept per (nodeFill, moduleColor), so
+   * its identity keys the kept fills. O(1).
+   */
+  private fillSpec(): NodeFillSpec | undefined {
+    const { nodeFill, moduleColor } = this.styleOpts;
+    const state = !!this.stateModules;
+    const kept = this.fillSpecKept;
+    if (kept && kept.nodeFill === nodeFill && kept.moduleColor === moduleColor && kept.state === state) return kept.spec;
+    const byPalette = moduleColor && ((isModuleFill(nodeFill) && !nodeFill.color) || (nodeFill === undefined && state));
+    const spec: NodeFillSpec | undefined = byPalette ? { by: "module", color: moduleColor } : nodeFill;
+    this.fillSpecKept = { nodeFill, moduleColor, state, spec };
+    return spec;
+  }
+
+  /**
+   * The node fill of `graph` (#494). A plain network resolves the style's fill ({@link fillSpec}), a module fill
+   * through the hierarchy `data()` holds. In a state network, each level (the state graph, the physical graph) is
    * resolved once per style and kept: the both view re-resolves its style on every streamed layout frame for
-   * its dot radii, and must not ask a colour accessor again each time. With no `nodeFill` set, a state
+   * its dot radii, and must not ask a colour accessor again each time. With no fill and no `moduleColor`, a state
    * network with modules takes the engine's own module colours ({@link StateNetworkOptions.color}).
    */
   private resolvedFill(graph: NetworkGraph): ResolvedNodeFill {
-    const spec = this.styleOpts.nodeFill;
+    const spec = this.fillSpec();
     const sg = this.stateData;
     if (!sg) return resolveNodeFill(graph, spec, DEFAULT_NODE_FILL, isModuleFill(spec) ? this.hierarchyModules() : null);
     const level = graph === sg.physical ? "physical" : "state";
@@ -5374,8 +5479,19 @@ export class Network extends BaseEngine {
 
   /** {@link stateFills} for `spec`: the kept fills while the spec is the same object, else a fresh entry. */
   private stateFillsFor(spec: NodeFillSpec | undefined): NonNullable<Network["stateFills"]> {
-    if (!this.stateFills || this.stateFills.spec !== spec) this.stateFills = { spec };
+    if (!this.stateFills || this.stateFills.spec !== spec) this.stateFills = { spec, palettes: [] };
     return this.stateFills;
+  }
+
+  /** The state network's {@link ModulePalette} of `color` for this style (#494), over its interned modules: one per
+   *  colour function, shared by both levels, the pies and the state view's module aggregates. */
+  private statePalette(color: ModuleColor): ModulePalette {
+    const fills = this.stateFillsFor(this.fillSpec());
+    const known = fills.palettes.find((p) => p.color === color);
+    if (known) return known;
+    const palette = modulePalette(this.levelModules().state.paths, color, DEFAULT_NODE_FILL);
+    fills.palettes.push(palette);
+    return palette;
   }
 
   /** Resolve `spec` for one level of the state network: O(nodes of that level), plus one colour per module. */
@@ -5384,61 +5500,68 @@ export class Network extends BaseEngine {
     const modules = this.stateModules;
     const wedges = this.pieWedges;
     if (!modules || !wedges) return { nodeFill: DEFAULT_NODE_FILL };
-    if (spec) return { nodeFill: DEFAULT_NODE_FILL, nodeColors: moduleFillColors(this.levelModules()[level], spec.color, DEFAULT_NODE_FILL) };
-    // No nodeFill: the engine's own module colours — a state node its module's, a physical disc its first wedge's.
+    if (spec) {
+      if (!spec.color) return { nodeFill: DEFAULT_NODE_FILL }; // `{ by: "module" }` with no colour anywhere
+      const palette = this.statePalette(spec.color);
+      return { nodeFill: DEFAULT_NODE_FILL, nodeColors: moduleFillColors(this.levelModules()[level], spec.color, DEFAULT_NODE_FILL, palette), modulePalette: palette };
+    }
+    // No fill: the engine's own module colours — a state node its module's, a physical disc its first wedge's.
     const css = level === "state" ? moduleColors(modules, this.stateColorOpts) : Array.from({ length: graph.nodeCount }, (_, p) => (wedges.wedgeCount[p]! > 0 ? wedges.color[wedges.offset[p]!]! : DEFAULT_NODE_FILL));
     return { nodeFill: DEFAULT_NODE_FILL, nodeColors: resolveNodeColors(graph, (i) => css[i] ?? DEFAULT_NODE_FILL) };
   }
 
-  /** Per-wedge RGBA of the physical view's pies for the current style (#494): `{ by: "module" }` colours each
-   *  wedge's module (once per module), any other fill keeps the wedges' own colours. Kept per style. */
+  /**
+   * Per-wedge RGBA of the physical view's pies for the current style (#494). The app's module colour reaches the
+   * wedges whatever the node fill: `style({ moduleColor })`, else a `{ by: "module" }` fill's `color`; each wedge
+   * takes its module's colour from the levels' {@link statePalette} (once per module). With neither, the wedges
+   * keep their own colours ({@link StateNetworkOptions.pie}). Kept per style: O(wedges) once, never per frame.
+   */
   private pieColors(): Uint8Array | null {
     const wedges = this.pieWedges;
     if (!wedges) return null;
-    const spec = this.styleOpts.nodeFill;
+    const spec = this.fillSpec();
     const fills = this.stateFillsFor(spec);
     if (fills.pie) return fills.pie;
     const total = wedges.end.length;
     const out = new Uint8Array(total * 4);
-    const byPath = new Map<readonly number[], [number, number, number, number]>();
+    const color = this.styleOpts.moduleColor ?? (isModuleFill(spec) ? spec.color : undefined);
+    const palette = color ? this.statePalette(color) : null;
+    const wedgeModule = palette ? this.levelModules().wedge : null;
     for (let w = 0; w < total; w++) {
-      let c: [number, number, number, number];
-      if (isModuleFill(spec)) {
-        const path = wedges.modulePath[w]!;
-        let known = byPath.get(path);
-        if (!known) byPath.set(path, (known = rgbaBytes(spec.color(path) ?? DEFAULT_NODE_FILL)));
-        c = known;
-      } else c = rgbaBytes(wedges.color[w]!);
+      const m = wedgeModule ? (wedgeModule[w] ?? -1) : -1;
+      const c: ArrayLike<number> = !palette ? rgbaBytes(wedges.color[w]!) : m >= 0 ? paletteRGBA(palette, m) : pathRGBA(palette, wedges.modulePath[w] ?? []);
       out.set(c, 4 * w);
     }
     fills.pie = out;
     return out;
   }
 
-  /** The module each node of the state and the physical graph is coloured by (#494), built once per state
-   *  network: a state node's enclosing module; a physical node's first wedge's module (its only one, for a disc). */
-  private levelModules(): { state: NodeModules; physical: NodeModules } {
+  /** The module each node of the state and the physical graph is coloured by, and each pie wedge's (#494), as
+   *  indices into the state graph's interned modules, so one palette colours them all. Built once per state
+   *  network: a state node's enclosing module; a physical node's first wedge's module (its only one, for a disc).
+   *  O(state nodes + wedges + modules · depth); the path index is dropped when it returns. */
+  private levelModules(): { state: NodeModules; physical: NodeModules; wedge: Int32Array } {
     if (this.stateNodeModules) return this.stateNodeModules;
     const sg = this.stateData;
     const records = this.stateModules;
     const wedges = this.pieWedges;
     const empty: NodeModules = { moduleOf: new Int32Array(0), paths: [] };
-    if (!sg || !records || !wedges) return { state: empty, physical: empty };
-    const index = new Map<readonly number[], number>();
-    const paths: (readonly number[])[] = [];
-    const moduleOf = new Int32Array(sg.physicalCount).fill(-1);
-    for (let p = 0; p < sg.physicalCount; p++) {
-      if (wedges.wedgeCount[p]! === 0) continue;
-      const path = wedges.modulePath[wedges.offset[p]!]!;
-      let m = index.get(path);
-      if (m === undefined) {
-        m = paths.length;
-        index.set(path, m);
-        paths.push(path);
-      }
-      moduleOf[p] = m;
+    if (!sg || !records || !wedges) return { state: empty, physical: empty, wedge: new Int32Array(0) };
+    const state = nodeModules(sg.state.nodeCount, records);
+    const index = new Map<string, number>();
+    for (let m = 0; m < state.paths.length; m++) index.set((state.paths[m] ?? []).join(","), m);
+    // A wedge's path array is shared per module: look each one up once.
+    const byPath = new Map<readonly number[], number>();
+    const wedge = new Int32Array(wedges.end.length).fill(-1);
+    for (let w = 0; w < wedge.length; w++) {
+      const path = wedges.modulePath[w] ?? [];
+      let m = byPath.get(path);
+      if (m === undefined) byPath.set(path, (m = index.get(path.join(",")) ?? -1));
+      wedge[w] = m;
     }
-    this.stateNodeModules = { state: nodeModules(sg.state.nodeCount, records), physical: { moduleOf, paths } };
+    const moduleOf = new Int32Array(sg.physicalCount).fill(-1);
+    for (let p = 0; p < sg.physicalCount; p++) if (wedges.wedgeCount[p]! > 0) moduleOf[p] = wedge[wedges.offset[p]!]!;
+    this.stateNodeModules = { state, physical: { moduleOf, paths: state.paths }, wedge };
     return this.stateNodeModules;
   }
 

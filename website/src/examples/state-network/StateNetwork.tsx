@@ -8,7 +8,7 @@ const notState = (o: Record<string, unknown>) => o.view !== "State";
 /** Harness for the state-network example: **Nodes** (physical count, up to 10k), a **Backend** toggle
  *  (Force / Worker / GPU — #182) for the physical layout, a **View** toggle (Physical pies / State
  *  rosette / Both), a **Links** toggle (half-arrow / line, both bent), **Colours** (the engine's module
- *  colours / an app palette via `nodeFill: { by: "module" }`), **Modules** (on / off: a raw state network,
+ *  colours / an app palette via `style({ moduleColor })`), **Modules** (on / off: a raw state network,
  *  #494), **Physical** / **State** label
  *  toggles, and the "directed map of modules" option set. The LOD cut only applies to the State view, so
  *  LOD + its sub-controls are **disabled** (greyed, no reflow) in the other views. */

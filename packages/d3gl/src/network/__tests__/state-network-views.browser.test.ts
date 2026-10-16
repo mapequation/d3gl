@@ -4,7 +4,7 @@ import { buildStateGraph } from "../state-graph.js";
 import { buildGraph } from "../graph.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
-import type { InstancedHighlight } from "../../core/backend.js";
+import type { InstancedHighlight, InstancedLayer } from "../../core/backend.js";
 import type { HoverHit } from "../../map/base-engine.js";
 import { decodeImage } from "../../map/__tests__/backend-equivalence-harness.js";
 
@@ -497,6 +497,322 @@ describe("hits and labels name their level in state mode (#494)", () => {
     net.data(buildGraph({ nodeCount: 2, source: [0], target: [1], directed: false }));
     net.layout({ backend: "positions", positions: new Float32Array([60, 100, 140, 100]) });
     expect((net.pick(60, 100)?.datum as NetworkHit).level).toBeUndefined();
+    net.destroy();
+  });
+});
+
+// ── #494 review: link units in the both view, LOD across views, module aggregates ─────────────────────────
+
+/** Two physical nodes 120 apart on one row, one state node each, one directed link 0 → 1: a horizontal link. */
+function pairFixture() {
+  const graph = buildStateGraph({ stateCount: 2, stateToPhysical: [0, 1], source: [0], target: [1], nodeFlow: [1, 1], directed: true });
+  return { graph, positions: new Float32Array([40, 100, 160, 100]) };
+}
+const LINK_RGB: [number, number, number] = [0, 200, 0];
+const isLink = (c: readonly number[]): boolean => (c[1] ?? 0) > 120 && (c[0] ?? 0) < 90 && (c[2] ?? 0) < 90;
+/** A view at zoom `k` that keeps world point (100, 100), the link's middle, at the canvas centre. */
+const centred = (k: number) => ({ k, x: W / 2 - 100 * k, y: H / 2 - 100 * k });
+
+describe("the both view draws its links in the app's sizeMode (#494 review, 1)", () => {
+  for (const linkStyle of ["line", "half-arrow"] as const) {
+    it(`${linkStyle}: px-wide links and a tip on the dot's boundary at two zoom levels (sizeMode "screen")`, async () => {
+      const { graph, positions } = pairFixture();
+      const net = await engine(host());
+      // Transparent dots, so the tip the dot would cover stays visible.
+      net
+        .style({ sizeMode: "screen", linkStyle, linkWidth: 6, arrowSize: 6, linkStroke: `rgb(${LINK_RGB.join(",")})`, directed: true, nodeFill: "rgba(0,0,0,0)" })
+        .stateNetwork(graph, { view: "both" });
+      net.layout({ backend: "positions", positions });
+      // The target dot's world radius, from the export (the both view's dots are world-sized).
+      const [tx, ty] = statePos(graph, 1);
+      const dot = circlesOf(net.toSVG()).find((c) => !c.stroked && Math.abs(c.cx - tx) < 0.01 && Math.abs(c.cy - ty) < 0.01);
+      expect(dot, "no state dot drawn at the link's target").toBeDefined();
+      const r = dot?.r ?? 0;
+      expect(r, "the dot is too small for the setback to tell the units apart").toBeGreaterThan(3);
+      for (const k of [0.5, 2]) {
+        const t = centred(k);
+        net.setTransform(t);
+        const img = await frame(net);
+        // Width: the green run across the link's middle column (between the containers), in px.
+        if (linkStyle === "line") {
+          let rows = 0;
+          for (let y = 0; y < H; y++) if (isLink(rgbaAt(img, W / 2, y))) rows++;
+          expect(Math.abs(rows - 6), `k=${k}: link drawn ${rows} px wide, the app asked for 6 px`).toBeLessThanOrEqual(1.5);
+        }
+        // Tip: the rightmost link pixel on the target's row sits on the dot's boundary, r·k px short of its centre.
+        const cx = tx * k + t.x;
+        const cy = Math.round(ty * k + t.y);
+        // The tip is a sharp point (a line also runs on to the transparent dot's centre), so it is read off the
+        // head's slanted edge, clear of the line's band: on a row d px off the centre line the edge is at
+        // tip − slope·d (a line's head: 2·size long, ±size wide; a half-arrow's: tipLength long, width + 2√width
+        // wide), so each such row estimates the tip; their median is the drawn tip.
+        const head = linkStyle === "line" ? { slope: 2, rows: [4, 5] } : { slope: Math.min((120 * k - 2 * r * k) / 3, 10 * Math.cbrt(6)) / (6 + 2 * Math.sqrt(6)), rows: [6, 7, 8] };
+        const estimates: number[] = [];
+        for (const d of head.rows) {
+          for (const y of [cy - d, cy + d]) {
+            let edge = -1;
+            for (let x = 0; x < W; x++) if (isLink(rgbaAt(img, x, y))) edge = x;
+            if (edge >= 0) estimates.push(edge + head.slope * d);
+          }
+        }
+        estimates.sort((a, b) => a - b);
+        const tip = estimates[Math.floor(estimates.length / 2)] ?? NaN;
+        // Within 2 px (anti-aliasing reads the edge a little short); a setback in the wrong units is off by r·|k − 1| ≥ 3 px.
+        expect(Math.abs(tip - (cx - r * k)), `k=${k}: tip at ${tip.toFixed(1)} (${estimates.map((e) => e.toFixed(1)).join(" ")}), the boundary at ${(cx - r * k).toFixed(1)}`).toBeLessThanOrEqual(2);
+      }
+      net.destroy();
+    });
+  }
+
+  it("the vector twins agree: px-sized heads set back by the world radius at any zoom (WebGL export, SVG scene)", async () => {
+    const { graph, positions } = pairFixture();
+    /** Each path's first two points: an arrowhead's tip, then a base corner (2·size back, size aside: size·√5 away). */
+    const headsOf = (svg: string): { tip: number; side: number }[] =>
+      [...svg.matchAll(/<path d="M\s*([-\d.e]+)[ ,]\s*([-\d.e]+)\s*L\s*([-\d.e]+)[ ,]\s*([-\d.e]+)/g)]
+        .map((m) => ({ tip: Number(m[1]), side: Math.hypot(Number(m[3]) - Number(m[1]), Number(m[4]) - Number(m[2])) }))
+        .filter((h) => Number.isFinite(h.tip));
+    const tips: Record<string, number[]> = {};
+    for (const backend of ["webgl", "svg"] as const) {
+      const net = network(host(), { width: W, height: H, backend });
+      await net.whenReady();
+      net.style({ sizeMode: "screen", linkStyle: "line", linkWidth: 6, arrowSize: 6, directed: true }).stateNetwork(graph, { view: "both" });
+      net.layout({ backend: "positions", positions });
+      const [tx, ty] = statePos(graph, 1);
+      const r = circlesOf(net.toSVG()).find((c) => !c.stroked && Math.abs(c.cx - tx) < 0.01 && Math.abs(c.cy - ty) < 0.01)?.r ?? NaN;
+      expect(r, `${backend}: the target dot`).toBeGreaterThan(0);
+      for (const k of [0.5, 2]) {
+        net.setTransform(centred(k));
+        net.syncScreenGeometry(); // re-bakes the vector path's screen-mode arrows at k
+        const svg = net.toSVG();
+        // An arrowhead's path starts at its tip: in world units r short of the target, whatever k.
+        const head = headsOf(svg).find((h) => Math.abs(h.tip - (tx - r)) < 0.5);
+        expect(head, `${backend} k=${k}: no arrow tip at the dot's boundary (${(tx - r).toFixed(2)})`).toBeDefined();
+        // The head is 6 px in size whatever the zoom: 6·√5 / k world units from the tip to a base corner.
+        expect(head?.side ?? NaN, `${backend} k=${k}: the head is not px-sized`).toBeCloseTo((6 * Math.sqrt(5)) / k, 1);
+        (tips[backend] ??= []).push(head?.tip ?? NaN);
+      }
+      net.destroy();
+    }
+    expect(tips["webgl"]).toEqual(tips["svg"]?.map((x) => expect.closeTo(x, 2)));
+  });
+});
+
+describe("the app's lod() holds across state-network views (#494 review, 2)", () => {
+  it("state(lod) → both → lod(change) → state draws the changed LOD; physical → state likewise", async () => {
+    const { graph, modules } = fixture();
+    const net = await engine(host());
+    net.stateNetwork(graph, { modules, view: "state" });
+    place(net);
+    net.lod({ modules });
+    expect(net.lodSource).toBe("modules");
+    net.view("both");
+    expect(net.lodSource, "the both view draws in full").toBe("none");
+    expect(circlesOf(net.toSVG()).filter((c) => c.stroked).length, "the both view's containers").toBe(P);
+    net.lod({ source: "spatial" }); // asked for in the both view: kept, not drawn there
+    expect(net.lodSource).toBe("none");
+    expect(circlesOf(net.toSVG()).filter((c) => c.stroked).length, "lod() in the both view dropped its containers").toBe(P);
+    net.view("state");
+    expect(net.lodSource, "the state view came back without the changed LOD").toBe("spatial");
+
+    // The physical view takes a structural or spatial cut, not the state nodes' partition; it keeps the request.
+    net.view("physical");
+    expect(net.lodSource, "the physical view takes a spatial cut").toBe("spatial");
+    net.lod({ modules });
+    expect(net.lodSource, "a state-node partition cannot cut the physical graph").toBe("none");
+    expect(net.toSVG(), "the physical view draws its pies again").toMatch(/<path[^>]*fill="rgba?\(/);
+    net.view("state");
+    expect(net.lodSource, "the state view came back without the LOD asked for in the physical view").toBe("modules");
+    net.lod(false);
+    net.view("both");
+    net.view("state");
+    expect(net.lodSource, "lod(false) holds across views too").toBe("none");
+    net.destroy();
+  });
+});
+
+/** Every circle fill of an export, as `r,g,b`. */
+function circleFills(svg: string): string[] {
+  const out: string[] = [];
+  for (const m of svg.matchAll(/<circle[^>]*fill="([^"]+)"/g)) {
+    const css = m[1] ?? "";
+    const rgb = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(css);
+    const hex = /^#([0-9a-f]{6})$/i.exec(css);
+    if (rgb) out.push(`${rgb[1]},${rgb[2]},${rgb[3]}`);
+    else if (hex) {
+      const v = parseInt(hex[1] ?? "0", 16);
+      out.push(`${(v >> 16) & 255},${(v >> 8) & 255},${v & 255}`);
+    }
+  }
+  return out;
+}
+const fills = (...css: string[]) => new Set(css.map((c) => (RGB[c] ?? [0, 0, 0]).join(",")));
+
+describe("module LOD aggregates take their module's colour under nodeFill { by: 'module' } (#494 review, 3)", () => {
+  // Module [1] holds [1,1] (orange) and [1,2] (purple) and no node of its own: as an aggregate it is red, its
+  // own colour, where its members' mean would be neither. [2] is blue; the root has no palette colour. Its two
+  // submodules sit a few world units apart and [2] far away, so with screen-sized glyphs the cut draws [1]
+  // collapsed over a wide range of zooms.
+  const zooms = Array.from({ length: 30 }, (_, i) => 0.01 * Math.pow(1.25, i)); // 0.01 … 6.5
+  const sweep = (net: Network, cx: number, cy: number): Set<string> => {
+    const seen = new Set<string>();
+    for (const k of zooms) {
+      net.setTransform({ k, x: W / 2 - cx * k, y: H / 2 - cy * k });
+      for (const f of circleFills(net.toSVG())) seen.add(f);
+    }
+    return seen;
+  };
+
+  it("a plain network's module tree, data(graph, { modules }): an aggregate takes color(its path)", async () => {
+    const graph = buildGraph({ nodeCount: 5, source: [0, 1, 3], target: [1, 2, 4], directed: false });
+    const modules = [
+      { id: 0, path: [1, 1, 1] },
+      { id: 1, path: [1, 1, 2] },
+      { id: 2, path: [1, 2, 1] },
+      { id: 3, path: [2, 1] },
+      { id: 4, path: [2, 2] },
+    ];
+    const calls: string[] = [];
+    const color = (path: readonly number[]) => (calls.push(path.join(":")), colorOf(path));
+    const net = await engine(host());
+    net.style({ nodeRadius: 6, sizeMode: "screen", nodeFill: { by: "module", color } }).data(graph, { modules });
+    net.layout({ backend: "positions", positions: new Float32Array([40, 100, 41, 100, 44, 100, 160, 100, 162, 100]) });
+    net.lod({ declutter: false });
+    expect(net.lodSource).toBe("modules");
+    const seen = sweep(net, 100, 100);
+    expect(seen.has(RGB["#d62728"]!.join(",")), `module [1] never drew in its own colour (red): ${[...seen].join(" | ")} calls ${calls.join(" ")}`).toBe(true);
+    const allowed = fills("#d62728", "#1f77b4", "#ff7f0e", "#9467bd");
+    const other = [...seen].filter((f) => !allowed.has(f));
+    // The root (no palette colour) takes the default fill; nothing takes a members' mean.
+    expect(other.length, `aggregate fills that are no module colour: ${other.join(" | ")}`).toBeLessThanOrEqual(1);
+    expect(new Set(calls).size, "color asked more than once for a module").toBe(calls.length);
+    net.destroy();
+  });
+
+  it("the state view's module LOD likewise; a spatial cell (no module) keeps its members' mean", async () => {
+    // Physical 0 holds module [1]'s state nodes (in [1,1] and [1,2]) on a tight rosette; physical 1 holds [2]'s.
+    const graph = buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 1], source: [0, 2], target: [2, 3], nodeFlow: [1, 1, 1, 1], directed: false });
+    const modules: ModulePathNode[] = [
+      { id: 0, path: [1, 1, 1] },
+      { id: 1, path: [1, 2, 1] },
+      { id: 2, path: [2, 1] },
+      { id: 3, path: [2, 2] },
+    ];
+    const calls: string[] = [];
+    const color = (path: readonly number[]) => (calls.push(path.join(":")), colorOf(path));
+    const net = await engine(host());
+    net.style({ nodeRadius: 6, sizeMode: "screen", nodeFill: { by: "module", color } }).stateNetwork(graph, { modules, view: "state", rosetteRadius: 2 });
+    net.layout({ backend: "positions", positions: new Float32Array([40, 100, 160, 100]) });
+    net.lod({ modules, declutter: false });
+    expect(net.lodSource).toBe("modules");
+    const seen = sweep(net, 100, 100);
+    expect(seen.has(RGB["#d62728"]!.join(",")), `module [1] never drew in its own colour (red): ${[...seen].join(" | ")}`).toBe(true);
+    const allowed = fills("#d62728", "#1f77b4", "#ff7f0e", "#9467bd");
+    expect([...seen].filter((f) => !allowed.has(f)).length, "an aggregate took a members' mean").toBeLessThanOrEqual(1);
+    expect(new Set(calls).size, "color asked more than once for a module, across levels and pies").toBe(calls.length);
+
+    // A spatial tree's cells are regions, not modules: the cell holding every state node takes their mean.
+    net.lod({ source: "spatial", declutter: false });
+    expect(net.lodSource).toBe("spatial");
+    const spatial = sweep(net, 100, 100);
+    expect([...spatial].some((f) => !allowed.has(f)), "a spatial cell took a module colour, not its members' mean").toBe(true);
+    net.destroy();
+  });
+});
+
+describe("the app's module palette reaches the pies whatever the node fill: style({ moduleColor }) (#494 review, 4)", () => {
+  /** The pie layer's data on each emit that reaches the WebGL backend, and whether it was updated in place. */
+  function pieEmits() {
+    const emits: { inPlace: boolean; centers: Float32Array; radii: Float32Array; angles: Float32Array; colors: Uint8Array }[] = [];
+    const record = (inPlace: boolean) => (layer: InstancedLayer) => {
+      if (layer.primitive === "pie") emits.push({ inPlace, centers: layer.pie.centers, radii: layer.pie.radii, angles: layer.pie.angles, colors: layer.pie.colors });
+    };
+    const set = WebGLBackend.prototype.setInstancedLayer;
+    const update = WebGLBackend.prototype.updateInstancedLayer;
+    vi.spyOn(WebGLBackend.prototype, "setInstancedLayer").mockImplementation(function (this: WebGLBackend, layer: InstancedLayer) {
+      record(false)(layer);
+      set.call(this, layer);
+    });
+    vi.spyOn(WebGLBackend.prototype, "updateInstancedLayer").mockImplementation(function (this: WebGLBackend, layer: InstancedLayer) {
+      record(true)(layer);
+      update.call(this, layer);
+    });
+    return emits;
+  }
+  const wedgeColours = (img: { width: number; data: Uint8Array }) => [rgbaAt(img, POS[0]! + 6, POS[1]! + 3).slice(0, 3), rgbaAt(img, POS[0]! - 6, POS[1]! - 3).slice(0, 3)];
+
+  it("flow-filled nodes: the wedges take the app's module colours; a palette style() recolours them, colours alone", async () => {
+    const { graph, modules } = fixture();
+    const net = await engine(host());
+    const calls: string[] = [];
+    const first = (path: readonly number[]) => (calls.push(path.join(":")), colorOf(path));
+    const flow = { by: "flow" as const, scale: () => "#00c000" };
+    net.style({ nodeRadius: 12, nodeFill: flow, moduleColor: first }).stateNetwork(graph, { modules, view: "physical" });
+    place(net);
+    let img = await frame(net);
+    expect(near(rgbaAt(img, POS[2]!, POS[3]!).slice(0, 3), [0, 192, 0]), "the discs keep the app's flow fill").toBe(true);
+    let wedges = wedgeColours(img);
+    expect(wedges.some((c) => near(c, RGB["#d62728"]!)) && wedges.some((c) => near(c, RGB["#1f77b4"]!)), `pie wedges ${wedges}`).toBe(true);
+    expect(new Set(calls).size, "a module colour asked twice").toBe(calls.length);
+
+    // A palette change (tone / hue) through style() alone: the same network, the same geometry.
+    const emits = pieEmits();
+    const second = (path: readonly number[]) => ({ "1": "#9467bd", "2": "#ff7f0e" })[path.join(":")];
+    const before = emits.length;
+    net.style({ moduleColor: second });
+    img = await frame(net);
+    wedges = wedgeColours(img);
+    expect(wedges.some((c) => near(c, RGB["#9467bd"]!)) && wedges.some((c) => near(c, RGB["#ff7f0e"]!)), `recoloured wedges ${wedges}`).toBe(true);
+    expect(near(rgbaAt(img, POS[2]!, POS[3]!).slice(0, 3), [0, 192, 0]), "the discs still take the flow fill").toBe(true);
+    // The pie layer was updated in place with its geometry columns unchanged (the SAME arrays, whose upload the
+    // WebGL pie skips) and new colours.
+    const after = emits.slice(before);
+    expect(after.length, "the palette change never reached the pie layer").toBeGreaterThan(0);
+    const prev = after.length > 1 ? after[0] : undefined;
+    const last = after[after.length - 1];
+    expect(after.every((e) => e.inPlace), "the pie layer was recreated").toBe(true);
+    if (prev && last) {
+      expect(last.centers).toBe(prev.centers);
+      expect(last.radii).toBe(prev.radii);
+      expect(last.angles).toBe(prev.angles);
+    }
+    net.destroy();
+  });
+
+  it("the pie emit hands back unchanged geometry: a palette change keeps the centres, radii and angles arrays", async () => {
+    const { graph, modules } = fixture();
+    const net = await engine(host());
+    net.style({ nodeRadius: 12, nodeFill: "#00c000", moduleColor: colorOf }).stateNetwork(graph, { modules, view: "physical" });
+    place(net);
+    const emits = pieEmits();
+    net.style({ nodeRadius: 12 }); // a restyle that changes nothing the pie draws
+    net.toPNG();
+    net.style({ moduleColor: (path) => ({ "1": "#9467bd", "2": "#ff7f0e" })[path.join(":")] });
+    net.toPNG();
+    expect(emits.length).toBeGreaterThanOrEqual(2);
+    const [a, b] = [emits[emits.length - 2], emits[emits.length - 1]];
+    expect(b?.centers).toBe(a?.centers);
+    expect(b?.radii).toBe(a?.radii);
+    expect(b?.angles).toBe(a?.angles);
+    expect(b?.colors, "the colours did not change").not.toBe(a?.colors);
+    net.destroy();
+  });
+
+  it("a { by: 'module' } fill without its own colour, and a state network with no nodeFill, take moduleColor", async () => {
+    const { graph, modules } = fixture();
+    const net = await engine(host());
+    net.style({ nodeRadius: 12, moduleColor: colorOf }).stateNetwork(graph, { modules, view: "state" });
+    place(net);
+    const want: Record<number, string> = { 0: "#ff7f0e", 1: "#1f77b4", 4: "#9467bd" };
+    const check = async (label: string) => {
+      const img = await frame(net);
+      for (const [s, hex] of Object.entries(want)) {
+        const [x, y] = statePos(graph, Number(s));
+        expect(near(rgbaAt(img, x, y).slice(0, 3), RGB[hex]!), `${label}: state ${s} is ${rgbaAt(img, x, y)}, want ${hex}`).toBe(true);
+      }
+    };
+    await check("no nodeFill");
+    net.style({ nodeFill: { by: "module" } });
+    await check("{ by: 'module' }");
     net.destroy();
   });
 });

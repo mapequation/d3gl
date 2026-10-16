@@ -122,3 +122,47 @@ export function nodeModules(nodeCount: number, records: ArrayLike<ModulePathNode
   }
   return { moduleOf, paths };
 }
+
+/** The parts of a provided-module LOD tree that name its aggregates' modules (`parent` + `branch`, #197). */
+export interface ModuleTreeNames {
+  leafCount: number;
+  size: number;
+  levelCount: number;
+  levelOffset: Uint32Array;
+  parent?: Int32Array;
+  branch?: Int32Array;
+}
+
+/**
+ * Each aggregate's own module colour on a module tree (#494): RGBA per aggregate, `4·(size − leafCount)`. An
+ * aggregate's module path (as its hit's `path`) is looked up among `paths` (an interned hierarchy's modules)
+ * and coloured `rgbaOf(m)` — so a module the nodes' colours already resolved is not asked again — or, for a path
+ * outside it (an explicit `lod({ modules })` of another partition), `rgbaOfPath(path)`. Null for a tree that is
+ * not a module tree (spatial, structural): its aggregates are no modules. Levels are walked from the root down,
+ * so each path extends its parent's. O(aggregates · depth + modules · depth) once per (tree, style), never per
+ * frame; the path index is dropped when it returns.
+ */
+export function moduleAggregateColors(
+  tree: ModuleTreeNames,
+  paths: readonly (readonly number[])[],
+  rgbaOf: (m: number) => ArrayLike<number>,
+  rgbaOfPath: (path: readonly number[]) => ArrayLike<number>,
+): Uint8Array | null {
+  const { leafCount, size, levelCount, levelOffset, parent, branch } = tree;
+  if (!parent || !branch) return null;
+  const index = new Map<string, number>();
+  for (let m = 0; m < paths.length; m++) index.set((paths[m] ?? []).join(","), m);
+  const out = new Uint8Array(4 * (size - leafCount));
+  const named = new Array<readonly number[]>(size - leafCount);
+  // A parent sits on a higher level than its children (levels are module heights), so it is named first.
+  for (let k = levelCount - 1; k >= 1; k--) {
+    for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
+      const p = parent[g]!;
+      const path = p < 0 ? [] : [...(named[p - leafCount] ?? []), branch[g]!];
+      named[g - leafCount] = path;
+      const m = index.get(path.join(","));
+      out.set(m === undefined ? rgbaOfPath(path) : rgbaOf(m), 4 * (g - leafCount));
+    }
+  }
+  return out;
+}

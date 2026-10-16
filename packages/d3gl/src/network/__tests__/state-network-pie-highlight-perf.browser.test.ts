@@ -210,10 +210,13 @@ let wedgeCount = 0;
 let edgeCount = 0;
 let registration: GlBufferUsage;
 let pieLiveAfterBuild = false;
+/** `style({ moduleColor })` calls (#494 review): at the build, and over every LOD-off leg after it. */
+let moduleCallsAtBuild = 0;
+let moduleCallsAfterBuild = 0;
 let hoverOff: EventLeg;
 let selectOff: EventLeg & { flagBytes: number; pieFlagLength: number; pieFlagSum: number };
-let zoomOff: { baseEmits: number; pieEmits: number; radiusCalls: number; strokeCalls: number; gpu: GlBufferUsage; frames: number; worstMs: number };
-let dragOff: { moves: number; pieEmits: number; distinctSelected: number; sameAsSelection: boolean; radiusCalls: number; strokeCalls: number; worstMs: number; medianMs: number };
+let zoomOff: { baseEmits: number; pieEmits: number; radiusCalls: number; moduleCalls: number; strokeCalls: number; gpu: GlBufferUsage; frames: number; worstMs: number };
+let dragOff: { moves: number; pieEmits: number; distinctSelected: number; sameAsSelection: boolean; radiusCalls: number; moduleCalls: number; strokeCalls: number; worstMs: number; medianMs: number };
 let lodOn: { nodesLive: boolean; pieLive: boolean; pieEmits: number; hoverBaseEmits: number; hoverChanges: number; hoverEvents: number; zoomBaseEmits: number; zoomUploadPerFrame: number; frames: number; pieLiveAfter: boolean };
 
 const median = (xs: number[]): number => {
@@ -230,6 +233,7 @@ beforeAll(async () => {
     edgeCount = fx.graph.physical.edgeCount;
     let radiusCalls = 0;
     let strokeCalls = 0;
+    let moduleCalls = 0;
     const h = perfHost(W, H);
     const net = network(h, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
@@ -246,6 +250,12 @@ beforeAll(async () => {
           strokeCalls++;
           return "rgba(90,110,150,0.5)";
         },
+        // The Navigator's shape (#494 review): nodes filled by a metric, the pies by the app's module palette.
+        nodeFill: { by: "degree", scale: () => "#4878d0" },
+        moduleColor: (path) => {
+          moduleCalls++;
+          return ["#d62728", "#1f77b4", "#2ca02c"][(path[0] ?? 1) % 3];
+        },
       })
       .stateNetwork(fx.graph, { modules: fx.modules, view: "physical" })
       .layout({ backend: "positions", positions: fx.positions });
@@ -253,6 +263,7 @@ beforeAll(async () => {
     net.interactive({ selectable: { multi: true }, draggable: true, hover: { others: { opacity: 0.5 } } });
     registration = gl.since(atStart);
     pieLiveAfterBuild = lane.live.has("pie");
+    moduleCallsAtBuild = moduleCalls;
 
     const r = h.getBoundingClientRect();
     const move = (x: number, y: number) =>
@@ -325,6 +336,7 @@ beforeAll(async () => {
     // Zoom sweep with a selection active (the dim is on, the ring lane is dynamic).
     {
       const radiusBefore = radiusCalls;
+      const moduleBefore = moduleCalls;
       const strokeBefore = strokeCalls;
       lane.reset();
       const before = gl.mark();
@@ -333,6 +345,7 @@ beforeAll(async () => {
         baseEmits: lane.baseEmits(),
         pieEmits: lane.emits.get("pie") ?? 0,
         radiusCalls: radiusCalls - radiusBefore,
+        moduleCalls: moduleCalls - moduleBefore,
         strokeCalls: strokeCalls - strokeBefore,
         gpu: gl.since(before),
         frames,
@@ -364,6 +377,7 @@ beforeAll(async () => {
       const times: number[] = [];
       let flags: Uint8Array | undefined;
       let radiusBefore = radiusCalls;
+      let moduleBefore = moduleCalls;
       let strokeBefore = strokeCalls;
       try {
         net.select("nodes", [grabbed]);
@@ -371,6 +385,7 @@ beforeAll(async () => {
         flags = lastPieFlags(lane);
         lane.reset();
         radiusBefore = radiusCalls;
+        moduleBefore = moduleCalls;
         strokeBefore = strokeCalls;
         const [gx, gy] = screenOf(grabbed);
         const ev = (type: string, x: number, y: number) =>
@@ -395,6 +410,7 @@ beforeAll(async () => {
         distinctSelected: refs.size,
         sameAsSelection: flags !== undefined && refs.size === 1 && refs.has(flags),
         radiusCalls: radiusCalls - radiusBefore,
+        moduleCalls: moduleCalls - moduleBefore,
         strokeCalls: strokeCalls - strokeBefore,
         worstMs: Math.max(...times),
         medianMs: median(times),
@@ -402,6 +418,7 @@ beforeAll(async () => {
       net.select("nodes", null);
     }
 
+    moduleCallsAfterBuild = moduleCalls - moduleCallsAtBuild; // hover, select, zoom and drag: none
     // ── LOD ON (physical view) ─────────────────────────────────────────────────────────────────────
     {
       lane.reset();
@@ -449,6 +466,14 @@ describe(`state-network pie highlight — per-interaction cost at N=${N.toLocale
     expect(registration.uploadedBytes, "registration uploaded nothing — the GL spy is not observing").toBeGreaterThan(0);
     // The per-event upload ceiling only bites while a pie geometry re-upload (~32 B per wedge) is far above it.
     expect(32 * wedgeCount, "fixture too small for the per-event upload ceiling to catch a pie re-upload").toBeGreaterThan(100 * RING_BYTES_PER_EVENT);
+  });
+
+  it("the app's module palette colours the pies once per module, whatever the node fill (#494 review)", () => {
+    expect(moduleCallsAtBuild, "the pies never asked the app's module colour").toBeGreaterThan(0);
+    expect(moduleCallsAtBuild, "the module colour was asked per wedge, not per module").toBeLessThan(wedgeCount);
+    expect(moduleCallsAfterBuild, "a hover, selection, zoom or drag frame asked the module colour again").toBe(0);
+    expect(zoomOff.moduleCalls).toBe(0);
+    expect(dragOff.moduleCalls).toBe(0);
   });
 
   it("LOD OFF — hover sweep: uniforms only, O(1) pushes per hover change, no geometry", () => {
