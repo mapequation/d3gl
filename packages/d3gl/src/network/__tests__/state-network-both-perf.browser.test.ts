@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
+import { DRAG_HEAT, ForceLayout } from "../force.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedLayer, InstancedHighlight, InstancedCirclesData } from "../../core/backend.js";
@@ -82,6 +83,10 @@ const STATE_LOD_FRAME_MS = perfBudget(20 + (5 * N) / 20_000);
 const REHEAT_MOVE_MS = perfBudget(40 + (60 * N) / 20_000);
 const REHEAT_RATIO = 2;
 const REHEAT_SLACK_MS = perfBudget(4 + (8 * N) / 20_000);
+// - the state view's drag against the same drag on `data(stateGraph, { modules })` (#495 review): the same code, so
+//   within noise; 1.25× + slack absorbs run-to-run spread.
+const STATE_PLAIN_RATIO = 1.25;
+const STATE_PLAIN_SLACK_MS = perfBudget(2 + (2 * N) / 20_000);
 const STATE_OFF_FRAME_MS = perfBudget(4 + (4 * N) / 20_000);
 const SETUP_MS = perfBudget(120_000 + N / 2);
 
@@ -89,6 +94,16 @@ const SETUP_MS = perfBudget(120_000 + N / 2);
 class StreamProbe extends Network {
   streamFrame(): void {
     this.scheduleLayoutRepaint();
+  }
+  /** `render()` calls, and with `countOnly` set they are counted, not submitted (#495 review): the reheating drag
+   *  legs measure the drag's CPU work (a force tick over every node, the lane emit, the uploads), and their
+   *  full-detail frames would queue minutes of software-GL work that stalls a later call (LOG.md, "Local headless
+   *  Chromium rasterises on SwiftShader"). The other legs draw. */
+  renders = 0;
+  countOnly = false;
+  override render(): this {
+    this.renders++;
+    return this.countOnly ? this : super.render();
   }
 }
 
@@ -205,13 +220,18 @@ let zoomOff: { baseEmits: number; colorCalls: number; gpu: GlBufferUsage; frames
 let dragOff: { moves: number; containerEmits: number; sameColumns: boolean; sameSelected: boolean; colorCalls: number; moved: boolean; worstMs: number; medianMs: number };
 let streamOff: { frames: number; colorCalls: number; containerEmits: number; radiiChanged: boolean; restyles: number; sameCenters: boolean; worstMs: number; medianMs: number };
 /** A drag that reheats a force layout (#495): a both-view container drag, and the physical view's drag of the same node. */
-interface ReheatLeg { moves: number; othersMoved: number; dotsFollow: boolean; sameColumns: boolean; colorCalls: number; worstMs: number; medianMs: number }
+interface ReheatLeg { moves: number; renders: number; othersMoved: number; dotsFollow: boolean; sameColumns: boolean; colorCalls: number; worstMs: number; medianMs: number }
 let containerReheat: ReheatLeg;
 /** A both-view drag of one state dot (#495 review): it moves inside its container, clamped to its disc. */
 let dotDrag: { moves: number; moved: boolean; colorCalls: number; sameContainerColumns: boolean; sameCenters: boolean; inside: boolean; physicalMoved: boolean; worstMs: number; medianMs: number };
 let physicalReheat: ReheatLeg;
 /** The state view's drag (#495): the plain network's, over the state graph — with its module LOD on and off. */
 let stateDrag: { off: ReheatLeg; lod: ReheatLeg };
+/** The baseline (#495 review): the same drag on the plain network `data(stateGraph, { modules })` on this engine, and
+ *  what the state view's drag frame is made of — one force tick over the state graph, and the rest of the frame (the
+ *  same drag translating, no tick). */
+let plainDrag: { off: ReheatLeg; lod: ReheatLeg };
+let dragParts: { tickMs: number; translateOffMs: number; translateLodMs: number };
 let lodAsked: { containersLive: boolean; nodesLive: boolean; hover: EventLeg; zoomBaseEmits: number; colorCalls: number };
 let stateView: {
   remembered: string;
@@ -238,6 +258,7 @@ beforeAll(async () => {
     stateCount = fx.graph.state.nodeCount;
     stateEdges = fx.graph.state.edgeCount;
     let colorCalls = 0;
+    let stateDragStart = new Float32Array(0);
     const seen = new Set<string>();
     const color = (path: readonly number[]): string => {
       colorCalls++;
@@ -399,7 +420,6 @@ beforeAll(async () => {
       net.select("nodes", null);
       flush();
     }
-
     {
       // One state dot of a container, dragged far out of it (#495 review): O(held) per move, clamped to its disc.
       const p = targetIds[60]!;
@@ -442,7 +462,6 @@ beforeAll(async () => {
         medianMs: median(times),
       };
     }
-
     {
       // A converging layout spreads out frame by frame: scale the physical positions up a little per frame,
       // as a worker frame writes them, then let the stream's repaint run.
@@ -492,6 +511,8 @@ beforeAll(async () => {
       lane.reset();
       const colorBefore = colorCalls;
       const times: number[] = [];
+      const rendersBefore = net.renders;
+      net.countOnly = true;
       const ev = (type: string, px: number, py: number) =>
         h.dispatchEvent(new PointerEvent(type, { clientX: r.left + px, clientY: r.top + py, bubbles: true, button: 0, pointerId: 1 }));
       ev("pointerdown", x, y);
@@ -501,10 +522,11 @@ beforeAll(async () => {
         flush();
         times.push(performance.now() - t0);
       }
+      const renders = net.renders - rendersBefore;
       ev("pointerup", x + 4 * DRAG_MOVES, y + 3 * DRAG_MOVES);
-      // A few frames of the re-cool, not all of it: each repaints the whole lane, which software GL draws in seconds
-      // at 100k (#464). The next grab or view switch stops the loop.
+      // A few frames of the re-cool, not all of it. The next grab or view switch stops the loop.
       for (let f = 0; f < 3; f++) flush();
+      net.countOnly = false;
       let othersMoved = 0;
       for (let p = 0; p < N; p++) if (p !== held && Math.hypot(pos[2 * p]! - before[2 * p]!, pos[2 * p + 1]! - before[2 * p + 1]!) > 1e-4) othersMoved++;
       // Each dot where its container's place puts it: inside its container's spacing of its physical node.
@@ -521,6 +543,7 @@ beforeAll(async () => {
       const head = emits[0];
       return {
         moves: DRAG_MOVES,
+        renders,
         othersMoved,
         dotsFollow,
         // Kept per (radii, fill): a frame rebuilds the container columns only with new radii (a sizing step).
@@ -547,7 +570,6 @@ beforeAll(async () => {
       physicalReheat = reheatDrag((grabbed % COLS) * SPACING * K, Math.floor(grabbed / COLS) * SPACING * K, grabbed, false);
       net.view("both");
     }
-
     // ── LOD asked for in the both view (the Navigator's order) ──────────────────────────────────────
     {
       net.layout({ backend: "positions", positions: fixture(N).positions });
@@ -587,7 +609,6 @@ beforeAll(async () => {
       c0 = colorCalls;
       const offSweep = sweepFrames(steps, (t) => net.setTransform(t));
       stateView = { remembered, source, callsAtLod, lod: lodLeg, off: { calls: colorCalls - c0, baseEmits: lane.baseEmits(), worstMs: offSweep.worstFrameMs, gpu: gl.since(before) } };
-
       // The state view's drag (#495): the plain network's force drag over the state graph, which reheats the state
       // layout — with LOD off, then with its module LOD on (every node at a zoom that opens the modules).
       net.layout({ backend: "force", warm: true, iterations: 0 });
@@ -595,6 +616,7 @@ beforeAll(async () => {
       flush();
       const statePos = net.positions;
       const start = Float32Array.from(statePos ?? []); // both legs drag from the same layout
+      stateDragStart = start; // and so does the plain baseline below
       const grab = fx.graph.physicalToState.states[fx.graph.physicalToState.offsets[targetIds[50]!]!]!; // in view at K
       const gx = (statePos?.[2 * grab] ?? 0) * K, gy = (statePos?.[2 * grab + 1] ?? 0) * K;
       /** A screen point near (gx, gy) the drawn cut picks (a leaf or an aggregate), so the press grabs, never pans. */
@@ -620,12 +642,60 @@ beforeAll(async () => {
       net.setTransform({ k: K, x: 0, y: 0 });
       flush();
       stateDrag = { off, lod: stateDragLeg() };
+      // What the frame is made of: the same drag translating (the "positions" backend: no tick), LOD off and on, and
+      // one drag-heat tick of the main-thread force layout over the state graph, timed alone on a copy of it.
+      const translate = (): number => {
+        net.layout({ backend: "positions", positions: start });
+        net.setTransform({ k: K, x: 0, y: 0 });
+        flush();
+        const [tx, ty] = grabPoint();
+        return reheatDrag(tx, ty, -1, false).medianMs;
+      };
+      const translateLodMs = translate();
+      net.lod(false);
+      const translateOffMs = translate();
+      const sim = new ForceLayout({ ...fx.graph.state, positions: Float32Array.from(start) });
+      sim.hold(DRAG_HEAT);
+      sim.tick();
+      const ticks: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const t0 = performance.now();
+        sim.tick();
+        ticks.push(performance.now() - t0);
+      }
+      dragParts = { tickMs: median(ticks), translateOffMs, translateLodMs };
+    }
+    // The run's module colours are counted up to here: the plain network below resolves its own.
+    colorCallsTotal = colorCalls;
+    modulesAsked = seen.size;
+    // ── The baseline (#495 review): the plain network over the same state graph and modules, on this engine, the
+    //    same drag from the same positions ──
+    {
+      net.data(fx.graph.state, { modules: fx.modules });
+      const statePositions = stateDragStart;
+      const plainLeg = (): ReheatLeg => {
+                net.layout({ backend: "positions", positions: statePositions });
+        net.layout({ backend: "force", warm: true, iterations: 0 });
+        net.setTransform({ k: K, x: 0, y: 0 });
+        flush();
+                const pos = net.positions ?? new Float32Array(0);
+        const before = Float32Array.from(pos);
+        const grab = fx.graph.physicalToState.states[fx.graph.physicalToState.offsets[targetIds[50]!]!]!;
+        const gx = before[2 * grab]! * K, gy = before[2 * grab + 1]! * K;
+        let p: [number, number] = [gx, gy];
+        for (let d = 0; d < 24; d++) for (const [dx, dy] of [[d, 0], [-d, 0], [0, d], [0, -d]] as const) if (!net.pick(p[0], p[1]) && net.pick(gx + dx, gy + dy)) p = [gx + dx, gy + dy];
+                const leg = reheatDrag(p[0], p[1], -1, false);
+        let moved = 0;
+        for (let i = 0; i < stateCount; i++) if (Math.hypot(pos[2 * i]! - before[2 * i]!, pos[2 * i + 1]! - before[2 * i + 1]!) > 1e-4) moved++;
+        return { ...leg, othersMoved: moved };
+      };
+      const off = plainLeg();
+      net.lod({ modules: fx.modules, declutter: true });
+      plainDrag = { off, lod: plainLeg() };
       net.lod(false);
     }
     globalThis.requestAnimationFrame = realRaf;
     globalThis.cancelAnimationFrame = realCaf;
-    colorCallsTotal = colorCalls;
-    modulesAsked = seen.size;
     net.destroy();
     h.remove();
   } finally {
@@ -710,6 +780,7 @@ describe(`state-network both view — per-interaction cost at N=${N.toLocaleStri
         `physical view ${physicalReheat.medianMs.toFixed(2)} ms (worst ${physicalReheat.worstMs.toFixed(2)}), translate ${dragOff.medianMs.toFixed(2)} ms, dot ${dotDrag.medianMs.toFixed(2)} ms`,
     );
     for (const leg of [containerReheat, physicalReheat]) {
+      expect(leg.renders, "a held frame did not render (counted)").toBeGreaterThanOrEqual(leg.moves);
       expect(leg.othersMoved, "no other physical node moved: the drag did not reheat").toBeGreaterThan(N / 2);
       expect(leg.colorCalls, "a drag frame resolved the module colours again").toBe(0);
     }
@@ -724,8 +795,18 @@ describe(`state-network both view — per-interaction cost at N=${N.toLocaleStri
   });
 
   it("state view drag (#495): the plain network's force drag over the state graph, module LOD off and on", () => {
-    console.info(`[both-perf N=${N}] state drag: off ${stateDrag.off.medianMs.toFixed(2)} ms, lod ${stateDrag.lod.medianMs.toFixed(2)} ms`);
-    for (const [name, leg] of [["off", stateDrag.off], ["lod", stateDrag.lod]] as const) {
+    console.info(
+      `[both-perf N=${N}] state drag: off ${stateDrag.off.medianMs.toFixed(2)} ms, lod ${stateDrag.lod.medianMs.toFixed(2)} ms; ` +
+        `plain data(state, { modules }): off ${plainDrag.off.medianMs.toFixed(2)} ms, lod ${plainDrag.lod.medianMs.toFixed(2)} ms; ` +
+        `one force tick ${dragParts.tickMs.toFixed(2)} ms, the frame without it (translate): off ${dragParts.translateOffMs.toFixed(2)} ms, lod ${dragParts.translateLodMs.toFixed(2)} ms`,
+    );
+    // Baseline (#495 review): the state view is the plain path, so its drag costs what the plain network's costs.
+    for (const [name, leg, base] of [["off", stateDrag.off, plainDrag.off], ["lod", stateDrag.lod, plainDrag.lod]] as const) {
+      expect(base.othersMoved, `${name}: the plain baseline did not reheat: the leg is vacuous`).toBeGreaterThan(stateCount / 2);
+      expect(leg.medianMs, `${name}: state view ${leg.medianMs.toFixed(2)}ms vs plain ${base.medianMs.toFixed(2)}ms`).toBeLessThan(STATE_PLAIN_RATIO * base.medianMs + STATE_PLAIN_SLACK_MS);
+    }
+    for (const [name, leg] of [["off", stateDrag.off], ["lod", stateDrag.lod], ["plain off", plainDrag.off], ["plain lod", plainDrag.lod]] as const) {
+      expect(leg.renders, `${name}: a held frame did not render (counted)`).toBeGreaterThanOrEqual(leg.moves);
       expect(leg.othersMoved, `${name}: the state layout did not reheat`).toBeGreaterThan(stateCount / 2);
       expect(leg.colorCalls, `${name}: a drag frame resolved the module colours again`).toBe(0);
       expect(leg.medianMs, `${name}: state drag ${leg.medianMs.toFixed(2)}ms (worst ${leg.worstMs.toFixed(2)}ms)`).toBeLessThan(REHEAT_MOVE_MS);
