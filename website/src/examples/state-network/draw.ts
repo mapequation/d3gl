@@ -21,8 +21,9 @@ const palette = (path: readonly number[]): string | undefined =>
  * - **Physical** — the derived physical network (flow-sized nodes, bent links). A physical node whose
  *   state nodes span several modules is a **pie chart** (a wedge per module, sized by flow); a
  *   single-module node is a solid disc.
- * - **State** — every state node on a golden-angle **rosette** around its physical node, coloured by
- *   module. `net.lod({ modules })` (the **LOD** control) aggregates the state nodes into their modules.
+ * - **State** — the state graph as an ordinary network with its modules, exactly what
+ *   `net.data(stateGraph, { modules })` gives: laid out on its own (**State layout: Nested** lays it out by
+ *   module), and `net.lod()` (the **LOD** control) cuts its module tree, with a ring around each open module.
  * - **Both** — state nodes confined **inside** each physical node's container disc, with state-level
  *   links: the memory structure in its physical context. Hover, click or drag a container: it acts as
  *   its state nodes.
@@ -35,11 +36,13 @@ const palette = (path: readonly number[]): string | undefined =>
  * and label names its `level` ("physical" or "state"), so the tooltip and labels below need no id mapping.
  *
  * The data is synthetic (`state-network-data.ts`): an LFR physical network + node2vec trigrams, node
- * labels `1,2,…` (physical) and `(i,j)` (state). `layout({ backend })` lays out the physical graph — **Force**
- * (main-thread, synchronous), **Worker** (off-thread, progressive), or **GPU** (WebGL2 Barnes-Hut,
- * falling back to Worker when unavailable) — and derives the rosette from it each streamed frame (#182);
- * `fit: true` has the camera **frame the layout** on every backend — following it as it converges on
- * Worker/GPU, once as it lands on Force. Scroll to zoom, drag to pan; dragging a node moves it, and
+ * labels `1,2,…` (physical) and `(i,j)` (state). **Each view keeps its own layout** (#495): `layout({ backend })`
+ * lays out the view on screen — the physical graph in the Physical and Both views, which share it, the state
+ * graph in the State view — with **Force** (main-thread, synchronous), **Worker** (off-thread, progressive) or
+ * **GPU** (WebGL2 Barnes-Hut, falling back to Worker when unavailable). A view shown for the first time is laid
+ * out with the last options, from where its nodes are (the state nodes start around their physical node), and
+ * every view keeps its positions across switches. `fit: true` has the camera **frame the layout** on every
+ * backend. Scroll to zoom, drag to pan; dragging a node reheats the layout of the view it is in, and
  * ⌘/Ctrl-drag pans even over a node (#178).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
@@ -51,6 +54,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let builtN = -1;
   let builtBackend = ""; // re-run layout() when the Backend control changes, even without new data
   let builtModules: boolean | null = null;
+  let builtNested = false; // the state view's layout: by module (nested) or flat
 
   // Same interactive options as the directed map of modules: multi-select, node-drag, hover rings — plus
   // a tooltip. In the physical view it shows a node's flow + its module share(s); elsewhere the node label.
@@ -88,6 +92,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const halfArrow = options.links !== "Line"; // default: half-arrows (the map-of-modules glyph)
       const backend = options.backend === "GPU" ? "gpu" : options.backend === "Worker" ? "worker" : "force";
       const withModules = options.modules !== "Off";
+      const nested = withModules && options.stateLayout === "Nested";
       const dataChanged = !data || builtN !== n;
       // Backend and Modules also re-load the network and re-lay it out.
       const layoutChanged = dataChanged || builtBackend !== backend || builtModules !== withModules;
@@ -119,19 +124,27 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       if (layoutChanged) {
         // fit: true (#238, #427) frames the layout with the camera: as it converges on worker/gpu, once as
         // it lands on force. Opens framed, no top-left flash.
-        net.stateNetwork(g.graph, { modules: withModules ? g.stateModules : undefined, view }).layout({ backend, fit: true });
+        net.stateNetwork(g.graph, { modules: withModules ? g.stateModules : undefined, view }).layout({ backend, fit: true, nested });
         builtBackend = backend;
         builtModules = withModules;
-      } else net.view(view);
+        builtNested = nested;
+      } else {
+        net.view(view); // each view keeps its layout; one never shown is laid out now
+        // The state layout changed: lay out the state view again (the physical graph has no modules to nest).
+        if (nested !== builtNested && view === "state") net.layout({ backend, fit: true, nested });
+        if (view === "state") builtNested = nested;
+      }
 
       // LOD applies to the state view (its nodes carry the module tree): the engine keeps the request across view
-      // switches and draws the physical (every pie) and both views in full. Default Off. "Modules" cuts on the
-      // provided partition; "Standard" coarsens the state graph structurally.
+      // switches and draws the physical (every pie) and both views in full. Default Off. "Modules" cuts the state
+      // view's module tree — its default, as for any network with modules — with a ring around each open module;
+      // "Standard" coarsens the state graph structurally.
       const lodOn = options.lod !== "Off" && (withModules || options.lod !== "Modules");
       net.lod(
         lodOn
           ? {
-              modules: options.lod === "Modules" ? g.stateModules : undefined,
+              source: options.lod === "Modules" ? "modules" : "structure",
+              moduleBoundary: options.lod === "Modules" ? {} : undefined,
               // "Auto" (0) ⇒ omitted, i.e. the cut's tree-adaptive default.
               expandPx: (options.expand as number) || undefined,
               maxAggregateRadius: options.maxRadius as number,

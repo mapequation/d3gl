@@ -1,0 +1,13 @@
+---
+"@mapequation/d3gl": minor
+---
+
+State networks keep a layout per view (#495):
+
+- **The state view is the plain network over the state graph and its modules**, exactly what `data(stateGraph, { modules })` gives: `lod()` cuts its module tree by default (with `moduleBoundary` rings), `layout({ nested })` lays it out by module, and hits carry the module `path`. `stateNetwork()` now checks `modules` as `data()` does (a record for every state node, exactly once) and throws on a misaligned assignment.
+- **Each view keeps its own layout.** `layout()` lays out the view on screen like a plain network's: the physical graph in the physical and both views, which share that layout, the state graph in the state view. A view switch keeps every view's positions; a view never laid out is laid out when it is first shown, with the app's last `layout()` options, from where its nodes are (the state nodes from a rosette around their physical node); a run a switch interrupted goes on, warm, when its view is shown again. **Breaking:** `layout({ backend: "positions", positions })` in the state view takes the state nodes' positions (it took the physical ones), and throws on a length that does not match the view's graph.
+- **The both view keeps each state node's place in its container**, which follows the physical layout; a dot dragged there stays where it was put. New `net.positions`: the positions of the view on screen (in the both view the state dots', which no graph holds).
+- **A drag reheats the layout of the view it is in**, also after a view switch, on the force, worker and GPU backends; in the both view a container drag reheats the physical layout and its state dots ride along. One coordinate scale (#401): a layout without `fit` is no longer rescaled to the viewport when it settles, so a drag never jumps in scale; `fit: true` frames a layout with the camera.
+- A new `stateNetwork()` keeps the app's `lod()` request, as `data()` does.
+- The both view no longer re-resolves its whole style on every streamed layout frame: its containers and dots are re-sized when the layout's scale moves a step (~9%).
+- The both view's containers are outlined by a 1 px ring at every zoom, in a darker shade of their own fill (was a 1.5-world-unit black ring). New `InstancedCirclesData.bordersPx`: `borders` as screen-px ring widths on a world layer, applied in the shader.

@@ -836,6 +836,8 @@ interface ViewLayout {
   nestedDiscs: { tree: LODTree; discs: BoundaryDiscs; size: ArrayLike<number> | undefined; drag?: NestedDragCache } | null;
   moduleTree: { graph: NetworkGraph; modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; tree: LODTree } | null;
   moduleSprings: { tree: LODTree; graph: NetworkGraph; springs: ModuleSprings | null } | null;
+  /** Which LOD tree its run's worker streams, so a drag's reheat after a switch back adopts it again. */
+  lodWorkerSource: "structure" | "spatial" | null;
 }
 
 /** Which layout a state-network view draws (#495): the physical and both views share the physical one. */
@@ -845,7 +847,7 @@ function layoutFamily(view: "state" | "physical" | "both"): "state" | "physical"
 
 /** A state-network layout that has not run yet (#495). */
 function newViewLayout(graph: NetworkGraph, hierarchy: Hierarchy | null): ViewLayout {
-  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, nestedDiscs: null, moduleTree: null, moduleSprings: null };
+  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null };
 }
 
 /** `opts` continued from where the nodes are (#495): a warm flat or nested start, for a view laid out on first show
@@ -1648,6 +1650,7 @@ export class Network extends BaseEngine {
       layout.interrupted = true;
     } else {
       layout.handle = this.layoutHandle;
+      layout.lodWorkerSource = this.layoutHandle ? this.lodWorkerSource : null;
       this.detachLayout();
     }
     layout.opts = this.layoutOpts;
@@ -1667,6 +1670,7 @@ export class Network extends BaseEngine {
     this.nestedDiscs = layout.nestedDiscs;
     this.moduleTreeCache = layout.moduleTree;
     this.moduleSpringsCache = layout.moduleSprings;
+    this.lodWorkerSource = layout.lodWorkerSource;
   }
 
   /** Stop the layout parked by a view switch (#495): the state network is replaced, or the engine destroyed. */
