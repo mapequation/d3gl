@@ -225,11 +225,11 @@ export interface NetworkStyle {
   nodeFill?: NodeFillSpec;
   /**
    * The app's colour for a module, by its module path (#494): `(modulePath) => cssColour | undefined`, e.g.
-   * `@mapequation/c3`'s `hierarchy().colorOf`. Whatever {@link nodeFill} is, a state network's **pie wedges**
-   * take it (else they keep the engine's own colours); a `nodeFill: { by: "module" }` without its own `color`
-   * takes it; and a state network with no `nodeFill` colours its nodes, discs and containers by it instead of
-   * the engine's palette. So nodes can be filled by flow or metadata while the pies keep the app's module
-   * colours. Asked once per module per `style()` call — a later `style({ moduleColor })` recolours — never per
+   * `@mapequation/c3`'s `hierarchy().colorOf`. Whatever {@link nodeFill} is, a state network's **pie wedges** and
+   * both-view **containers** take it (else they keep the engine's own colours); a `nodeFill: { by: "module" }`
+   * without its own `color` takes it; and a state network with no `nodeFill` colours its nodes and discs by it
+   * instead of the engine's palette. So nodes can be filled by flow or metadata while the pies and containers
+   * keep the app's module colours. Asked once per module per `style()` call — a later `style({ moduleColor })` recolours — never per
    * frame; `undefined` (no colour for a module) takes the default fill.
    */
   moduleColor?: ModuleColor;
@@ -1251,7 +1251,7 @@ export class Network extends BaseEngine {
   /** The resolved module fills of a state network (#494), kept across the both view's radius-only
    *  re-resolutions (one per streamed layout frame), so a frame never asks a colour accessor again. Keyed by
    *  the fill spec; dropped by `style()` and a new state network. */
-  private stateFills: { spec: NodeFillSpec | undefined; state?: ResolvedNodeFill; physical?: ResolvedNodeFill; pie?: Uint8Array; palettes: ModulePalette[] } | null = null;
+  private stateFills: { spec: NodeFillSpec | undefined; state?: ResolvedNodeFill; physical?: ResolvedNodeFill; pie?: Uint8Array; container?: Uint8Array; palettes: ModulePalette[] } | null = null;
   /** {@link fillSpec}'s result for the style's (nodeFill, moduleColor) and whether a state network has modules. */
   private fillSpecKept: { nodeFill: NodeFillSpec | undefined; moduleColor: ModuleColor | undefined; state: boolean; spec: NodeFillSpec | undefined } | null = null;
   /** The module colours of a module tree's aggregates (#494) under a `{ by: "module" }` fill, per (tree, style):
@@ -1441,7 +1441,7 @@ export class Network extends BaseEngine {
    *
    *  The selection follows the switch (#316, #494): a physical node becomes all its state nodes, a state node
    *  (or a `both`-view container's state nodes) its physical node, and `on("select")` hears the mapped
-   *  selection. The hover is cleared. The app's {@link lod} carries over: the new view applies what it takes. */
+   *  selection. The hover is cleared. The app's {@link lod} carries over: the state view draws it, the others in full. */
   view(view: "state" | "physical" | "both"): this {
     if (!this.stateData || view === this.activeView) return this;
     const sel = this.selectedIds(this.NODE_LAYER);
@@ -1522,14 +1522,12 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The part of the app's LOD request `options` the active state-network view takes (#494): the state view
-   * all of it; the physical view a request that names no module partition (`modules` are the state nodes',
-   * so they cannot cut the physical graph; a structural or spatial cut can, as before); the both view none
+   * The app's LOD request `options` as the active state-network view takes it (#494): the state view all of it;
+   * the physical view none until its pies are LOD-aware (#174: a cut would hide every pie); the both view none
    * (its containers hold every state node). O(1).
    */
   private viewLOD(options: NetworkLODOptions): NetworkLODOptions | null {
-    if (!this.stateData || this.activeView === "state") return options;
-    return this.activeView === "physical" && !options.modules ? options : null;
+    return !this.stateData || this.activeView === "state" ? options : null;
   }
 
   /** Size the container / rosette radii against the current physical layout, so they track the layout scale
@@ -1633,16 +1631,16 @@ export class Network extends BaseEngine {
    * streamed frame, so call this before `layout()` there too. `lod(false)` turns LOD off but keeps the
    * hierarchy, so re-enabling reuses its tree.
    *
-   * In state-network mode ({@link stateNetwork}, #494) the request holds across {@link view} switches, and each
-   * view applies what it can: the state view all of it, the physical view a structural or spatial cut (not a
-   * `modules` partition, which names state nodes), the both view none (its containers hold every state node).
-   * Call it once, in any view. A new {@link stateNetwork} drops it.
+   * In state-network mode ({@link stateNetwork}, #494) the request holds across {@link view} switches and applies
+   * to the state view only: the physical view draws in full, every pie with it, until pies are LOD-aware (#174),
+   * and the both view's containers hold every state node. Call it once, in any view. A new {@link stateNetwork}
+   * drops it.
    */
   lod(options: NetworkLODOptions | false): this {
     if (this.stateData) {
-      // State-network mode (#494): the request is remembered across view switches, and each view applies what
-      // it can take ({@link viewLOD}) — so an app calls lod() once, in any view. A view that takes none (the
-      // both view, whose containers hold every state node) keeps drawing in full: nothing to change here.
+      // State-network mode (#494): the request is remembered across view switches and drawn by the state view
+      // only ({@link viewLOD}) — so an app calls lod() once, in any view. The physical and both views keep
+      // drawing in full (every pie, every container): nothing to change there.
       this.stateLODRequest = options || null;
       const applied = options ? this.viewLOD(options) : null;
       if (!applied && !this.lodOptions) return this;
@@ -3028,10 +3026,19 @@ export class Network extends BaseEngine {
     };
   }
 
-  /** A container's fill (#494): its physical node's module colour (the app's `{ by: "module" }` palette, or the
-   *  engine's own with no `nodeFill`), else the app's single colour, else the default. Per-node RGBA or one CSS. */
+  /** A container's fill (#494): its physical node's module colour — the app's `moduleColor` whatever the node
+   *  fill; without one, a `{ by: "module" }` fill's colour or the engine's own with no `nodeFill` — else the app's
+   *  single colour, else the default. Per-node RGBA or one CSS. */
   private containerFill(): { rgba: Uint8Array | null; css: string } {
     const sg = this.stateData;
+    const moduleColor = this.styleOpts.moduleColor;
+    if (sg && moduleColor && this.stateModules && this.pieWedges) {
+      // The app's module palette whatever the node fill (#494): each container its physical node's colour, by
+      // the plain physical disc's rule (its first wedge's module), from the levels' palette, once per style.
+      const fills = this.stateFillsFor(this.fillSpec());
+      fills.container ??= moduleFillColors(this.levelModules().physical, moduleColor, DEFAULT_NODE_FILL, this.statePalette(moduleColor));
+      return { rgba: fills.container, css: DEFAULT_NODE_FILL };
+    }
     const spec = this.fillSpec();
     if (sg && (spec === undefined || isModuleFill(spec))) {
       const fill = this.resolvedFill(sg.physical);

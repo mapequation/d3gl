@@ -464,7 +464,7 @@ describe("physical-view pie highlight (#175)", () => {
     h.remove();
   });
 
-  it("the pie never outlives the lane that drew it: lod() in the physical view (pies are not LOD-aware yet, #174) and data() drop it", async () => {
+  it("the pie never outlives the lane that drew it: the state view's LOD lane and data() drop it; lod() in the physical view keeps it (#174, #494)", async () => {
     const live = new Set<string>();
     const origSet = WebGLBackend.prototype.setInstancedLayer;
     const origRemove = WebGLBackend.prototype.removeInstancedLayer;
@@ -480,13 +480,19 @@ describe("physical-view pie highlight (#175)", () => {
     const net = await physicalPies(h);
     expect(live.has("pie"), "the fixture drew no pie").toBe(true);
 
+    // The physical view draws in full until pies are LOD-aware (#174): asked for there, LOD keeps every pie,
+    // and is remembered for the state view (#494).
     net.lod({});
+    expect(net.lodSource, "the physical view took the LOD").toBe("none");
+    expect(live.has("pie"), "lod() in the physical view hid the pies").toBe(true);
+    net.view("state");
     // The LOD lane must actually have taken over — `unregisterLanes()` (LOD on, no tree yet) also drops
     // the pie, and would pass the stale-pie check below without exercising the lane swap at all.
-    expect(live.has("nodes"), "lod() did not hand the lane to the LOD frontier").toBe(true);
+    expect(net.lodSource, "the state view did not draw the remembered LOD").not.toBe("none");
+    expect(live.has("nodes"), "the state view's LOD lane drew no nodes").toBe(true);
     expect(live.has("pie"), "a stale pie layer survived the switch to the LOD lane").toBe(false);
-    net.lod(false);
-    expect(live.has("pie"), "the pie did not come back with LOD off").toBe(true);
+    net.view("physical");
+    expect(live.has("pie"), "the pie did not come back in the physical view").toBe(true);
 
     // Same contract when the state network is replaced by a plain graph: its lane has no pie to emit.
     net.data(buildGraph({ nodeCount: 2, source: [0], target: [1], directed: false }));

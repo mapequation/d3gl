@@ -101,7 +101,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       let hiFlow = 0;
       for (const f of g.graph.physical.flow!) if (f > hiFlow) hiFlow = f;
       // Without a palette the engine colours modules itself; `moduleColor` gives the app's palette to every view's
-      // nodes, containers and pie wedges (and keeps the pies in it when `nodeFill` colours nodes by a metric).
+      // nodes, containers and pie wedges (and keeps the pies and containers in it when `nodeFill` colours nodes
+      // by a metric).
       // The "both" view sizes its state dots to their containers itself (in world units).
       net.style({
         moduleColor: options.colors === "Palette" ? palette : undefined,
@@ -123,9 +124,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         builtModules = withModules;
       } else net.view(view);
 
-      // LOD applies only to the state view (its nodes carry the module tree); default Off. "Modules" cuts
-      // on the provided partition; "Standard" coarsens the state graph structurally.
-      const lodOn = view === "state" && options.lod !== "Off" && (withModules || options.lod !== "Modules");
+      // LOD applies to the state view (its nodes carry the module tree): the engine keeps the request across view
+      // switches and draws the physical (every pie) and both views in full. Default Off. "Modules" cuts on the
+      // provided partition; "Standard" coarsens the state graph structurally.
+      const lodOn = options.lod !== "Off" && (withModules || options.lod !== "Modules");
       net.lod(
         lodOn
           ? {

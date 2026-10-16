@@ -886,7 +886,7 @@ net
 net.view("physical"); // pie glyphs for overlapping nodes · net.view("state") for the rosette
 
 // Your own module palette, in every view: state nodes, pie wedges and physical discs (#494). With a
-// nodeFill by a metric (`{ by: "flow", scale }`) the nodes follow it and the pie wedges keep the palette.
+// nodeFill by a metric (`{ by: "flow", scale }`) the nodes follow it; pie wedges and containers keep the palette.
 net.style({ moduleColor: (modulePath) => palette(modulePath) });
 ```
 
@@ -894,9 +894,9 @@ net.style({ moduleColor: (modulePath) => palette(modulePath) });
 **both** view a container hovers, selects and drags as its state nodes; a view switch carries the selection
 over (a physical node ↔ its state nodes), and every hit, selection and label says its `level`
 (`"physical"` or `"state"`), so the app names an id without mapping it. Its dots and containers are world
-regions, while its links keep your `sizeMode`. Call `lod()` once: it holds across view switches, and each
-view applies what it can (the state view all of it, the physical view a structural or spatial cut, the both
-view none). Under `nodeFill: { by: "module" }` a collapsed module takes its own colour from your palette.
+regions, while its links keep your `sizeMode`. Call `lod()` once: it holds across view switches and applies
+to the state view; the physical view draws in full, every pie with it, until pies are LOD-aware. Under a
+module palette a collapsed module takes its own colour from it.
 
 The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
 of a disc — no wedge texture, no per-fragment loop), so a physical view with many overlapping nodes draws

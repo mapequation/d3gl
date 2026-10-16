@@ -598,7 +598,7 @@ describe("the both view draws its links in the app's sizeMode (#494 review, 1)",
 });
 
 describe("the app's lod() holds across state-network views (#494 review, 2)", () => {
-  it("state(lod) → both → lod(change) → state draws the changed LOD; physical → state likewise", async () => {
+  it("state(lod) → both → lod(change) → state draws the changed LOD; physical (in full, with its pies) → state likewise", async () => {
     const { graph, modules } = fixture();
     const net = await engine(host());
     net.stateNetwork(graph, { modules, view: "state" });
@@ -614,12 +614,13 @@ describe("the app's lod() holds across state-network views (#494 review, 2)", ()
     net.view("state");
     expect(net.lodSource, "the state view came back without the changed LOD").toBe("spatial");
 
-    // The physical view takes a structural or spatial cut, not the state nodes' partition; it keeps the request.
+    // The physical view draws in full, every pie with it, until pies are LOD-aware (#174); it keeps the request.
     net.view("physical");
-    expect(net.lodSource, "the physical view takes a spatial cut").toBe("spatial");
+    expect(net.lodSource, "the physical view took the app's spatial LOD").toBe("none");
+    expect(net.toSVG(), "the app's LOD hid the physical view's pies").toMatch(/<path[^>]*fill="rgba?\(/);
     net.lod({ modules });
-    expect(net.lodSource, "a state-node partition cannot cut the physical graph").toBe("none");
-    expect(net.toSVG(), "the physical view draws its pies again").toMatch(/<path[^>]*fill="rgba?\(/);
+    expect(net.lodSource).toBe("none");
+    expect(net.toSVG(), "lod() in the physical view hid its pies").toMatch(/<path[^>]*fill="rgba?\(/);
     net.view("state");
     expect(net.lodSource, "the state view came back without the LOD asked for in the physical view").toBe("modules");
     net.lod(false);
@@ -794,6 +795,33 @@ describe("the app's module palette reaches the pies whatever the node fill: styl
     expect(b?.radii).toBe(a?.radii);
     expect(b?.angles).toBe(a?.angles);
     expect(b?.colors, "the colours did not change").not.toBe(a?.colors);
+    net.destroy();
+  });
+
+  it("flow-filled nodes: the both view's containers take moduleColor, by the physical disc's rule", async () => {
+    const { graph, modules } = fixture();
+    const net = await engine(host());
+    net.style({ nodeFill: { by: "flow", scale: () => "#00c000" }, moduleColor: colorOf }).stateNetwork(graph, { modules, view: "both" });
+    place(net);
+    /** The fill of the stroked (container) circle centred on physical `p`, as `r,g,b`. */
+    const containerFill = (p: number): string | undefined => {
+      for (const m of net.toSVG().matchAll(/<circle([^>]*)>/g)) {
+        const a = m[1] ?? "";
+        const num = (k: string) => Number(new RegExp(`\\b${k}="([^"]+)"`).exec(a)?.[1] ?? NaN);
+        if (!(num("stroke-width") > 0) || Math.abs(num("cx") - POS[2 * p]!) > 0.01 || Math.abs(num("cy") - POS[2 * p + 1]!) > 0.01) continue;
+        const rgb = /fill="rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(a);
+        return rgb ? `${rgb[1]},${rgb[2]},${rgb[3]}` : /fill="([^"]+)"/.exec(a)?.[1];
+      }
+      return undefined;
+    };
+    // Physical 1 holds module [1] alone (red), physical 2 module [2] (blue), physical 0 a pie whose first wedge is [1].
+    expect(containerFill(1)).toBe(RGB["#d62728"]!.join(","));
+    expect(containerFill(2)).toBe(RGB["#1f77b4"]!.join(","));
+    expect(containerFill(0)).toBe(RGB["#d62728"]!.join(","));
+    // The state dots keep the flow fill.
+    const img = await frame(net);
+    const [x, y] = statePos(graph, 3);
+    expect(near(rgbaAt(img, x, y).slice(0, 3), [0, 192, 0]), `state dot ${rgbaAt(img, x, y)}`).toBe(true);
     net.destroy();
   });
 

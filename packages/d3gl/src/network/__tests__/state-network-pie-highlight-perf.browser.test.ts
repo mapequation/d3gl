@@ -28,10 +28,11 @@ import { GlBufferSpy, perfHost, sweepFrames, zoomSteps, type GlBufferUsage } fro
  *   - **node-drag**: every drag frame (the engine folds a frame's moves into one, #367) re-emits the
  *     pie (pre-existing, #314) but hands it the SAME cached `selected` array the selection built — no
  *     O(wedges) flag rebuild per frame, and the renderer's reference check skips the flag upload.
- *   - **LOD on**: the frontier emits no pie (pies are not LOD-aware yet, #174). The leg pins that the
- *     no-LOD pie is REMOVED when LOD switches on — it used to linger on the backend, stale — and that no
- *     pie work runs per hover or per zoom frame there. When #174 lands, this leg is where the frontier
- *     pie's own O(visible) signature goes.
+ *   - **LOD requested**: the physical view draws in full until pies are LOD-aware (#174; #494 review: the
+ *     app's LOD must not hide the pies), so an `lod()` asked for there changes nothing. The leg pins that the
+ *     full-detail lane and its pie stay, with the LOD-off signatures: a hover is uniforms only, a zoom frame
+ *     re-emits nothing and uploads N-independently. When #174 lands, this leg is where the LOD frontier's pie
+ *     and its own O(visible) signature go.
  *
  * ONE ENGINE for every leg, LOD toggled last — never a second WebGL engine after a large one (#287).
  */
@@ -62,8 +63,6 @@ const HL_LAYER_COUNT = 4;
 const RING_BYTES_PER_EVENT = 4 * 1024;
 // Selection change: the flag columns the pushes carry, plus the ring and headroom for it.
 const SELECT_SLACK_BYTES = 16 * 1024;
-// LOD on: the frontier re-cut uploads per frame, screen-bounded (same ceiling as network-sweep-perf).
-const LOD_UPLOAD_BYTES_PER_FRAME = 1024 * 1024;
 // Wall-clock ceilings, split constant + linear (AGENTS.md §Scaling a browser guard). A hover move is a
 // CPU pick (pickNodes scans the full graph with LOD off — the linear term) + one ring emit + four uniform
 // writes + a render submit: measured median 0.2 ms at 20k (local headless Chromium, under load), so 1.5 ms
@@ -217,7 +216,7 @@ let hoverOff: EventLeg;
 let selectOff: EventLeg & { flagBytes: number; pieFlagLength: number; pieFlagSum: number };
 let zoomOff: { baseEmits: number; pieEmits: number; radiusCalls: number; moduleCalls: number; strokeCalls: number; gpu: GlBufferUsage; frames: number; worstMs: number };
 let dragOff: { moves: number; pieEmits: number; distinctSelected: number; sameAsSelection: boolean; radiusCalls: number; moduleCalls: number; strokeCalls: number; worstMs: number; medianMs: number };
-let lodOn: { nodesLive: boolean; pieLive: boolean; pieEmits: number; hoverBaseEmits: number; hoverChanges: number; hoverEvents: number; zoomBaseEmits: number; zoomUploadPerFrame: number; frames: number; pieLiveAfter: boolean };
+let lodAsked: { lodSource: string; nodesLive: boolean; pieLive: boolean; pieEmits: number; hoverBaseEmits: number; hoverChanges: number; hoverEvents: number; zoomBaseEmits: number; zoomUploadPerFrame: number; frames: number; pieLiveAfter: boolean; moduleCalls: number };
 
 const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
@@ -419,16 +418,15 @@ beforeAll(async () => {
     }
 
     moduleCallsAfterBuild = moduleCalls - moduleCallsAtBuild; // hover, select, zoom and drag: none
-    // ── LOD ON (physical view) ─────────────────────────────────────────────────────────────────────
+    // ── LOD requested in the physical view (the Navigator's spatial LOD): drawn in full, pies kept (#174) ──
     {
       lane.reset();
-      net.lod({ declutter: true, maxAggregateRadius: 24 });
-      // Proof the LOD lane took over: `unregisterLanes()` (LOD on, no tree yet) would drop the pie too.
+      const moduleBefore = moduleCalls;
+      net.lod({ source: "spatial", declutter: true, maxAggregateRadius: 24 });
       const nodesLive = lane.live.has("nodes");
       const pieLive = lane.live.has("pie");
-      // Not the LOD-off row: at k = 1 the frontier is aggregates, and that row can fall entirely in the
-      // gaps between them — no re-target at all, so "no re-emit" would hold vacuously. A viewport-wide
-      // lattice at 20 px pitch crosses glyphs and gaps alike (measured: ~135 distinct targets at 20k).
+      // A viewport-wide lattice at 20 px pitch crosses glyphs and gaps alike (measured: ~135 distinct targets
+      // at 20k), so the hover sweep re-targets whatever the view draws.
       const lattice: [number, number][] = [];
       for (let y = LATTICE_PITCH / 2; y < H; y += LATTICE_PITCH) for (let x = LATTICE_PITCH / 2; x < W; x += LATTICE_PITCH) lattice.push([x, y]);
       const leg = hoverSweep(lattice);
@@ -436,13 +434,14 @@ beforeAll(async () => {
       const before = gl.mark();
       const { frames } = sweepFrames(zoomSteps(W, H), (t) => net.setTransform(t));
       const zoom = gl.since(before);
-      lodOn = {
+      lodAsked = {
+        lodSource: net.lodSource,
+        moduleCalls: moduleCalls - moduleBefore,
         nodesLive,
         pieLive,
         pieEmits: lane.emits.get("pie") ?? 0,
         hoverBaseEmits: leg.baseEmits,
-        // One HL push reaches "pie" per hover change (a no-op under LOD — no pie layer), so this counts
-        // the re-targets the sweep actually produced.
+        // One HL push reaches "pie" per hover change, so this counts the re-targets the sweep produced.
         hoverChanges: leg.pieStyles,
         hoverEvents: leg.events,
         zoomBaseEmits: lane.baseEmits(),
@@ -526,14 +525,16 @@ describe(`state-network pie highlight — per-interaction cost at N=${N.toLocale
     expect(dragOff.medianMs, `drag move median ${dragOff.medianMs.toFixed(2)}ms (worst ${dragOff.worstMs.toFixed(2)}ms)`).toBeLessThan(DRAG_MOVE_MS);
   });
 
-  it("LOD ON — the no-LOD pie is removed, and no pie work runs per hover or per zoom frame (#174)", () => {
-    expect(lodOn.nodesLive, "lod() did not hand the lane to the LOD frontier").toBe(true);
-    expect(lodOn.pieLive, "a stale no-LOD pie layer survived lod() on").toBe(false);
-    expect(lodOn.pieLiveAfter, "a pie layer reappeared under LOD").toBe(false);
-    expect(lodOn.pieEmits, "the LOD lane emitted a pie").toBe(0);
-    expect(lodOn.hoverChanges, "the LOD hover sweep never re-targeted — the no-re-emit check below is vacuous").toBeGreaterThan(0);
-    expect(lodOn.hoverBaseEmits, "an LOD hover re-emitted base-lane geometry").toBe(0);
-    expect(lodOn.zoomBaseEmits, "the LOD lane never re-cut during the zoom sweep — the upload bound below is vacuous").toBeGreaterThan(0);
-    expect(lodOn.zoomUploadPerFrame, "the LOD zoom upload is not screen-bounded").toBeLessThan(LOD_UPLOAD_BYTES_PER_FRAME);
+  it("LOD requested — the physical view keeps its full-detail lane and every pie, with the LOD-off signatures (#174, #494)", () => {
+    expect(lodAsked.lodSource, "the physical view took the app's LOD").toBe("none");
+    expect(lodAsked.nodesLive).toBe(true);
+    expect(lodAsked.pieLive, "lod() hid the pies").toBe(true);
+    expect(lodAsked.pieLiveAfter, "the pie layer went away").toBe(true);
+    expect(lodAsked.hoverChanges, "the hover sweep never re-targeted — the no-re-emit check below is vacuous").toBeGreaterThan(0);
+    expect(lodAsked.hoverBaseEmits, "a hover re-emitted base-lane geometry").toBe(0);
+    expect(lodAsked.zoomBaseEmits, "the static lane re-emitted during the zoom sweep").toBe(0);
+    expect(lodAsked.pieEmits, "the pie re-ran per frame").toBe(0);
+    expect(lodAsked.zoomUploadPerFrame, "per-frame upload grew beyond the ring overlay").toBeLessThan(RING_BYTES_PER_EVENT);
+    expect(lodAsked.moduleCalls, "the request re-resolved the module colours").toBe(0);
   });
 });
