@@ -12,10 +12,10 @@ import { NestedDrag, NestedDragCache } from "./nested-drag.js";
 import { easeCubicOut, positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, nodeModules, moduleAggregateColors, type ModulePathNode, type ModuleColorOptions, type NodeModules } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
-import { rosettePositions } from "./rosette.js";
+import { rosetteOffsets, rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type LayoutContinuation, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import { incidenceSourceEdges } from "./spatial-rows.js";
@@ -123,7 +123,11 @@ class OpenModuleTreeHit extends ModuleTreeHit {
 class LeafRecordHit implements NetworkHit {
   readonly aggregate = false;
   readonly count = 1;
-  constructor(private readonly record: ModuleNode) {}
+  constructor(
+    private readonly record: ModuleNode,
+    /** State-network mode (#495): the state view's leaves carry their state module path. */
+    readonly level?: "state",
+  ) {}
   get path(): number[] {
     return Array.from(this.record.path);
   }
@@ -306,8 +310,8 @@ export interface NetworkStyle {
 }
 
 /** How node positions are produced. Applies to plain graphs ({@link Network.layout}) and, since #182,
- *  state networks ({@link Network.stateNetwork}) — there every backend lays out the **physical** graph
- *  and the state/both views' rosette is derived from it. */
+ *  state networks ({@link Network.stateNetwork}) — there each view keeps a layout of its own (#495): the
+ *  physical and both views the physical graph's, the state view the state graph's. */
 export interface NetworkLayoutOptions {
   /** `"positions"` uses caller-supplied coordinates; `"force"` runs the in-library force layout on the
    *  main thread; `"worker"` runs it off-thread with progressive streaming; `"gpu"` runs a WebGL2
@@ -751,8 +755,9 @@ export interface StateNetworkOptions {
   color?: ModuleColorOptions;
   /** Which view to show first. Default `"physical"` (so the overlapping-module pie glyphs are visible). */
   view?: "state" | "physical" | "both";
-  /** State-view rosette radius (world units). Default: auto — bounded by the physical layout spacing.
-   *  (The `"both"` view ignores this; its rosette is confined to the physical container radius.)
+  /** Radius (world units) of the rosette of state nodes around their physical node that the state view's
+   *  layout starts from when the state view is first shown after the physical layout (#495). Default: auto —
+   *  a third of the physical layout's spacing. (The `"both"` view's rosette fills its containers instead.)
    *  @see {@link rosettePositions} */
   rosetteRadius?: number;
 }
@@ -794,35 +799,78 @@ const LAYER_NAMES = ["leaf-links", "links", "leaf-arrows", "arrows", "module-bou
 const HL_LAYERS = ["phys-container", "nodes", "leaf-links", "links", "leaf-arrows", "arrows", "pie"] as const;
 /** The empty `hoverInstances` run (#476), shared: pushed after every base emit, so it must not allocate. */
 const NO_INSTANCES: [number, number] = [0, 0];
-/** Scale a laid-out graph's positions (in place) to fill the view at the default `k = 1` zoom — the
- *  same "scale the layout, don't fit-transform" approach the directed-map-of-modules example uses, so
- *  the network opens framed without a custom transform (which would fight d3-zoom's own transform, #171).
- *  Centres on the centroid and scales the 97th-percentile radius (robust to force-layout fling-outs) to
- *  ~0.85× half the view. */
-function scaleToViewport(positions: Float32Array, count: number, width: number, height: number): void {
-  if (count <= 1) return;
-  let cx = 0, cy = 0;
-  for (let p = 0; p < count; p++) { cx += positions[2 * p]!; cy += positions[2 * p + 1]!; }
-  cx /= count;
-  cy /= count;
-  const dists = new Float64Array(count);
-  for (let p = 0; p < count; p++) dists[p] = Math.hypot(positions[2 * p]! - cx, positions[2 * p + 1]! - cy);
-  dists.sort();
-  const r = dists[Math.floor(count * 0.97)] || dists[count - 1] || 1;
-  const s = ((Math.min(width, height) / 2) * 0.85) / r;
-  for (let p = 0; p < count; p++) {
-    positions[2 * p] = width / 2 + (positions[2 * p]! - cx) * s;
-    positions[2 * p + 1] = height / 2 + (positions[2 * p + 1]! - cy) * s;
-  }
-}
-
-/** Characteristic node spacing of a laid-out graph (bounding-box diagonal ÷ √count) — the scale the
- *  state-network container / rosette radii are sized against (#171). */
 /** The share of a `both`-view container's radius its state rosette fills ({@link rosettePositions}). */
 const ROSETTE_FILL = 0.72;
 /** A `both`-view state dot's radius as a share of the radius of its equal share of the rosette's area (#494). */
 const DOT_SHARE = 0.6;
+/** Steps per doubling the `both`-view sizing scale is rounded to (#495): the containers and dots are re-sized
+ *  only when the physical layout's spacing has moved a step, ~9%, not on every streamed frame. */
+const SIZING_STEPS = 8;
+/** Darkening of a `both`-view container's ring: a darker shade of its own fill, as module glyphs are ringed (#495). */
+const CONTAINER_RING_DARKEN = 0.62;
+/** A `both`-view container ring's width in screen px at every zoom (#495), as thin as a module boundary ring. */
+const CONTAINER_RING_PX = 1;
 
+/** A state network's module hierarchy, or a plain network's (#326): the records with each node's record index. */
+type Hierarchy = { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; recordOf: Int32Array };
+
+/**
+ * One of a state network's two layouts (#495): the physical graph's (drawn by the physical and both views) and the
+ * state view's own. The engine works on the active one's fields; a view switch parks the other's state here and
+ * restores it on return, so a view keeps its positions, its settled layout (alive for a drag's reheat) and its
+ * module tree across switches.
+ */
+interface ViewLayout {
+  /** The graph this layout places: `sg.physical` or `sg.state`. */
+  readonly graph: NetworkGraph;
+  /** The module hierarchy of that graph (the state view's modules), as `data(graph, { modules })` holds it. */
+  readonly hierarchy: Hierarchy | null;
+  /** A settled run, parked with its transport alive (a drag reheats it). Never a live run: a switch stops that. */
+  handle: WorkerLayoutHandle | null;
+  opts: NetworkLayoutOptions;
+  laidOut: boolean;
+  /** The positions hold a layout or a seed ({@link Network.seedView}). */
+  placed: boolean;
+  /** A switch stopped its run before it settled: it runs again, warm, when its view is shown. */
+  interrupted: boolean;
+  /** Where that run stood (#495): it goes on over the ticks it had left at the heat it had reached. Null when its
+   *  transport could not say (a nested solve, a transition): it then runs again from full heat. */
+  resume: LayoutContinuation | null;
+  nestedDiscs: { tree: LODTree; discs: BoundaryDiscs; size: ArrayLike<number> | undefined; drag?: NestedDragCache } | null;
+  moduleTree: { graph: NetworkGraph; modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; tree: LODTree } | null;
+  moduleSprings: { tree: LODTree; graph: NetworkGraph; springs: ModuleSprings | null } | null;
+  /** Which LOD tree its run's worker streams, so a drag's reheat after a switch back adopts it again. */
+  lodWorkerSource: "structure" | "spatial" | null;
+  /** The camera its views had when they were last shown (#495 review): restored when one is shown again, as its
+   *  layout is. Null until its views are first left. The physical and both views share it, as they share the
+   *  positions it frames. */
+  camera: ViewTransform | null;
+}
+
+/** Which layout a state-network view draws (#495): the physical and both views share the physical one. */
+function layoutFamily(view: "state" | "physical" | "both"): "state" | "physical" {
+  return view === "state" ? "state" : "physical";
+}
+
+/** A state-network layout that has not run yet (#495). */
+function newViewLayout(graph: NetworkGraph, hierarchy: Hierarchy | null): ViewLayout {
+  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null, camera: null };
+}
+
+/** `opts` continued from where the nodes are (#495): a warm flat or nested start, for a view laid out on first show
+ *  from its seed or again after a switch interrupted its run. */
+function warmLayout(opts: NetworkLayoutOptions): NetworkLayoutOptions {
+  if (opts.nested) return { ...opts, nested: { ...(typeof opts.nested === "object" ? opts.nested : {}), warm: true } };
+  return { ...opts, warm: true };
+}
+
+/** The `both`-view sizing scale for a layout `spacing` (#495): rounded to {@link SIZING_STEPS} steps per doubling. */
+function sizingScale(spacing: number): number {
+  return 2 ** (Math.round(SIZING_STEPS * Math.log2(spacing)) / SIZING_STEPS);
+}
+
+/** Characteristic node spacing of a laid-out graph (bounding-box diagonal ÷ √count) — the scale the
+ *  state-network container radii are sized against (#171). */
 function physicalSpacing(positions: Float32Array, count: number): number {
   if (count <= 1) return 1;
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -970,7 +1018,7 @@ export class Network extends BaseEngine {
    * node's record index (`recordOf[id]`, from the one-time alignment check). Independent of
    * {@link lodOptions}, so `lod(false)` keeps it; a new `data()` replaces it. Null without one.
    */
-  private hierarchy: { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; recordOf: Int32Array } | null = null;
+  private hierarchy: Hierarchy | null = null;
   /**
    * The module tree last built from a hierarchy (#326), keyed by (graph, modules, moduleLinks) identity,
    * so LOD toggles, source switches and re-layouts reuse it instead of rebuilding. Part of the engine's
@@ -1228,11 +1276,26 @@ export class Network extends BaseEngine {
    *  main thread is holding under the cursor. Null when no drag is in flight. */
   private dragReapply: (() => void) | null = null;
   /** State-network mode (#171): the ingested state network, or null for a plain graph. When set, the
-   *  engine renders one of its two views ({@link activeView}) and {@link layout} lays out the physical
-   *  graph + derives rosette state positions. */
+   *  engine renders one of its three views ({@link activeView}), each with the layout it draws ({@link viewLayouts}). */
   private stateData: StateNetworkGraph | null = null;
+  /** The state network's two layouts (#495): the physical graph's (the physical and both views) and the state
+   *  view's own. The active one's state is in the engine's fields; the other's is parked here. */
+  private viewLayouts: { physical: ViewLayout; state: ViewLayout } | null = null;
+  /** The `both` view's graph (#495): the state graph's topology with positions of its own, derived from the
+   *  physical layout and each state node's place in its container ({@link bothPlaces}). */
+  private bothGraph: NetworkGraph | null = null;
+  /** Each state node's place in its `both`-view container (#495): its offset from its physical node, in container
+   *  radii. Seeded from the rosette; a drag in the both view moves it. Kept for the state network. */
+  private bothPlaces: Float32Array | null = null;
+  /** The app's last {@link layout} options in state-network mode (#495): what a view never laid out runs with
+   *  when it is first shown, and a view whose run a switch interrupted when it is shown again. */
+  private lastStateLayout: NetworkLayoutOptions | null = null;
+  /** The continuation the run a view switch is starting goes on from (#495), read by {@link startStreamingLayout}
+   *  during that call only. */
+  private layoutResume: LayoutContinuation | null = null;
+
   /** The active view of the state network (#171). `physical` = aggregated links + overlapping-module
-   *  pie glyphs; `state` = state nodes on spread rosette rings (+ optional module LOD); `both` = state
+   *  pie glyphs; `state` = the state graph with its modules, laid out on its own (#495); `both` = state
    *  nodes confined inside their physical node's container disc, with state-level links. Ignored unless
    *  {@link stateData} is set. */
   private activeView: "state" | "physical" | "both" = "physical";
@@ -1258,9 +1321,9 @@ export class Network extends BaseEngine {
    *  built when the style is applied to the tree, never per frame. */
   private moduleAggregateFill: { tree: LODTree; palette: ModulePalette; fill: FillAggregate | undefined } | null = null;
   /** `both`-view physical **container** radii (world units), sized so a physical node's confined state
-   *  rosette fits inside it. Computed from the physical positions, relative to {@link stateSpacing}. */
+   *  dots fit inside it. Computed from the physical positions, relative to {@link stateSpacing}. */
   private containerRadii: Float32Array | null = null;
-  /** Characteristic physical-node spacing of the (viewport-scaled) layout — the scale container/rosette
+  /** Characteristic physical-node spacing of the layout, rounded to {@link sizingScale}'s steps — the scale container
    *  radii are sized against, so they track the layout instead of a fixed constant (#171). 0 until sized. */
   private stateSpacing = 0;
   /** `both`-view state-node dot radii (world units), each sized to its container's rosette so the dots
@@ -1279,7 +1342,8 @@ export class Network extends BaseEngine {
   /** The LOD the app asked for in state-network mode (#494), kept across view switches; each view applies the
    *  part it takes ({@link viewLOD}) as {@link lodOptions}. Dropped by a new state network, as `lodOptions` is. */
   private stateLODRequest: NetworkLODOptions | null = null;
-  /** State-view rosette radius override (world units); null = auto from the physical layout scale. */
+  /** The radius (world units) of the rosette the state view's layout starts from on first show (#495); null =
+   *  auto from the physical layout scale. */
   private rosetteRadius: number | null = null;
   /** Registry key + layer name for the physical-view pie glyphs (drawn on top of the node discs). */
   private readonly PIE_LAYER = "pie";
@@ -1327,6 +1391,11 @@ export class Network extends BaseEngine {
 
   /** Drop the state-network mode and everything derived from it (#494). */
   private clearStateNetwork(): void {
+    this.stopParkedLayouts();
+    this.viewLayouts = null;
+    this.bothGraph = null;
+    this.bothPlaces = null;
+    this.lastStateLayout = null;
     this.stateData = null;
     this.pieWedges = null;
     this.stateModules = null;
@@ -1352,8 +1421,23 @@ export class Network extends BaseEngine {
 
   /** {@link setActiveGraph} without its rebuild: the caller rebuilds once it is done with the new graph. */
   private adoptGraph(graph: NetworkGraph): void {
-    this.moved = null; // leaf ids of the previous graph: the rebuild below draws the new one in full
     this.haltLayout(); // any worker layout is tied to the previous graph's buffers
+    // …and so is everything the previous graph was laid out with.
+    this.moduleTreeCache = null;
+    this.moduleSpringsCache = null;
+    this.cancelModuleTreeJob();
+    this.laidOut = false;
+    this.nestedDiscs = null;
+    this.showGraph(graph);
+  }
+
+  /**
+   * Point the engine at `graph` to draw it, and drop what it drew of the previous one: per-node style arrays sized
+   * to it, the LOD trees, the resolved style. Unlike {@link adoptGraph} it leaves the layout alone, so a state
+   * network's view switch keeps each view's layout state (#495, {@link applyView}).
+   */
+  private showGraph(graph: NetworkGraph): void {
+    this.moved = null; // leaf ids of the previous graph: the rebuild below draws the new one in full
     this.graph = graph;
     // Drop per-node style arrays sized to the PREVIOUS graph — the idiomatic re-render on a graph swap is
     // `net.data(g).style(s)`, but data() rebuilds first, and resolving a stale-length `flowBorder.flow` /
@@ -1368,12 +1452,7 @@ export class Network extends BaseEngine {
     if (this.styleOpts.nodeRadius instanceof Float32Array && this.styleOpts.nodeRadius.length !== n) {
       this.styleOpts = { ...this.styleOpts, nodeRadius: undefined };
     }
-    // New topology + position buffer: drop the retained LOD tree, the module tree and resolved-style cache.
-    this.moduleTreeCache = null;
-    this.moduleSpringsCache = null;
-    this.cancelModuleTreeJob();
-    this.laidOut = false;
-    this.nestedDiscs = null;
+    // New topology + position buffer: drop the retained LOD tree and the resolved-style cache.
     this.lodBorderStyle = null; // the previous graph's tree and its ring colours
     this.moduleAggregateFill = null; // and its module colours (#494)
     this.boundaryWidths = null; // and its module-boundary widths
@@ -1396,60 +1475,82 @@ export class Network extends BaseEngine {
   /**
    * Render a **state (higher-order / memory) network** (#171). The engine ingests the state network
    * (state graph + its engine-derived physical graph, from {@link buildStateGraph}) and a per-**state-node**
-   * module assignment, then lets you toggle between:
-   *  - the **state view** — every state node on a golden-angle rosette around its physical node, coloured
-   *    by module, and
+   * module assignment, then lets you toggle between three views ({@link view}):
    *  - the **physical view** — the aggregated physical network, where a physical node whose state nodes span
    *    ≥2 modules renders as a **pie chart** (wedges ∝ per-module flow/count, module-coloured) and a
-   *    single-module node as a solid disc.
+   *    single-module node as a solid disc;
+   *  - the **state view** — the state graph as an ordinary network with its modules, exactly what
+   *    `data(stateGraph, { modules })` gives (#495): {@link lod} cuts its module tree by default, with module
+   *    boundary rings, `layout({ nested })` lays it out by module, and hits carry {@link NetworkHit.path};
+   *  - the **both view** — the state nodes inside their physical node's container disc, with state-level links.
    *
-   * Call {@link layout} next: in state-network mode it lays out the **physical** graph with any layout
-   * backend (`"positions"`, `"force"`, or the streaming `"worker"` / `"gpu"` / `"auto"`) and derives the
-   * rosette state positions from it — on every streamed frame for the streaming backends — so every view
-   * has coordinates. State nodes always sit on that deterministic rosette; laying them out by force around
-   * their physical node is planned (#189). Switch views with {@link view}: `"physical"` (pies),
-   * `"state"` (spread rosette, module LOD via {@link lod}), or `"both"` (state nodes confined inside their
-   * physical container, state-level links). Colours + pie wedges + container radii are derived once here.
+   * Each view keeps its own layout (#495): {@link layout} lays out the active view's graph — the physical graph
+   * in the physical and both views, which share that layout, the state graph in the state view — and a view
+   * switch keeps every view's positions. A view whose layout never ran is laid out when it is first shown, with
+   * the app's last {@link layout} options, from where its nodes are: the state view from a rosette of the state
+   * nodes around their physical node, the physical view from its state nodes' centroids. In the both view each
+   * state node keeps its place in its container, which follows the physical layout. Colours + pie wedges +
+   * container radii are derived once here.
+   *
+   * `modules` are checked against the state graph here, as `data()` checks its hierarchy: a record for every
+   * state node, exactly once, or this throws with the engine unchanged. The app's {@link lod} request holds
+   * (`data()` keeps it too); an explicit `modules` in it named the previous network's, so the new network's own
+   * modules take its place.
    */
   stateNetwork(graph: StateNetworkGraph, opts: StateNetworkOptions = {}): this {
+    const recordOf = opts.modules ? moduleRecordIndex(graph.state.nodeCount, opts.modules) : null;
     // Interaction state belongs to the previous network's ids: drop it before the new graph draws.
     if (this.stateData) this.dropNodeInteraction();
     this.clearStateNetwork();
     this.stateData = graph;
     this.activeView = opts.view ?? "physical";
     this.rosetteRadius = opts.rosetteRadius ?? null;
-    // A new state network invalidates any prior LOD config: its `modules` were keyed to the OLD state
-    // graph, so a stale `lod({ modules })` would fail `buildModuleLODTree`'s "record for every node" check
-    // when `layout()` rebuilds the tree below. Callers re-apply `lod()` after `layout()` with fresh modules.
+    // The app's LOD request holds (#495), as data() keeps it; an explicit `modules` alias in it was keyed to the
+    // previous state graph, so the new network's own hierarchy takes its place.
+    const request = this.stateLODRequest;
+    this.stateLODRequest = request?.modules ? { ...request, modules: undefined, moduleLinks: undefined } : request;
     this.lodOptions = null;
-    this.stateLODRequest = null;
-    this.hierarchy = null; // a plain graph's hierarchy (#326) doesn't describe the state network
+    this.hierarchy = null;
     // Without modules (#494): no pies and no module colours; every view still draws.
     this.stateModules = opts.modules ?? null;
     this.stateColorOpts = opts.color;
     this.pieWedges = opts.modules ? physicalPieWedges(graph, opts.modules, opts.pie) : null;
-    // Container / rosette radii follow the layout scale: sized now from whatever positions the physical graph
-    // holds, so a `both` view has its containers from the first frame (#494), and again after every layout frame.
+    const hierarchy = opts.modules && recordOf ? { modules: opts.modules, moduleLinks: undefined, recordOf } : null;
+    this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: newViewLayout(graph.state, hierarchy) };
+    // The both view draws the state graph at positions of its own: each state node at its place in its container.
+    this.bothGraph = { ...graph.state, positions: new Float32Array(2 * graph.state.nodeCount) };
+    this.bothPlaces = rosetteOffsets(graph, ROSETTE_FILL);
+    // Container radii follow the layout scale: sized now from whatever positions the physical graph holds, so a
+    // `both` view has its containers from the first frame (#494), and again whenever that scale moves a step.
     this.computeStateSizing();
-    this.applyView();
+    this.applyView(null);
     return this;
   }
 
   /** Toggle the active view of the ingested state network (#171): `"physical"` (aggregated network with
-   *  overlapping-module pie glyphs), `"state"` (spread rosette of state nodes), or `"both"` (state nodes
+   *  overlapping-module pie glyphs), `"state"` (the state graph with its modules, #495), or `"both"` (state nodes
    *  confined inside their physical container disc, state-level links). No-op without {@link stateNetwork}.
    *
    *  The selection follows the switch (#316, #494): a physical node becomes all its state nodes, a state node
    *  (or a `both`-view container's state nodes) its physical node, and `on("select")` hears the mapped
-   *  selection. The hover is cleared. The app's {@link lod} carries over: the state view draws it, the others in full. */
+   *  selection. The hover is cleared. The app's {@link lod} carries over: the state view draws it, the others in full.
+   *
+   *  Each view keeps its layout (#495): the switch keeps the positions of every view, and a settled layout stays
+   *  alive for a drag to reheat when its view is shown again. A layout still running when its view is left stops
+   *  there and goes on, warm, when the view is shown again; a view never laid out is laid out with the app's
+   *  last {@link layout} options as it is first shown ({@link whenSettled} follows that run). Each layout keeps its
+   *  camera too: a view shown again comes back at the view (pan and zoom) it was left at; the physical and both
+   *  views, which draw the same physical layout, share theirs. A view shown for the first time keeps the current
+   *  camera, or is framed by its first layout when the app's layout options have `fit`. */
   view(view: "state" | "physical" | "both"): this {
     if (!this.stateData || view === this.activeView) return this;
     const sel = this.selectedIds(this.NODE_LAYER);
     const mapped = sel && sel.size > 0 ? this.mapSelection(sel, this.activeView, view) : null;
     // Drop the old view's ids (selection and hover) before the new graph draws with them.
     this.dropNodeInteraction();
+    const from = this.activeView;
     this.activeView = view;
-    this.applyView();
+    this.applyView(from);
     if (mapped) this.select(this.NODE_LAYER, mapped.length > 0 ? mapped : null);
     return this;
   }
@@ -1503,22 +1604,141 @@ export class Network extends BaseEngine {
     return this.stateData ? this.activeView : null;
   }
 
-  /** Point the engine at the active view's graph + per-view node colours, preserving state-network mode.
-   *  Positions live in each view's graph buffer (filled by {@link layout}); a view switch re-derives the
-   *  view-appropriate rosette from the (already laid-out) physical positions. */
-  private applyView(): void {
+  /**
+   * The positions of the nodes the engine draws, interleaved `[x, y, …]` in world units, indexed by the ids its
+   * hits carry: the graph's own `positions` for a plain network; in a state network the active view's (#495) —
+   * the physical graph's, the state graph's, or in the both view the state dots' at their places in their
+   * containers, which no graph holds. Live: read it when needed (a layout writes into it, and may replace it).
+   * Null without data.
+   */
+  get positions(): Float32Array | null {
+    return this.graph?.positions ?? null;
+  }
+
+  /**
+   * Show the active view (#495): park the layout of the view left (its settled run alive, a running one stopped
+   * to go on later), point the engine at the view's graph — the state view with the state modules as its
+   * hierarchy, as `data(state, { modules })` holds them — and restore that view's layout. A view whose nodes were
+   * never placed starts from the other view's ({@link seedView}); one never laid out, or whose run a switch
+   * stopped, is laid out with the app's last options. `from` is null for a new state network. One rebuild.
+   */
+  private applyView(from: Network["activeView"] | null): void {
     const sg = this.stateData;
-    if (!sg) return;
-    const physical = this.activeView === "physical";
-    // The view's fill and the both view's dot radii are resolved from the view at style resolution
-    // ({@link resolvedStyle}, #494): a switch never writes the app's style.
+    const layouts = this.viewLayouts;
+    const both = this.bothGraph;
+    if (!sg || !layouts || !both) return;
+    const to = this.activeView;
+    const layout = layouts[layoutFamily(to)];
+    const switching = from === null || layoutFamily(from) !== layoutFamily(to);
+    this.stopDragLoop?.(); // a drag still re-cooling belongs to the view being left
+    this.dragReapply = null;
+    if (from === null) this.haltLayout(); // whatever ran belongs to the previous network
+    else if (switching) {
+      const left = layouts[layoutFamily(from)];
+      left.camera = { ...this.latestTransform() }; // its views' camera, for when they are shown again
+      this.parkLayout(left);
+    }
     // The app's LOD, remembered across switches (#494), applied as far as this view takes it ({@link viewLOD}).
     this.lodOptions = this.stateLODRequest ? this.viewLOD(this.stateLODRequest) : null;
-    this.deriveStatePositions(); // view-dependent rosette (spread vs. container-confined)
-    this.adoptGraph(physical ? sg.physical : sg.state);
+    this.showGraph(to === "both" ? both : layout.graph);
+    this.hierarchy = to === "state" ? layout.hierarchy : null;
+    if (switching) this.restoreLayout(layout);
+    if (!layout.placed) this.seedView(layoutFamily(to));
+    // Each layout keeps its camera (#495 review): its own scale, not the other view's. O(1), d3-zoom re-seeded, no
+    // gesture. A view shown for the first time keeps the camera, or is framed by its first layout's `fit` below.
+    if (from !== null && switching && layout.camera) this.frameView(layout.camera);
+    if (to === "both") this.syncBoth();
     // The new graph's tree, built before the one rebuild (as lod() would after the switch): O(tree size), per switch.
     if (this.lodOptions) this.recomputeLODGeometry();
+    const last = this.lastStateLayout;
+    if (switching && last && last.backend !== "positions" && (layout.interrupted || !layout.laidOut)) {
+      // An interrupted run goes on at the heat it had reached, over the ticks it had left (a flat streaming run).
+      this.layoutResume = layout.interrupted ? layout.resume : null;
+      layout.resume = null;
+      this.runLayout(layout.placed ? warmLayout(last) : last); // rebuilds
+      this.layoutResume = null;
+      return;
+    }
     this.rebuild();
+  }
+
+  /**
+   * Park the active layout in `layout` as its view is left (#495). A settled run keeps its transport alive (a
+   * worker, or a GPU solve on its device), so a drag reheats it when the view is back; a run still going, or a
+   * transition still easing, stops where it is and goes on, warm, when the view is shown again.
+   */
+  private parkLayout(layout: ViewLayout): void {
+    if (this.layoutLive || this.nestedSolving || this.transition?.running === true) {
+      // Read where it stands before stopping it: it goes on from there, not from full heat.
+      layout.resume = this.transition?.running ? null : (this.layoutHandle?.continuation?.() ?? null);
+      this.haltLayout();
+      layout.handle = null;
+      layout.interrupted = true;
+    } else {
+      layout.handle = this.layoutHandle;
+      layout.lodWorkerSource = this.layoutHandle ? this.lodWorkerSource : null;
+      this.detachLayout();
+    }
+    layout.opts = this.layoutOpts;
+    layout.laidOut = this.laidOut;
+    layout.nestedDiscs = this.nestedDiscs;
+    layout.moduleTree = this.moduleTreeCache;
+    layout.moduleSprings = this.moduleSpringsCache;
+    this.cancelModuleTreeJob(); // a run that waited for it was stopped above
+  }
+
+  /** Make `layout` the engine's active layout again (#495): the inverse of {@link parkLayout}. */
+  private restoreLayout(layout: ViewLayout): void {
+    this.layoutHandle = layout.handle;
+    layout.handle = null;
+    this.layoutOpts = layout.opts;
+    this.laidOut = layout.laidOut;
+    this.nestedDiscs = layout.nestedDiscs;
+    this.moduleTreeCache = layout.moduleTree;
+    this.moduleSpringsCache = layout.moduleSprings;
+    this.lodWorkerSource = layout.lodWorkerSource;
+  }
+
+  /** Stop the layout parked by a view switch (#495), and drop any run it would resume: {@link stopLayout}, a new
+   *  state network, or the engine destroyed. */
+  private stopParkedLayouts(): void {
+    const layouts = this.viewLayouts;
+    if (!layouts) return;
+    for (const layout of [layouts.physical, layouts.state]) {
+      layout.handle?.stop();
+      layout.handle = null;
+      layout.interrupted = false;
+      layout.resume = null;
+    }
+  }
+
+  /**
+   * Place a view's nodes from the other view's, the first time it is shown (#495): the state nodes on a rosette
+   * around their physical node ({@link StateNetworkOptions.rosetteRadius}, else a third of the physical layout's
+   * spacing), or each physical node at its state nodes' centroid. A no-op while the other view has no positions
+   * either. O(state nodes), once per view.
+   */
+  private seedView(family: "state" | "physical"): void {
+    const sg = this.stateData;
+    const layouts = this.viewLayouts;
+    if (!sg || !layouts || !layouts[family === "state" ? "physical" : "state"].placed) return;
+    if (family === "state") {
+      const radius = this.rosetteRadius ?? 0.33 * physicalSpacing(sg.physical.positions, sg.physicalCount);
+      sg.state.positions.set(rosettePositions(sg, { radius }));
+    } else {
+      const { offsets, states } = sg.physicalToState;
+      const from = sg.state.positions;
+      const to = sg.physical.positions;
+      for (let p = 0; p < sg.physicalCount; p++) {
+        const start = offsets[p]!, end = offsets[p + 1]!;
+        if (end === start) continue;
+        let x = 0, y = 0;
+        for (let i = start; i < end; i++) { const st = states[i]!; x += from[2 * st]!; y += from[2 * st + 1]!; }
+        to[2 * p] = x / (end - start);
+        to[2 * p + 1] = y / (end - start);
+      }
+    }
+    layouts[family].placed = true;
   }
 
   /**
@@ -1530,13 +1750,14 @@ export class Network extends BaseEngine {
     return !this.stateData || this.activeView === "state" ? options : null;
   }
 
-  /** Size the container / rosette radii against the current physical layout, so they track the layout scale
-   *  instead of a fixed constant: O(physical nodes), on a layout (or streamed layout) frame only, and only
-   *  when the scale changed. The both view's dot radii follow lazily ({@link bothDots}). */
+  /** Size the container radii against the current physical layout, so they track the layout scale instead of a
+   *  fixed constant: O(physical nodes) to measure the scale, on a frame that moved the physical nodes in the both
+   *  view, and O(physical nodes) more only when it moved a step ({@link sizingScale}, #495). The both view's dot
+   *  radii follow lazily ({@link bothDots}). */
   private computeStateSizing(): void {
     const sg = this.stateData;
     if (!sg) return;
-    const spacing = physicalSpacing(sg.physical.positions, sg.physicalCount);
+    const spacing = sizingScale(physicalSpacing(sg.physical.positions, sg.physicalCount));
     if (spacing === this.stateSpacing && this.containerRadii) return;
     this.stateSpacing = spacing;
     const { offsets } = sg.physicalToState;
@@ -1574,18 +1795,31 @@ export class Network extends BaseEngine {
     return dots;
   }
 
-  /** Write the state-node positions for the active view into `state.positions`: a **spread** rosette for
-   *  the `state` view (bounded by the layout spacing) and a **container-confined** rosette for the `both`
-   *  view (inside each physical container disc). Reads the current physical positions; a no-op-ish zero
-   *  placement until {@link layout} has run. */
-  private deriveStatePositions(): void {
+  /**
+   * The both view's state-dot positions (#495): each state node at its place in its container ({@link bothPlaces}),
+   * which sits at its physical node. O(state nodes), in place, on a frame that moved the physical nodes (a layout
+   * frame, a container drag, a transition) in the both view. The containers are re-sized first when the layout's
+   * scale moved a step ({@link computeStateSizing}); only then does the style re-resolve, for the dots' radii.
+   */
+  private syncBoth(): void {
     const sg = this.stateData;
-    if (!sg || this.activeView === "physical") return;
-    const container = this.containerRadii;
-    const spread = this.rosetteRadius ?? (this.stateSpacing > 0 ? this.stateSpacing * 0.33 : 12);
-    const radius =
-      this.activeView === "both" && container ? (p: number) => ROSETTE_FILL * container[p]! : () => spread;
-    sg.state.positions.set(rosettePositions(sg, { radius }));
+    const both = this.bothGraph;
+    const places = this.bothPlaces;
+    if (!sg || !both || !places) return;
+    const containers = this.containerRadii;
+    this.computeStateSizing();
+    const radii = this.containerRadii;
+    if (!radii) return;
+    if (radii !== containers && this.activeView === "both") this.resolvedCache = null; // the dots' radii follow the containers
+    const phys = sg.physical.positions;
+    const pos = both.positions;
+    const physicalOf = sg.stateToPhysical;
+    for (let s = 0; s < both.nodeCount; s++) {
+      const p = physicalOf[s]!;
+      const r = radii[p]!;
+      pos[2 * s] = phys[2 * p]! + r * places[2 * s]!;
+      pos[2 * s + 1] = phys[2 * p + 1]! + r * places[2 * s + 1]!;
+    }
   }
 
   /** Set visual style (node radius/fill/sizeMode; link & arrow appearance). */
@@ -1988,11 +2222,33 @@ export class Network extends BaseEngine {
     this.refreshLabels();
   }
 
-  /** Configure layout / supply positions (the pluggable contract proper lands in #101). */
+  /**
+   * Configure layout / supply positions (the pluggable contract proper lands in #101).
+   *
+   * In state-network mode ({@link stateNetwork}, #495) this lays out the active view's graph like a plain
+   * network's: the physical graph in the physical and both views, the state graph — with its modules, so
+   * `nested` lays it out by module — in the state view. `"positions"` supplies that graph's positions (one
+   * `[x, y]` per node of it), and omitting `backend` runs `"force"`. As for a plain network, the positions are the
+   * layout's own, on every backend (#401): `fit: true` frames them with the camera. The options are remembered:
+   * a view never laid out runs them when it is first shown.
+   */
   layout(opts: NetworkLayoutOptions): this {
-    if (this.stateData) return this.layoutStateNetwork(opts);
+    if (this.stateData) this.lastStateLayout = opts;
+    return this.runLayout(opts);
+  }
+
+  /** {@link layout} without remembering `opts` in state-network mode: a view laid out on show runs this (#495). */
+  private runLayout(input: NetworkLayoutOptions): this {
+    const sg = this.stateData;
+    // A state network's layouts default to the main-thread force (#182), as they always have.
+    const opts: NetworkLayoutOptions = sg && input.backend === undefined ? { ...input, backend: "force" } : input;
+    // The graph the layout places: the active view's, except the both view, which draws the physical layout.
+    const graph = sg && this.activeView === "both" ? sg.physical : this.graph;
+    if (sg && graph && opts.backend === "positions" && opts.positions && opts.positions.length !== 2 * graph.nodeCount) {
+      throw new Error(`network.layout: ${opts.positions.length / 2} positions for the ${this.activeView} view's ${graph.nodeCount} ${graph === sg.state ? "state" : "physical"} nodes`);
+    }
     this.layoutOpts = { ...this.layoutOpts, ...opts };
-    if (this.graph) {
+    if (graph) {
       // Any backend change cancels a running worker layout before re-seeding positions. A prior
       // worker-streamed LOD tree belongs to that superseded run, so drop it: the new layout either
       // re-streams one (worker backend) or builds one on the main thread (force/positions).
@@ -2022,16 +2278,15 @@ export class Network extends BaseEngine {
       // A warm start (#454, #328) continues the positions on screen: no seed disc — unless there are none to
       // continue (a graph never laid out), which makes it the cold layout. O(nodes) once, stopping early.
       const nestedWarm = typeof opts.nested === "object" && opts.nested.warm === true;
-      const warm = opts.backend !== "positions" && (opts.warm === true || (!!nestedTree && nestedWarm)) && hasLayout(this.graph.positions, this.graph.nodeCount);
+      const warm = opts.backend !== "positions" && (opts.warm === true || (!!nestedTree && nestedWarm)) && hasLayout(graph.positions, graph.nodeCount);
       // A flat force layout's first paint sits at the scale it converges to (the force equilibrium). A
       // nested layout ignores `force` — its root disc is 10·√N, the box the camera frames — so it keeps
       // the viewport disc rather than one ~3× wider than that box.
       const streamed = layoutClass(opts.backend) === "streaming" && duration === 0;
-      if (fit && streamed && !warm) seedPositions(this.graph, this.width, this.height, nestedTree ? undefined : { force: opts.force });
+      if (fit && streamed && !warm) seedPositions(graph, this.width, this.height, nestedTree ? undefined : { force: opts.force });
       if (nestedTree) {
         this.startNestedLayout(nestedTree, opts, duration, warm);
       } else if (opts.backend === "positions" && opts.positions) {
-        const graph = this.graph;
         if (duration > 0) {
           const target = graph.positions.slice();
           target.set(opts.positions); // a copy: the caller may reuse its buffer while the transition runs
@@ -2044,12 +2299,11 @@ export class Network extends BaseEngine {
           this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
         }
       } else if (layoutClass(opts.backend) === "streaming") {
-        this.startStreamingLayout(this.graph, opts, warm);
+        this.startStreamingLayout(graph, opts, warm);
       } else if (opts.backend === "force") {
         // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
         // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
         const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
-        const graph = this.graph;
         const from = duration > 0 ? graph.positions.slice() : null; // where a transition eases from
         // The module links pull too (#455), warm or cold: the solve's view of the graph carries them as springs.
         const solved = withModuleSprings(graph, this.flatModuleSprings());
@@ -2084,6 +2338,12 @@ export class Network extends BaseEngine {
       // the settle's {@link releaseFit}) — it never frames the layout being replaced.
       // A nested start still waiting for its module tree (#428) holds the camera: the transport has posted no
       // bound yet, so it is framed when the first one lands ({@link startNestedLayout}) and only zooms in after.
+      if (sg) {
+        // The view's layout ran (#495); the both view's dots follow the physical nodes it placed.
+        const layout = this.viewLayouts?.[layoutFamily(this.activeView)];
+        if (layout) { layout.placed = true; layout.interrupted = false; }
+        if (this.activeView === "both") this.syncBoth();
+      }
       if (this.fitOnLayout) {
         if (streamed) {
           if (!(nestedTree instanceof Promise)) {
@@ -2459,10 +2719,12 @@ export class Network extends BaseEngine {
     const leafStyle = useLod ? this.lodLeafStyle(graph) : null;
     this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;
     if (leafStyle) this.lodStylePosted = leafStyle.version;
+    // A state-network run a view switch stopped goes on where it stood (#495): its ticks left, its heat.
+    const resume = warm ? this.layoutResume : null;
     const workerOpts: WorkerLayoutOptions = {
       width: this.width,
       height: this.height,
-      iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
+      iterations: resume?.iterations ?? opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
       force: opts.force,
       multilevel: opts.multilevel,
       // When LOD is on, the worker builds + streams the tree; its coarsening is shared with the
@@ -2475,7 +2737,7 @@ export class Network extends BaseEngine {
       coarsen: this.lodOptions?.coarsen,
       // A warm start (#454) continues the positions on screen — the worker's and the GPU run's own
       // continuation (#311): no disc, no multilevel seed, a fresh cooling schedule from full heat.
-      ...(warm ? { warm: { heat: 1, decaying: true } } : {}),
+      ...(warm ? { warm: resume?.warm ?? { heat: 1, decaying: true } } : {}),
     };
     // …and the nodes chase its frames from where they are, as a warm nested map's (#454) — unless a worker streams
     // the LOD tree, whose geometry is the solve's: then its frames are painted as they land.
@@ -2800,6 +3062,7 @@ export class Network extends BaseEngine {
       get transport() {
         return solve.transport;
       },
+      continuation: () => solve.continuation?.() ?? null,
       settled,
       stop: () => {
         solve.stop();
@@ -2835,6 +3098,7 @@ export class Network extends BaseEngine {
         this.transition = null;
         this.nestedSolving = false;
         prepare?.();
+        if (this.activeView === "both" && this.stateData) this.syncBoth(); // the dots follow the settled physical layout (#495)
         this.recomputeLODGeometry(true);
         this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
         this.rebuild();
@@ -2848,117 +3112,6 @@ export class Network extends BaseEngine {
         this.nestedSolving = false;
       },
     );
-  }
-
-  /** Post-layout bookkeeping for state-network mode (#171/#182), shared by every backend and every
-   *  streamed frame: size the container/rosette radii against the (current) physical layout scale (the
-   *  `both`-view dot radii with them), and re-derive the active view's rosette positions from the physical
-   *  positions. O(physicalCount) sizing + O(stateCount) rosette placement — cheap enough to call once per
-   *  streamed physical frame (worker/gpu backends) as well as once after a synchronous solve. */
-  private applyStateDerivedPositions(): void {
-    const containers = this.containerRadii;
-    this.computeStateSizing();
-    // The both view draws its dots at the engine's radii (#494): a new scale re-resolves the style's radii
-    // only — the fills (`stateFills`) and `linkColors` (and its warm memo) are kept.
-    if (this.activeView === "both" && this.containerRadii !== containers) this.resolvedCache = null;
-    this.deriveStatePositions();
-  }
-
-  /**
-   * Layout for state-network mode (#171/#182): lay out the **physical** graph (the coarser structure) with
-   * the requested backend, then derive the **rosette** state positions from it. Both view graphs share
-   * their own position buffer, so after this the active view renders immediately.
-   *
-   * - `backend: "positions"` supplies the **physical** positions directly.
-   * - `backend: "force"` runs the in-library multilevel/force layout on the physical graph, synchronously.
-   * - `backend: "worker"` / `"gpu"` / `"auto"` mirror {@link layout}'s async branches, but drive the
-   *   **physical** graph: positions stream progressively into `sg.physical.positions`, and each coalesced
-   *   frame ({@link scheduleLayoutRepaint}) re-derives the rosette from them, so the state/both views converge
-   *   live alongside the physical layout. No worker-built LOD tree is requested here (`lod` stays unset) —
-   *   the state-network LOD tree is over the state/module hierarchy, a different structure from the
-   *   worker's physical-graph coarsening. For the same reason no module tree goes to the GPU seed: a
-   *   `"gpu"` physical layout seeds multilevel from the physical graph's own coarsening (a disc with
-   *   `multilevel: false`), as for a graph without a module hierarchy.
-   */
-  private layoutStateNetwork(opts: NetworkLayoutOptions): this {
-    const sg = this.stateData!;
-    this.layoutOpts = { ...this.layoutOpts, ...opts };
-    const phys = sg.physical;
-    this.haltLayout(); // cancel a running physical-layout worker/GPU stream before re-seeding
-    // fit: true (#238, #427) frames the physical layout via the CAMERA, as the main layout path does, on
-    // every backend: a streamed one frame by frame, a one-go one once as it lands. The state sizing is
-    // scale-relative (computeStateSizing sizes against physicalSpacing), so leaving positions in force scale
-    // is fine; without fit, the `force` backend remaps them to fill the view at k=1 instead.
-    const fit = opts.fit === true;
-    this.fitOnLayout = fit;
-
-    if (opts.backend === "positions" && opts.positions) {
-      phys.positions.set(opts.positions);
-      this.applyStateDerivedPositions();
-      this.recomputeLODGeometry();
-      this.releaseFit(); // with fit: framed once, on the derived positions of the active view
-      return this.rebuild();
-    }
-
-    if (layoutClass(opts.backend) === "streaming") {
-      // A streamed fit opens framed and converges in place (no top-left flash + settle snap on the GPU
-      // backend). Pre-seed so the first paint is framed (the GPU device resolves async → phys is zero until
-      // then); each streamed frame reframes in scheduleLayoutRepaint, released on settle/interaction.
-      if (fit) seedPositions(phys, this.width, this.height, { force: opts.force });
-      let handle: WorkerLayoutHandle | undefined;
-      const onPhysFrame = (): void => this.onStreamedFrame(handle);
-      // One option set for both: a GPU layout that falls back runs this worker layout exactly (#312).
-      const workerOpts: WorkerLayoutOptions = {
-        width: this.width,
-        height: this.height,
-        iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
-        force: opts.force,
-        multilevel: opts.multilevel,
-      };
-      // "auto" expects the worker where the GPU is unsupported: it falls back silently (#375).
-      const started: WorkerLayoutHandle = requestsGpu(opts.backend)
-        ? startGpuLayout(this.whenBackendSettled().then(() => this.gpuDevice()), phys,
-            { ...workerOpts, warnUnsupported: opts.backend === "gpu" }, onPhysFrame)
-        : startWorkerLayout(phys, workerOpts, onPhysFrame);
-      handle = started;
-      this.layoutHandle = started;
-      void started.settled.then(() => {
-        if (this.layoutHandle !== started) return; // a newer layout superseded this one
-        // Without fit, scaleToViewport remaps the physical positions to fill the view at k=1 now that the
-        // stream has stopped writing them. With fit, the camera already tracks the layout — derive + refresh
-        // geometry from the final positions first, then do the final reframe + release (release needs fresh
-        // geometry to frame the settled layout, not the last streamed frame's).
-        if (!fit) scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
-        this.applyStateDerivedPositions();
-        this.recomputeLODGeometry(true);
-        if (fit) this.releaseFit();
-        this.rebuild();
-      });
-      // `worker` seeds `phys.positions` synchronously before returning; the async `gpu` device promise
-      // seeds once it resolves. Either way, deriving now (rather than leaving a stale prior rosette on
-      // screen) is cheap and self-corrects on the first streamed frame regardless.
-      this.applyStateDerivedPositions();
-      this.recomputeLODGeometry();
-      if (fit) this.fitViewToLayout("streaming"); // frame the first paint against the seeded layout
-      return this.rebuild();
-    }
-
-    // Main-thread force (backend: "force", the synchronous default).
-    const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
-    if (opts.multilevel === false) {
-      seedPositions(phys, this.width, this.height, { force: opts.force });
-      new ForceLayout(phys, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
-    } else {
-      multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
-    }
-    // Without fit, scale the layout to fill the view at k=1 (the map-of-modules approach) so it opens framed
-    // without a fit-transform; with fit, the camera frames it once, as it lands. Caller-supplied positions
-    // are taken as-is (already placed).
-    if (!fit) scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
-    this.applyStateDerivedPositions();
-    this.recomputeLODGeometry();
-    this.releaseFit();
-    return this.rebuild();
   }
 
   /** The physical-view pie layer (#171): overlapping (≥2-module) physical nodes as instanced pie wedges,
@@ -2991,7 +3144,9 @@ export class Network extends BaseEngine {
    *  its confined state rosette — drawn UNDER the state nodes/links so state nodes read as "inside" their
    *  physical node. Null outside the `both` view. Its style columns are kept per (radii, fill), so an emit
    *  allocates nothing for them; its highlight columns (#315: `groups` = `stateCount + p`, the container's hit
-   *  id, and `selected`) travel on every emit, as the nodes' do. */
+   *  id, and `selected`) travel on every emit, as the nodes' do. Each disc is outlined by a ring
+   *  {@link CONTAINER_RING_PX} px wide at every zoom, in a darker shade of its own fill (#495): the px width is
+   *  a constant column the shader divides by the disc's px radius, so a zoom rewrites nothing. */
   private containerLayer(): InstancedLayer | null {
     const sg = this.stateData;
     const radii = this.containerRadii;
@@ -3001,8 +3156,8 @@ export class Network extends BaseEngine {
     let cols = this.containerColumns;
     if (!cols || cols.radii !== radii || cols.fill !== fill.rgba) {
       const colors = new Uint8Array(n * 4);
-      // A thin black border ring makes the faint container disc clearly visible (#171 review).
-      const borders = new Float32Array(n);
+      // A thin ring in a darker shade of the disc's own colour makes the faint container visible (#171, #495).
+      const borders = new Float32Array(n).fill(CONTAINER_RING_PX);
       const borderColors = new Uint8Array(n * 4);
       const groups = cols?.groups.length === n ? cols.groups : Float32Array.from({ length: n }, (_, p) => sg.state.nodeCount + p);
       const one = rgbaBytes(fill.css);
@@ -3012,8 +3167,8 @@ export class Network extends BaseEngine {
         colors[4 * p + 1] = c ? c[4 * p + 1]! : one[1];
         colors[4 * p + 2] = c ? c[4 * p + 2]! : one[2];
         colors[4 * p + 3] = 42; // faint — a context backdrop, not a solid glyph
-        borders[p] = Math.min(0.25, 1.5 / radii[p]!); // ≈1.5 world-unit ring
-        borderColors[4 * p + 3] = 255; // opaque black (rgb = 0)
+        for (let c = 0; c < 3; c++) borderColors[4 * p + c] = Math.round(colors[4 * p + c]! * CONTAINER_RING_DARKEN);
+        borderColors[4 * p + 3] = 255;
       }
       cols = this.containerColumns = { radii, fill: fill.rgba, colors, borders, borderColors, groups };
     }
@@ -3022,7 +3177,7 @@ export class Network extends BaseEngine {
       name: this.CONTAINER_LAYER,
       primitive: "circles",
       sizeMode: "world", // world-sized so state nodes stay inside their container at every zoom
-      circles: { centers: sg.physical.positions, radii, colors, borders, borderColors, groups, selected: this.noLodSelectedFor(this.CONTAINER_LAYER), count: n },
+      circles: { centers: sg.physical.positions, radii, colors, borders, borderColors, bordersPx: true, groups, selected: this.noLodSelectedFor(this.CONTAINER_LAYER), count: n },
     };
   }
 
@@ -3082,12 +3237,15 @@ export class Network extends BaseEngine {
       this.streamPending = false;
       this.moved = null; // the streamed frame's full geometry pass below covers any drag move
       this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
-      if (this.stateData) this.applyStateDerivedPositions(); // physical positions just streamed a frame
+      if (this.activeView === "both" && this.stateData) this.syncBoth(); // the physical layout streamed a frame (#495)
       if (!this.drawsWorkerTree()) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       // Fit-on-layout: reframe the camera to the layout's freshly-updated bounds BEFORE the rebuild, so
       // the LOD cut + render run once at the framed transform (no extra emit). Cleared on settle/gesture.
       if (this.fitOnLayout) this.fitViewToLayout("streaming");
     } else {
+      // Every physical node may have moved (a container drag's reheat, a transition): the dots follow (#495). A held
+      // set is state dots the drag placed itself.
+      if (this.moved === "all" && this.activeView === "both" && this.stateData) this.syncBoth();
       this.applyMovedGeometry();
     }
     this.rebuild(); // also hands the spatial trees this repaint replaced back to the worker (#343)
@@ -3207,12 +3365,20 @@ export class Network extends BaseEngine {
    *  (#427). A nested layout's transition stopped mid-ease leaves the nodes between
    *  two layouts, so its discs no longer hold: the modules (and their rings) fall back to their members'
    *  centroid + extent (#329). A spatial LOD tree, refit through the transition, is rebuilt where the
-   *  nodes stopped (#343), and any tree's crowding (#426), held through it, is recomputed there. */
+   *  nodes stopped (#343), and any tree's crowding (#426), held through it, is recomputed there.
+   *
+   *  In a state network it stops every view's layout (#495): no view goes on with a run on its own afterwards,
+   *  and a drag then moves the nodes it holds, as after a plain network's stop. A view never laid out is still
+   *  laid out when it is first shown. */
   stopLayout(): this {
     const running = this.transition?.running === true;
     const live = this.layoutLive;
     const interrupted = running && this.nestedDiscs !== null;
     this.haltLayout();
+    // A state network's hidden view stops too (#495 review): its settled run is stopped, and a run a switch
+    // interrupted no longer goes on when its view is back. Only a view never laid out still gets its first layout
+    // on first show (it has no positions otherwise).
+    this.stopParkedLayouts();
     if (interrupted) this.nestedDiscs = null;
     // The modules and rings redraw around where the members stopped; a spatial tree is rebuilt there, and
     // the crowding follows the nodes to where they stopped. A streamed run stopped mid-way held the crowding
@@ -3228,6 +3394,12 @@ export class Network extends BaseEngine {
   /** {@link stopLayout} without its repaint, for the callers that go on to set new state and rebuild. */
   private haltLayout(): void {
     this.layoutHandle?.stop();
+    this.detachLayout();
+  }
+
+  /** Let go of the layout's handle without stopping it — a settled state-network layout parked by a view switch
+   *  (#495) stays alive for a drag — and clear what belonged to its run. */
+  private detachLayout(): void {
     this.layoutHandle = null;
     this.layoutLive = false;
     this.transition = null;
@@ -3251,6 +3423,7 @@ export class Network extends BaseEngine {
   /** Tear down the engine, cancelling any worker layout first. */
   override destroy(): void {
     this.haltLayout();
+    this.stopParkedLayouts(); // a state network's other view's layout (#495)
     // Cancel a queued LOD build: with the worker stopped nothing streams a tree any more, and a destroyed
     // engine must not coarsen its graph (a React StrictMode re-mount destroys it within the call chain).
     this.lodFallbackScheduled = false;
@@ -3522,11 +3695,13 @@ export class Network extends BaseEngine {
     // State network (#494): the cut is over the active view's graph — state nodes, or the physical view's.
     const level = !this.stateData ? undefined : this.activeView === "physical" ? "physical" : "state";
     if (tree.branch && tree.parent) return new ModuleTreeHit(tree.parent, tree.branch, g, aggregate, count, level);
-    if (level === "state") return aggregate ? { aggregate, count, level } : STATE_LEAF_INFO;
     if (level === "physical") return aggregate ? { aggregate, count, level } : { aggregate, count, level, physical: g };
-    // A structural cut over a graph with a hierarchy (#326): a leaf still reports its own path.
+    // A structural cut over a graph with a hierarchy (#326) — the state view's included (#495): a leaf still
+    // reports its own path.
     const h = this.hierarchy;
-    return h && !aggregate ? new LeafRecordHit(h.modules[h.recordOf[g]!]!) : { aggregate, count };
+    if (h && !aggregate) return new LeafRecordHit(h.modules[h.recordOf[g]!]!, level);
+    if (level === "state") return aggregate ? { aggregate, count, level } : STATE_LEAF_INFO;
+    return { aggregate, count };
   }
 
   /** The module-boundary ring under host CSS px (x, y) the last frame drew for `tree` (#476): its index in
@@ -3554,13 +3729,15 @@ export class Network extends BaseEngine {
    *  container (`stateCount + p`: an aggregate of its state nodes). */
   private leafDatumOf(): (i: number) => NetworkHit {
     const sg = this.stateData;
+    const h = this.hierarchy;
     if (sg) {
       if (this.activeView === "physical") return (p) => ({ aggregate: false, count: 1, level: "physical", physical: p });
+      // The state view holds the state modules as its hierarchy (#495): a state node reports its path.
+      if (this.activeView === "state" && h) return (i) => new LeafRecordHit(h.modules[h.recordOf[i]!]!, "state");
       const S = sg.state.nodeCount;
       const { offsets } = sg.physicalToState;
       return (i) => (i < S ? STATE_LEAF_INFO : { aggregate: true, count: offsets[i - S + 1]! - offsets[i - S]!, level: "physical", physical: i - S });
     }
-    const h = this.hierarchy;
     if (!h) return () => ({ aggregate: false, count: 1 });
     const { modules, recordOf } = h;
     return (i) => new LeafRecordHit(modules[recordOf[i]!]!);
@@ -4054,17 +4231,26 @@ export class Network extends BaseEngine {
    * - **worker / gpu / auto**: the backend pins + reflows the rest (worker off-thread, gpu on the GPU) via
    *   {@link WorkerLayoutHandle.pin}; the main thread writes the held positions every move (zero-lag)
    *   and re-pins them over each streamed frame ({@link dragReapply}, copy mode). Released via
-   *   {@link WorkerLayoutHandle.unpin}. On the gpu backend the physical-view state layout reheats too.
+   *   {@link WorkerLayoutHandle.unpin}.
    * - **positions** (or a worker fallback with no live handle): no sim — the held set just translates.
    *
    * On a landed nested map (any of the reheating backends) none of those runs: {@link runDragLoop}
    * re-solves only the held node's module around it, on the main thread ({@link NestedDrag}).
+   *
+   * Each view of a state network drags its own layout (#495), as a plain network does: the physical view the
+   * physical layout, the state view its own. In the both view a held container is its physical node, held in the
+   * physical layout while that reheats around it, its state dots keeping their places in it; any other held
+   * state dot moves inside its container, held within its disc ({@link placeDots}), the layout left alone.
    */
   protected override beginNodeDrag(hit: HoverHit, sx: number, sy: number): NodeDragSession | null {
-    const graph = this.graph;
-    if (!graph || !this.interactiveOpts?.draggable) return null;
-    const held = this.heldLeavesFor(hit);
-    if (held.length === 0) return null;
+    if (!this.graph || !this.interactiveOpts?.draggable) return null;
+    const leaves = this.heldLeavesFor(hit);
+    if (leaves.length === 0) return null;
+    const sg = this.stateData;
+    const containers = this.heldContainersFor(hit);
+    const dots = sg && this.activeView === "both" ? this.freeDots(leaves, containers) : null;
+    const graph = sg && dots ? sg.physical : this.graph;
+    const held = dots ? containers : leaves;
     // A grab takes the view over, as a zoom/pan gesture does: the camera must hold still under the cursor,
     // so a fit stops following the layout (#427) — a fitted transition finished below keeps the view it has.
     this.fitOnLayout = false;
@@ -4085,11 +4271,10 @@ export class Network extends BaseEngine {
 
     const heldIds = Uint32Array.from(held);
     const heldPos = new Float32Array(held.length * 2); // interleaved held positions, for the worker pin message
-    // `both` view (#494): a grabbed container — or a held selection with containers in it — moves its physical
-    // node along with its state nodes, so the container (drawn at the physical position) goes with them.
-    const physical = this.heldContainersFor(hit);
-    const physPos = physical.length > 0 && this.stateData ? this.stateData.physical.positions : null;
-    const physStart = physPos ? Float32Array.from(physical.flatMap((p) => [physPos[2 * p]!, physPos[2 * p + 1]!])) : null;
+    // The both view's free state dots (#495), moved inside their containers by the same cursor delta.
+    const dotIds = dots ? Uint32Array.from(dots) : null;
+    const bothPos = dotIds ? this.bothGraph?.positions : undefined;
+    const dotStart = dotIds && bothPos ? Float32Array.from({ length: 2 * dotIds.length }, (_, i) => bothPos[2 * dotIds[i >> 1]! + (i & 1)]!) : null;
     // Hold every grabbed leaf at (start + cursor delta), mirrored into `heldPos` for the worker pin. Reads
     // `graph.positions` per call, not once per drag: a GPU layout moved to a shared-memory worker mid-drag
     // swaps it for a view of the shared buffer (#311), and a shared-mode pin sends ids only.
@@ -4101,12 +4286,12 @@ export class Network extends BaseEngine {
         pos[id * 2] = px; pos[id * 2 + 1] = py;
         heldPos[k * 2] = px; heldPos[k * 2 + 1] = py;
       }
-      if (physPos && physStart) {
-        for (let k = 0; k < physical.length; k++) {
-          const p = physical[k]!;
-          physPos[2 * p] = physStart[2 * k]! + dx; physPos[2 * p + 1] = physStart[2 * k + 1]! + dy;
-        }
-      }
+      if (dotIds && dotStart) this.placeDots(dotIds, dotStart, dx, dy);
+    };
+    // What moved: in the both view every dot of a held container ("all": they follow it), else the held set alone.
+    const repaintHeld = (): void => {
+      if (dotIds && held.length > 0) this.repaintDuringDrag();
+      else this.repaintDuringDrag(dotIds ?? heldIds);
     };
     // The grab maps through the DRAWN view (`t0`: what the grab's hit was picked against); each move through
     // the view the next frame draws, so a pinch/scroll mid-drag — even one whose frame has not run yet (#367)
@@ -4117,13 +4302,9 @@ export class Network extends BaseEngine {
       dy = (my - t.y) / t.k - worldStartY;
     };
 
-    // State-network state/both views (#171) render a DERIVED rosette, not a live sim over this.graph,
-    // so a drag there TRANSLATES the grabbed node rather than reheating a fresh sim that would fight
-    // the derived placement. The PHYSICAL view, however, IS the live physical layout (this.graph ===
-    // sg.physical, laid out by layoutHandle) — so it reheats like a normal network (#183): the pinned
-    // physical node holds while the rest reflows, and scheduleLayoutRepaint re-derives the rosette
-    // (state/both) around it. State-view reheat over the deterministic rosette is out of scope (#189).
-    const backend = this.stateData && this.activeView !== "physical" ? "positions" : this.layoutOpts.backend;
+    // Each state-network view drags the layout it draws (#495); a both-view drag of state dots alone moves them
+    // inside their containers and leaves the physical layout alone.
+    const backend = dots && held.length === 0 ? "positions" : this.layoutOpts.backend;
     const handle = this.layoutHandle;
 
     // A settled nested map (any layout backend): re-solve the grabbed node's module around it, on the main
@@ -4150,7 +4331,7 @@ export class Network extends BaseEngine {
         });
       }
       return {
-        move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(heldIds); },
+        move: (mx, my) => { setDelta(mx, my); applyHeld(); repaintHeld(); },
         end: () => this.settleLODPositions(),
       };
     }
@@ -4184,16 +4365,16 @@ export class Network extends BaseEngine {
       applyHeld();
       handle.pin(heldIds, heldPos);
       this.dragReapply = applyHeld;
-      this.repaintDuringDrag(heldIds); // only the held set moved; streamed frames repaint in full (#211)
+      repaintHeld(); // only the held set moved; streamed frames repaint in full (#211)
       return {
-        move: (mx, my) => { setDelta(mx, my); applyHeld(); handle.pin(heldIds, heldPos); this.repaintDuringDrag(heldIds); },
+        move: (mx, my) => { setDelta(mx, my); applyHeld(); handle.pin(heldIds, heldPos); repaintHeld(); },
         end: () => { handle.unpin(); this.dragReapply = null; if (pending === this.transition) pending?.keep(heldIds); this.settleLODPositions(); },
       };
     }
 
     // positions / no live worker: translate the held set under the cursor, no reheat.
     return {
-      move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(heldIds); },
+      move: (mx, my) => { setDelta(mx, my); applyHeld(); repaintHeld(); },
       end: () => this.settleLODPositions(),
     };
   }
@@ -4283,6 +4464,44 @@ export class Network extends BaseEngine {
     const selected = this.selectedIds(this.NODE_LAYER);
     if (selected?.has(id)) return [...selected].map(Number).filter(isContainer).map((c) => c - S);
     return isContainer(id) ? [id - S] : [];
+  }
+
+  /** The held state dots of a both-view drag (#495) that no held container carries: they move in their containers. */
+  private freeDots(leaves: readonly number[], containers: readonly number[]): number[] {
+    const sg = this.stateData;
+    if (!sg || containers.length === 0) return [...leaves];
+    const carried = new Set(containers);
+    return leaves.filter((s) => !carried.has(sg.stateToPhysical[s]!));
+  }
+
+  /** Move both-view state dots to `start + (dx, dy)`, kept inside their container's disc less their own radius,
+   *  and keep each there as its place in its container (#495): O(dots). The bound is a share of the container's
+   *  radius that does not change when the containers re-size (a dot's radius follows its container's). */
+  private placeDots(ids: Uint32Array, start: Float32Array, dx: number, dy: number): void {
+    const sg = this.stateData;
+    const pos = this.bothGraph?.positions;
+    const places = this.bothPlaces;
+    const radii = this.containerRadii;
+    const dots = this.bothDots();
+    if (!sg || !pos || !places || !radii || !dots) return;
+    const phys = sg.physical.positions;
+    for (let k = 0; k < ids.length; k++) {
+      const s = ids[k]!;
+      const p = sg.stateToPhysical[s]!;
+      const r = radii[p]!;
+      let ox = start[2 * k]! + dx - phys[2 * p]!, oy = start[2 * k + 1]! + dy - phys[2 * p + 1]!;
+      const room = Math.max(0, r - dots[s]!);
+      const d = Math.hypot(ox, oy);
+      if (d > room) {
+        const f = d > 0 ? room / d : 0;
+        ox *= f;
+        oy *= f;
+      }
+      pos[2 * s] = phys[2 * p]! + ox;
+      pos[2 * s + 1] = phys[2 * p + 1]! + oy;
+      places[2 * s] = ox / r;
+      places[2 * s + 1] = oy / r;
+    }
   }
 
   private heldLeavesFor(hit: HoverHit): number[] {
@@ -5086,18 +5305,26 @@ export class Network extends BaseEngine {
     const containerIds = containers ? Array.from({ length: containers.physicalCount }, (_, p) => p) : [];
     const containerFill = containers ? this.containerFill() : null;
     const containerCss = (p: number): string => (containerFill?.rgba ? rgbaCss(containerFill.rgba, p) : (containerFill?.css ?? DEFAULT_NODE_FILL));
+    // The ring the WebGL lane draws (#495): CONTAINER_RING_PX px at this zoom, a darker shade of the disc's colour,
+    // traced as one ring-encoded circle (radius R − w/2, stroke w). The Scene re-registers at a gesture's end.
+    const ringWorld = CONTAINER_RING_PX / (this.transform.k || 1);
     this.registerLayer({
       name: this.CONTAINER_LAYER,
       data: containerIds,
       ids: containerIds,
       sizeMode: "world",
       fill: (p) => withAlpha(containerCss(p as number), 42),
-      stroke: () => "#000000", // thin black ring so the faint container disc reads (#171 review)
+      stroke: (p) => {
+        const c = rgb(containerCss(p as number));
+        const d = (v: number): number => Math.round(v * CONTAINER_RING_DARKEN);
+        return rgb(d(c.r), d(c.g), d(c.b)).formatHex();
+      },
       build: (g) => {
-        if (emit && containers)
+        const radii = this.containerRadii;
+        if (emit && containers && radii)
           for (let p = 0; p < containers.physicalCount; p++) {
-            const cx = containers.physical.positions[2 * p]!, cy = containers.physical.positions[2 * p + 1]!, r = this.containerRadii![p]!;
-            g.drawable(p, (ctx) => { ctx.moveTo(cx + r, cy); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.closePath(); }, { lineWidth: 1.5 });
+            const r = radii[p]!, w = Math.min(r, ringWorld);
+            g.point(p, containers.physical.positions[2 * p]!, containers.physical.positions[2 * p + 1]!, r - w / 2, w);
           }
       },
     });
@@ -5393,7 +5620,7 @@ export class Network extends BaseEngine {
     // aggregates fill). In a state network, per level and kept across radius-only re-resolutions (#494).
     const { nodeFill, nodeColors, fillAggregate: nodeFillAggregate, modulePalette: nodeModulePalette } = this.resolvedFill(graph);
     // The both view draws its state dots at the engine's world-unit radii, sized to their containers (#494).
-    const bothDots = this.stateData && this.activeView === "both" && graph === this.stateData.state ? this.bothDots() : null;
+    const bothDots = this.stateData && this.activeView === "both" && graph === this.bothGraph ? this.bothDots() : null;
     // Constant border (px). flowBorder wins if both are set.
     const nb = this.styleOpts.nodeBorder;
     const constBorder: ConstBorder | null =
@@ -5590,7 +5817,11 @@ export class Network extends BaseEngine {
    * working. A worker layout is not bound to a device and keeps running.
    */
   protected override onBeforeBackendSwap(): void {
-    this.layoutHandle?.moveDevice?.(this.whenBackendSettled().then(() => this.gpuDevice()));
+    const device = (): Promise<import("@luma.gl/core").Device | null> => this.whenBackendSettled().then(() => this.gpuDevice());
+    this.layoutHandle?.moveDevice?.(device());
+    // A state network's parked layout (#495) runs on the same device: it moves too, and stays idle for a drag.
+    const layouts = this.viewLayouts;
+    if (layouts) for (const layout of [layouts.physical, layouts.state]) layout.handle?.moveDevice?.(device());
   }
 
   /** Re-push instanced layers after a backend swap (the first install doesn't fire this). */

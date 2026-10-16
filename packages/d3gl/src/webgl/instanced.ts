@@ -226,6 +226,7 @@ export class InstancedCircles {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width, height],
+      u_borderPx: data.bordersPx ? 1 : 0, // #495: px rings on world discs
       ...highlightUniforms(0), // nodes are dimmed/kept but not recoloured (recolor = 0)
     };
     this.model = new Model(device, {
@@ -284,6 +285,7 @@ export class InstancedCircles {
    * destroy()+new InstancedCircles() avoids per-frame GPU buffer teardown+recreate.
    */
   update(device: Device, data: InstancedCirclesData): void {
+    this.uniforms["u_borderPx"] = data.bordersPx ? 1 : 0;
     const hasBorders = data.borders != null;
     // If optional-field shape changed or count exceeds capacity, reinit buffers.
     if (data.count > this._capacity || hasBorders !== this._hasBorders) {
