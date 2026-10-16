@@ -11,7 +11,7 @@ import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./ne
 import { NestedDrag, NestedDragCache } from "./nested-drag.js";
 import { easeCubicOut, positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, nodeModules, moduleAggregateColors, type ModulePathNode, type ModuleColorOptions, type NodeModules } from "./module-colors.js";
-import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
+import { dominantWedges, physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
@@ -228,8 +228,9 @@ export interface NetworkStyle {
    * `@mapequation/c3`'s `hierarchy().colorOf`. Whatever {@link nodeFill} is, a state network's **pie wedges** and
    * both-view **containers** take it (else they keep the engine's own colours); a `nodeFill: { by: "module" }`
    * without its own `color` takes it; and a state network with no `nodeFill` colours its nodes and discs by it
-   * instead of the engine's palette. So nodes can be filled by flow or metadata while the pies and containers
-   * keep the app's module colours. Asked once per module per `style()` call — a later `style({ moduleColor })` recolours — never per
+   * instead of the engine's palette. A container, like a physical disc, takes its physical node's dominant module:
+   * the pie wedge holding most of its flow (a tie goes to the lower module). So nodes can be filled by flow or
+   * metadata while the pies and containers keep the app's module colours. Asked once per module per `style()` call — a later `style({ moduleColor })` recolours — never per
    * frame; `undefined` (no colour for a module) takes the default fill.
    */
   moduleColor?: ModuleColor;
@@ -1245,7 +1246,7 @@ export class Network extends BaseEngine {
   private stateColorOpts: ModuleColorOptions | undefined = undefined;
   /** The module each node of a view's graph is coloured by (#494): a state node's enclosing module, a
    *  physical node's (first) module at the pie level. Built once per state network, on first use. */
-  private stateNodeModules: { state: NodeModules; physical: NodeModules; wedge: Int32Array } | null = null;
+  private stateNodeModules: { state: NodeModules; physical: NodeModules; wedge: Int32Array; dominant: Int32Array } | null = null;
   /** A plain network's {@link NodeModules} for `nodeFill: { by: "module" }` (#494), per hierarchy. */
   private hierarchyNodeModules: { hierarchy: object; modules: NodeModules } | null = null;
   /** The resolved module fills of a state network (#494), kept across the both view's radius-only
@@ -3034,7 +3035,7 @@ export class Network extends BaseEngine {
     const moduleColor = this.styleOpts.moduleColor;
     if (sg && moduleColor && this.stateModules && this.pieWedges) {
       // The app's module palette whatever the node fill (#494): each container its physical node's colour, by
-      // the plain physical disc's rule (its first wedge's module), from the levels' palette, once per style.
+      // the plain physical disc's rule (its dominant wedge's module), from the levels' palette, once per style.
       const fills = this.stateFillsFor(this.fillSpec());
       fills.container ??= moduleFillColors(this.levelModules().physical, moduleColor, DEFAULT_NODE_FILL, this.statePalette(moduleColor));
       return { rgba: fills.container, css: DEFAULT_NODE_FILL };
@@ -5512,8 +5513,9 @@ export class Network extends BaseEngine {
       const palette = this.statePalette(spec.color);
       return { nodeFill: DEFAULT_NODE_FILL, nodeColors: moduleFillColors(this.levelModules()[level], spec.color, DEFAULT_NODE_FILL, palette), modulePalette: palette };
     }
-    // No fill: the engine's own module colours — a state node its module's, a physical disc its first wedge's.
-    const css = level === "state" ? moduleColors(modules, this.stateColorOpts) : Array.from({ length: graph.nodeCount }, (_, p) => (wedges.wedgeCount[p]! > 0 ? wedges.color[wedges.offset[p]!]! : DEFAULT_NODE_FILL));
+    // No fill: the engine's own module colours — a state node its module's, a physical disc its dominant wedge's.
+    const dominant = level === "state" ? null : this.levelModules().dominant;
+    const css = !dominant ? moduleColors(modules, this.stateColorOpts) : Array.from({ length: graph.nodeCount }, (_, p) => wedges.color[dominant[p] ?? -1] ?? DEFAULT_NODE_FILL);
     return { nodeFill: DEFAULT_NODE_FILL, nodeColors: resolveNodeColors(graph, (i) => css[i] ?? DEFAULT_NODE_FILL) };
   }
 
@@ -5545,15 +5547,16 @@ export class Network extends BaseEngine {
 
   /** The module each node of the state and the physical graph is coloured by, and each pie wedge's (#494), as
    *  indices into the state graph's interned modules, so one palette colours them all. Built once per state
-   *  network: a state node's enclosing module; a physical node's first wedge's module (its only one, for a disc).
-   *  O(state nodes + wedges + modules · depth); the path index is dropped when it returns. */
-  private levelModules(): { state: NodeModules; physical: NodeModules; wedge: Int32Array } {
+   *  network: a state node's enclosing module; a physical node's dominant wedge's module, the one holding most of
+   *  its flow (its only one, for a disc), and that wedge's index ({@link dominantWedges}; a tie goes to the lower
+   *  module). O(state nodes + wedges + modules · depth); the path index is dropped when it returns. */
+  private levelModules(): { state: NodeModules; physical: NodeModules; wedge: Int32Array; dominant: Int32Array } {
     if (this.stateNodeModules) return this.stateNodeModules;
     const sg = this.stateData;
     const records = this.stateModules;
     const wedges = this.pieWedges;
     const empty: NodeModules = { moduleOf: new Int32Array(0), paths: [] };
-    if (!sg || !records || !wedges) return { state: empty, physical: empty, wedge: new Int32Array(0) };
+    if (!sg || !records || !wedges) return { state: empty, physical: empty, wedge: new Int32Array(0), dominant: new Int32Array(0) };
     const state = nodeModules(sg.state.nodeCount, records);
     const index = new Map<string, number>();
     for (let m = 0; m < state.paths.length; m++) index.set((state.paths[m] ?? []).join(","), m);
@@ -5566,9 +5569,13 @@ export class Network extends BaseEngine {
       if (m === undefined) byPath.set(path, (m = index.get(path.join(",")) ?? -1));
       wedge[w] = m;
     }
+    const dominant = dominantWedges(wedges);
     const moduleOf = new Int32Array(sg.physicalCount).fill(-1);
-    for (let p = 0; p < sg.physicalCount; p++) if (wedges.wedgeCount[p]! > 0) moduleOf[p] = wedge[wedges.offset[p]!]!;
-    this.stateNodeModules = { state, physical: { moduleOf, paths: state.paths }, wedge };
+    for (let p = 0; p < sg.physicalCount; p++) {
+      const k = dominant[p] ?? -1;
+      if (k >= 0) moduleOf[p] = wedge[k] ?? -1;
+    }
+    this.stateNodeModules = { state, physical: { moduleOf, paths: state.paths }, wedge, dominant };
     return this.stateNodeModules;
   }
 

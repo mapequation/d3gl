@@ -626,8 +626,9 @@ function constBorderArrays(
  *   `color`, the style's `moduleColor`:
  *   `data(graph, { modules })`, or a state network's `modules` (`stateNetwork()`). A node takes its
  *   enclosing module's colour, `color(path)` with `path` the node's module path minus its own rank (the
- *   1-based chain, `[]` for a node in no module), as {@link moduleColors} colours. In a state network's
- *   physical view a disc takes its module at the pie level and each pie wedge its own module (see
+ *   1-based chain, `[]` for a node in no module), as {@link moduleColors} colours. In a state network, a
+ *   physical node (its disc, or its both-view container) takes its dominant module at the pie level, the one
+ *   holding most of its flow (a tie goes to the lower module), and each pie wedge its own module (see
  *   {@link PieWedgeOptions.level}). `color` is asked once per module, not per node; `undefined` (a module
  *   the palette has no colour for), and every node of a network without a hierarchy, take the default fill.
  *   An LOD aggregate that is a module (a module tree's) takes that module's own colour, `color(its path)`;
