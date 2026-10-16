@@ -1,7 +1,7 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance, type Backend, type GroupBuilder, type GroupOptions, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
-import { LabelLayer, placeLabels, labelCullScratch, labelTextY, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
+import { LabelLayer, placeLabels, anchorBox, labelCullScratch, labelTextY, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
@@ -352,6 +352,8 @@ export abstract class BaseEngine {
   /** Retained cull buffers for the native-text placement path (#204) — `routeLabels` places on every
    *  transform on SVG/Canvas, so the grid + geometry scratch is reused instead of re-allocated. */
   private readonly labelCull = labelCullScratch();
+  /** The label shown in full while hovered (#496), and the text it returns to; null when none. */
+  private labelHover: { anchor: LabelAnchor; restore: string } | null = null;
   /** Retained plot/geo data-label anchors (#223): measured + built ONCE at `labels(data, opts)` call,
    *  re-placed (not rebuilt/re-measured) on every transform. `max` caps the shown set (default ∞). */
   private dataLabels: { anchors: LabelAnchor[]; max: number } | null = null;
@@ -604,7 +606,7 @@ export abstract class BaseEngine {
     }
   }
   /** Idempotent: addEventListener dedupes on the same handler reference. */
-  private attachPointer(): void {
+  protected attachPointer(): void {
     this.host.addEventListener("pointermove", this.onPointerMove);
     this.host.addEventListener("pointerleave", this.onPointerLeave);
   }
@@ -1720,6 +1722,8 @@ export abstract class BaseEngine {
     this.labelLayer?.destroy();
     this.labelLayer = null;
     this.labelText = null;
+    this.labelHover = null;
+    this.backend()?.setHoverText?.(null);
     this.exportAnchors = [];
     this.backend()?.setTextLayer?.([]);
   }
@@ -1749,6 +1753,26 @@ export abstract class BaseEngine {
       // export-only text backend can be fed the placed labels at toPNG()/toSVG() time (#219).
       // Nothing is placed or allocated here — zero added per-frame work.
       this.exportAnchors = anchors;
+    }
+  }
+
+  /**
+   * Show `anchor`'s text in full while hovered, in place of its (trimmed) placed twin, or clear it
+   * (`null`) — #496. `restore` is the text the label returns to. The anchor is NOT culled: the hovered
+   * label is shown even where collision dropped it. Every backend has a one-label slot, so a hover change
+   * writes exactly one label and never re-places or re-pushes the placed set: the HTML overlay's one node
+   * ({@link LabelLayer.setHover}, WebGL), `Backend.setHoverText` on SVG (one element) and Canvas (one
+   * label-sized rectangle, no scene repaint).
+   */
+  protected setLabelHover(anchor: LabelAnchor | null, restore: string): void {
+    const layer = this.labelLayer;
+    if (!layer) return;
+    this.labelHover = anchor ? { anchor, restore } : null;
+    const backend = this.backend();
+    if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
+      backend.setHoverText?.(anchor ? { text: this.toTextData([anchorBox(anchor, this.transform)])[0]!, width: anchor.width ?? 0, height: anchor.height ?? 0 } : null);
+    } else {
+      layer.setHover(anchor, restore, this.transform);
     }
   }
 
@@ -2202,7 +2226,7 @@ export abstract class BaseEngine {
 
   private onPointerMove = (e: PointerEvent): void => {
     if (this.interacting || this.marquee || this.nodeDrag) return; // gesture / marquee / node-drag frames skip hover picking entirely
-    if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip) && !this.anyLaneInteractive("hover")) return;
+    if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip) && !this.anyLaneInteractive("hover") && !this.wantsHoverTarget()) return;
     const r = this.host.getBoundingClientRect();
     // Hover: exact=false lets GPU link picking (#141) use its stall-free async readback (the result may
     // lag the cursor by one pointer event — imperceptible — instead of flushing the GPU per move).
@@ -2212,6 +2236,7 @@ export abstract class BaseEngine {
       this.lastHover = hit;
       this.applyAutoHover(hit);
       this.updateTooltip(hit);
+      this.onHoverTarget(hit);
     }
     this.tooltipEl?.move(e.clientX - r.left, e.clientY - r.top);
   };
@@ -2255,7 +2280,18 @@ export abstract class BaseEngine {
     if (this.autoHover) { this.highlight(this.autoHover, null); this.autoHover = null; }
     if (this.laneHoverLayer) this.setLaneHover(null, null);
     this.tooltipEl?.hide();
+    this.onHoverTarget(null);
   }
+
+  /** Hook: does the engine need hover picking though no handler, hover spec or hover lane asks for it?
+   *  Default false; the network says yes while a trimmed label waits to be shown in full (#496), which on
+   *  the vector backends (no hover lane) is what makes the pointer path pick at all. */
+  protected wantsHoverTarget(): boolean { return false; }
+
+  /** Hook: the hover TARGET changed (a different glyph, or none) — runs once per change, not per pointer
+   *  move, on every backend (lane and Scene hover alike). Default no-op; the network shows the hovered
+   *  label in full here (#496). Keep it O(1): a hover sweep reaches it at every glyph it crosses. */
+  protected onHoverTarget(_hit: HoverHit | null): void {}
   private onPointerDown = (e: PointerEvent): void => {
     this.downAt = [e.clientX, e.clientY];
     // shift+drag over a marquee-selectable lane starts a region selection instead of a pan (#159).
