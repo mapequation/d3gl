@@ -841,6 +841,10 @@ interface ViewLayout {
   moduleSprings: { tree: LODTree; graph: NetworkGraph; springs: ModuleSprings | null } | null;
   /** Which LOD tree its run's worker streams, so a drag's reheat after a switch back adopts it again. */
   lodWorkerSource: "structure" | "spatial" | null;
+  /** The camera its views had when they were last shown (#495 review): restored when one is shown again, as its
+   *  layout is. Null until its views are first left. The physical and both views share it, as they share the
+   *  positions it frames. */
+  camera: ViewTransform | null;
 }
 
 /** Which layout a state-network view draws (#495): the physical and both views share the physical one. */
@@ -850,7 +854,7 @@ function layoutFamily(view: "state" | "physical" | "both"): "state" | "physical"
 
 /** A state-network layout that has not run yet (#495). */
 function newViewLayout(graph: NetworkGraph, hierarchy: Hierarchy | null): ViewLayout {
-  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null };
+  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null, camera: null };
 }
 
 /** `opts` continued from where the nodes are (#495): a warm flat or nested start, for a view laid out on first show
@@ -1534,7 +1538,10 @@ export class Network extends BaseEngine {
    *  Each view keeps its layout (#495): the switch keeps the positions of every view, and a settled layout stays
    *  alive for a drag to reheat when its view is shown again. A layout still running when its view is left stops
    *  there and goes on, warm, when the view is shown again; a view never laid out is laid out with the app's
-   *  last {@link layout} options as it is first shown ({@link whenSettled} follows that run). */
+   *  last {@link layout} options as it is first shown ({@link whenSettled} follows that run). Each layout keeps its
+   *  camera too: a view shown again comes back at the view (pan and zoom) it was left at; the physical and both
+   *  views, which draw the same physical layout, share theirs. A view shown for the first time keeps the current
+   *  camera, or is framed by its first layout when the app's layout options have `fit`. */
   view(view: "state" | "physical" | "both"): this {
     if (!this.stateData || view === this.activeView) return this;
     const sel = this.selectedIds(this.NODE_LAYER);
@@ -1626,13 +1633,20 @@ export class Network extends BaseEngine {
     this.stopDragLoop?.(); // a drag still re-cooling belongs to the view being left
     this.dragReapply = null;
     if (from === null) this.haltLayout(); // whatever ran belongs to the previous network
-    else if (switching) this.parkLayout(layouts[layoutFamily(from)]);
+    else if (switching) {
+      const left = layouts[layoutFamily(from)];
+      left.camera = { ...this.latestTransform() }; // its views' camera, for when they are shown again
+      this.parkLayout(left);
+    }
     // The app's LOD, remembered across switches (#494), applied as far as this view takes it ({@link viewLOD}).
     this.lodOptions = this.stateLODRequest ? this.viewLOD(this.stateLODRequest) : null;
     this.showGraph(to === "both" ? both : layout.graph);
     this.hierarchy = to === "state" ? layout.hierarchy : null;
     if (switching) this.restoreLayout(layout);
     if (!layout.placed) this.seedView(layoutFamily(to));
+    // Each layout keeps its camera (#495 review): its own scale, not the other view's. O(1), d3-zoom re-seeded, no
+    // gesture. A view shown for the first time keeps the camera, or is framed by its first layout's `fit` below.
+    if (from !== null && switching && layout.camera) this.frameView(layout.camera);
     if (to === "both") this.syncBoth();
     // The new graph's tree, built before the one rebuild (as lod() would after the switch): O(tree size), per switch.
     if (this.lodOptions) this.recomputeLODGeometry();
@@ -1685,13 +1699,16 @@ export class Network extends BaseEngine {
     this.lodWorkerSource = layout.lodWorkerSource;
   }
 
-  /** Stop the layout parked by a view switch (#495): the state network is replaced, or the engine destroyed. */
+  /** Stop the layout parked by a view switch (#495), and drop any run it would resume: {@link stopLayout}, a new
+   *  state network, or the engine destroyed. */
   private stopParkedLayouts(): void {
     const layouts = this.viewLayouts;
     if (!layouts) return;
     for (const layout of [layouts.physical, layouts.state]) {
       layout.handle?.stop();
       layout.handle = null;
+      layout.interrupted = false;
+      layout.resume = null;
     }
   }
 
@@ -3348,12 +3365,20 @@ export class Network extends BaseEngine {
    *  (#427). A nested layout's transition stopped mid-ease leaves the nodes between
    *  two layouts, so its discs no longer hold: the modules (and their rings) fall back to their members'
    *  centroid + extent (#329). A spatial LOD tree, refit through the transition, is rebuilt where the
-   *  nodes stopped (#343), and any tree's crowding (#426), held through it, is recomputed there. */
+   *  nodes stopped (#343), and any tree's crowding (#426), held through it, is recomputed there.
+   *
+   *  In a state network it stops every view's layout (#495): no view goes on with a run on its own afterwards,
+   *  and a drag then moves the nodes it holds, as after a plain network's stop. A view never laid out is still
+   *  laid out when it is first shown. */
   stopLayout(): this {
     const running = this.transition?.running === true;
     const live = this.layoutLive;
     const interrupted = running && this.nestedDiscs !== null;
     this.haltLayout();
+    // A state network's hidden view stops too (#495 review): its settled run is stopped, and a run a switch
+    // interrupted no longer goes on when its view is back. Only a view never laid out still gets its first layout
+    // on first show (it has no positions otherwise).
+    this.stopParkedLayouts();
     if (interrupted) this.nestedDiscs = null;
     // The modules and rings redraw around where the members stopped; a spatial tree is rebuilt there, and
     // the crowding follows the nodes to where they stopped. A streamed run stopped mid-way held the crowding

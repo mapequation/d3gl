@@ -221,9 +221,12 @@ describe("a view never laid out is laid out on first show (#495, 8)", () => {
   });
 });
 
-/** Runs `onStream` on every streamed layout frame, inside the transport's callback. */
+/** Runs `onStream` on every streamed layout frame, inside the transport's callback; reads the camera. */
 class SwitchProbe extends Network {
   onStream: (() => void) | null = null;
+  get camera(): { k: number; x: number; y: number } {
+    return { ...this.transform };
+  }
   protected override scheduleLayoutRepaint(): void {
     super.scheduleLayoutRepaint();
     this.onStream?.();
@@ -269,6 +272,88 @@ describe("a run a switch stopped goes on where it stood (#495 review, 3)", () =>
     post.mockRestore();
     net.destroy();
   }, 60_000);
+});
+
+describe("each layout keeps its camera (#495 review, 1)", () => {
+  it("a view comes back at the camera it was left at; the physical and both views share theirs; a first show is framed by its fit", async () => {
+    const { graph, modules } = fixture();
+    const el = host();
+    const net = new SwitchProbe(el, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    net.enableZoom();
+    net.stateNetwork(graph, { modules, view: "physical" }).layout({ backend: "force", iterations: 40, fit: true });
+    const physical = { k: 2.5, x: -30, y: 12 };
+    net.setTransform(physical);
+    // First show: laid out with the last options, framed by their fit (the camera moves off the physical one).
+    net.view("state");
+    const framed = net.camera;
+    expect(framed, "the state view's first layout did not frame it").not.toEqual(physical);
+    const state = { k: 0.7, x: 40, y: -8 };
+    net.setTransform(state);
+    net.view("physical");
+    expect(net.camera, "the physical view did not come back at its camera").toEqual(physical);
+    net.view("both");
+    expect(net.camera, "the both view, which draws the physical layout, has another camera").toEqual(physical);
+    const both = { k: 3, x: 5, y: 5 };
+    net.setTransform(both);
+    net.view("state");
+    expect(net.camera, "the state view did not come back at its camera").toEqual(state);
+    net.view("physical");
+    expect(net.camera, "the physical view lost the camera the both view left").toEqual(both);
+    // d3-zoom follows the restored camera: a wheel tick zooms from it, not from the camera left behind.
+    const r = net.camera;
+    el.dispatchEvent(new WheelEvent("wheel", { clientX: el.getBoundingClientRect().left + W / 2, clientY: el.getBoundingClientRect().top + H / 2, deltaY: -10, bubbles: true, cancelable: true }));
+    await frames(2);
+    const after = net.camera;
+    expect(after.k / r.k, "a wheel zoom jumped from another view's camera").toBeGreaterThan(0.9);
+    expect(after.k / r.k).toBeLessThan(1.5);
+    net.destroy();
+  });
+});
+
+describe("stopLayout() stops every view (#495 review, 2)", () => {
+  for (const backend of ["worker", "gpu"] as const) {
+    it(`${backend}: a run a switch interrupted does not go on after stopLayout(); a view never laid out still is`, async () => {
+      const { graph, modules } = fixture(2000);
+      const net = new SwitchProbe(host(), { width: W, height: H, backend: "webgl" });
+      await net.whenReady();
+      let streamed = 0;
+      net.onStream = () => {
+        if (++streamed === 2) net.view("state"); // the physical run is live: the switch interrupts it
+      };
+      net.stateNetwork(graph, { modules, view: "physical" }).layout({ backend, iterations: 2000 });
+      for (let f = 0; f < 600 && net.stateView !== "state"; f++) await nextFrame();
+      expect(net.stateView, "the physical run streamed no second frame").toBe("state");
+      net.onStream = null;
+      // The state view was never laid out: it is, on its first show.
+      expect(net.layoutTransport, "the state view's first layout did not run").not.toBe("none");
+      net.stopLayout(); // the app's simulation goes off
+      const physical = Float32Array.from(graph.physical.positions);
+      net.view("physical");
+      expect(net.layoutTransport, "the interrupted physical run went on after stopLayout()").toBe("none");
+      await frames(10);
+      expect(maxMove(physical, graph.physical.positions), "the physical layout moved on its own").toBe(0);
+      const state = Float32Array.from(graph.state.positions);
+      net.view("state");
+      expect(net.layoutTransport, "the stopped state run went on").toBe("none");
+      await frames(5);
+      expect(maxMove(state, graph.state.positions)).toBe(0);
+      net.destroy();
+    }, 60_000);
+  }
+
+  it("a view never laid out is still laid out on its first show after stopLayout()", async () => {
+    const { graph, modules } = fixture();
+    const net = await engine(host());
+    net.stateNetwork(graph, { modules, view: "physical" }).layout({ backend: "worker", iterations: 30 });
+    await net.whenSettled();
+    net.stopLayout();
+    net.view("state");
+    expect(["shared", "copy"], "the state view's first layout did not run").toContain(net.layoutTransport);
+    await net.whenSettled();
+    expect(spread(net.positions!)).toBeGreaterThan(0);
+    net.destroy();
+  });
 });
 
 describe("the state view is data(state, { modules }) (#495, 7)", () => {

@@ -913,7 +913,7 @@ both views, which share that layout, and the state graph in the state view. A vi
 is laid out with the app's last `layout()` options, from where its nodes are — the state nodes start on a
 rosette around their physical node — and every view keeps its positions across switches, so the app never
 re-runs a layout to switch views; a layout still running when its view is left goes on where it stood when the
-view is back. A node drag reheats the layout of the view it is in, also after a switch;
+view is back (unless `stopLayout()` stopped it), and each view comes back at the pan and zoom it was left at. A node drag reheats the layout of the view it is in, also after a switch;
 in the both view a container drag reheats the physical layout, its state nodes riding along. `net.positions`
 gives the positions of the view on screen (in the both view the state dots', which no graph holds).
 
