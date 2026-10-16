@@ -1,5 +1,6 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { network, type Network, type NetworkHit } from "../network.js";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { network, Network, type NetworkHit } from "../network.js";
+import { heatAfter } from "../worker-transport.js";
 import { buildStateGraph, type StateNetworkGraph } from "../state-graph.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { decodeImage } from "../../map/__tests__/backend-equivalence-harness.js";
@@ -220,6 +221,56 @@ describe("a view never laid out is laid out on first show (#495, 8)", () => {
   });
 });
 
+/** Runs `onStream` on every streamed layout frame, inside the transport's callback. */
+class SwitchProbe extends Network {
+  onStream: (() => void) | null = null;
+  protected override scheduleLayoutRepaint(): void {
+    super.scheduleLayoutRepaint();
+    this.onStream?.();
+  }
+}
+
+/** A worker's `start` message: the ticks it runs and the heat schedule a warm start resumes. */
+interface StartMessage {
+  type: "start";
+  iterations: number;
+  warm?: { heat: number; decaying: boolean };
+}
+const isStart = (m: unknown): m is StartMessage => typeof m === "object" && m !== null && "type" in m && m.type === "start";
+
+describe("a run a switch stopped goes on where it stood (#495 review, 3)", () => {
+  it("worker: over the ticks it had left, at the heat it had reached — never from full heat", async () => {
+    const { graph, modules } = fixture(2000);
+    const net = new SwitchProbe(host(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const post = vi.spyOn(Worker.prototype, "postMessage");
+    // Leave the physical view inside its run's second streamed frame (the first after the seed's): the run is
+    // live there, whether or not that frame is its last.
+    let streamed = 0;
+    net.onStream = () => {
+      if (++streamed === 2) net.view("state");
+    };
+    net.stateNetwork(graph, { modules, view: "physical" }).layout({ backend: "worker", iterations: 2000 });
+    for (let f = 0; f < 600 && net.stateView !== "state"; f++) await nextFrame();
+    expect(net.stateView, "the physical run streamed no second frame").toBe("state");
+    net.onStream = null;
+    await net.whenSettled(); // the state view's own run
+    post.mockClear();
+    net.view("physical");
+    const start = post.mock.calls.map((call) => call[0]).find(isStart);
+    expect(start, "the physical view's run did not go on").toBeDefined();
+    const iterations = start?.iterations ?? 0;
+    expect(iterations, "it ran its whole budget again").toBeLessThan(2000);
+    expect(iterations).toBeGreaterThan(0);
+    expect(start?.warm?.decaying).toBe(true);
+    expect(start?.warm?.heat ?? 1, "it reheated to full heat").toBeLessThan(1);
+    // The heat its schedule had reached after the ticks it ran.
+    expect(start?.warm?.heat).toBeCloseTo(heatAfter(1, true, 2000, 2000 - iterations), 6);
+    post.mockRestore();
+    net.destroy();
+  }, 60_000);
+});
+
 describe("the state view is data(state, { modules }) (#495, 7)", () => {
   it("draws, cuts and lays out exactly as the plain network over the same graph and modules", async () => {
     const a = fixture();
@@ -314,6 +365,43 @@ describe("a drag reheats the view's own layout, after any switch, at one scale (
       const d = Math.hypot(dots[2 * s]! - after[2 * p]!, dots[2 * s + 1]! - after[2 * p + 1]!);
       expect(d, `dot ${s} left its container`).toBeLessThan(spread(after));
     }
+    net.destroy();
+  });
+});
+
+describe("a both-view dot drag keeps the dot in its container (#495 review, 4)", () => {
+  it("dragged far out, the dot stops at its container's edge less its radius, and keeps that place", async () => {
+    const { graph, modules } = fixture();
+    const h = host();
+    const net = await engine(h);
+    net.stateNetwork(graph, { modules, view: "both" }).layout({ backend: "force", iterations: 60 });
+    net.interactive({ draggable: true });
+    const t = frameAll(net, net.positions!);
+    const s = 0;
+    const p = graph.stateToPhysical[s]!;
+    const before = copy(net);
+    await drag(h, t.k * before[2 * s]! + t.x, t.k * before[2 * s + 1]! + t.y, 160, 90, 8);
+    // The container's outer radius and the dot's radius, as drawn (the WebGL export).
+    const circles = [...net.toSVG().matchAll(/<circle([^>]*)>/g)].map((m) => {
+      const a = m[1] ?? "";
+      const num = (name: string): number => Number(new RegExp(`\\b${name}="([^"]+)"`).exec(a)?.[1]);
+      return { cx: num("cx"), cy: num("cy"), r: num("r"), sw: num("stroke-width") || 0 };
+    });
+    const cx = graph.physical.positions[2 * p]!, cy = graph.physical.positions[2 * p + 1]!;
+    const ring = circles.find((c) => c.sw > 0 && Math.abs(c.cx - cx) < 1e-3 && Math.abs(c.cy - cy) < 1e-3);
+    const dots = net.positions!;
+    const dot = circles.find((c) => c.sw === 0 && Math.abs(c.cx - dots[2 * s]!) < 1e-3 && Math.abs(c.cy - dots[2 * s + 1]!) < 1e-3);
+    expect(ring, "no container drawn").toBeDefined();
+    expect(dot, "no dot drawn where the engine says it is").toBeDefined();
+    const outer = (ring?.r ?? 0) + (ring?.sw ?? 0) / 2;
+    const d = Math.hypot(dots[2 * s]! - cx, dots[2 * s + 1]! - cy);
+    expect(d + (dot?.r ?? 0), "the dot left its container").toBeLessThanOrEqual(outer + 1e-3);
+    expect(d + (dot?.r ?? 0), "the dot did not reach the edge it was dragged past").toBeGreaterThan(0.99 * outer);
+    expect(maxMove(before, dots, new Set([s])), "the drag moved other dots").toBe(0);
+    const kept = copy(net);
+    net.view("state");
+    net.view("both");
+    expect(maxMove(kept, copy(net)), "the dot lost its place").toBeLessThan(1e-4);
     net.destroy();
   });
 });

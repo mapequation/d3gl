@@ -13,7 +13,7 @@
 import type { NetworkGraph } from "./graph.js";
 import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { ForceLayout, seedPositions, type ForceParams, type LayoutGraph } from "./force.js";
+import { ForceLayout, MIN_HEAT, seedPositions, type ForceParams, type LayoutGraph } from "./force.js";
 import type { ModuleSprings } from "./module-springs.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTopology, type LODTree } from "./lod.js";
 import type { FitBox } from "./fit.js";
@@ -160,6 +160,27 @@ export interface WorkerLayoutHandle {
    * for a device.
    */
   moveDevice?(next: Promise<Device | null | undefined>): void;
+  /**
+   * Where the run stands (#495): the ticks left of its budget and the heat schedule it has reached, for a later
+   * run that goes on from the same positions without reheating them (`layout` options `iterations` and the
+   * worker's `warm`). Null once the run has settled (nothing is left of it), or when its transport cannot say
+   * (a nested solve, a transition). The heat is that of the last frame painted, so the continuation may
+   * repeat a few ticks' cooling: never a reheat.
+   */
+  continuation?(): LayoutContinuation | null;
+}
+
+/** How a stopped run goes on (#311, #495): the ticks it has left and the heat schedule it resumes. */
+export interface LayoutContinuation {
+  iterations: number;
+  warm: { heat: number; decaying: boolean };
+}
+
+/** The heat of a schedule started at `from` (decaying to the floor over `budget` ticks, else held) after `ticks`. */
+export function heatAfter(from: number, decaying: boolean, budget: number, ticks: number): number {
+  if (!decaying || budget <= 0) return from;
+  const floor = Math.min(from, MIN_HEAT);
+  return Math.max(floor, from * Math.pow(floor / from, Math.min(1, ticks / budget)));
 }
 
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
@@ -215,6 +236,7 @@ export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => 
     get mainThread() {
       return run?.mainThread;
     },
+    continuation: () => run?.continuation?.() ?? null,
     settled,
     stop() {
       stopped = true;
@@ -418,6 +440,7 @@ export function startWorkerLayout(
   // can reheat it (#140). `terminate` is the real teardown (stop / worker error); it also settles.
   let terminated = false;
   let settledOnce = false;
+  let tick = 0; // the last frame's refinement tick (#495: where a stopped run goes on from)
   const settle = (): void => { if (settledOnce) return; settledOnce = true; resolveSettled(); };
   const terminate = (): void => {
     if (terminated) return;
@@ -445,6 +468,7 @@ export function startWorkerLayout(
     }
     if (msg.type === "lod-geometry" || msg.type === "seed-plan" || msg.type === "module-tree") return; // only the GPU layout's coarsening worker (#377, #353) or a module-tree build (#428) sends these
     // frame | done
+    tick = msg.tick;
     if (follow) {
       // A followed stream (#454): the follower eases toward the frame — the message's copy, or the shared buffer.
       const frame = shared ? pendingView : msg.positions;
@@ -511,9 +535,16 @@ export function startWorkerLayout(
   };
   worker.postMessage(start);
 
+  // The schedule the run cools on: a warm start's, else a multilevel seed's decay from full heat, or a disc
+  // start's held full heat (see the worker's start).
+  const schedule = warm ?? { heat: 1, decaying: multilevel };
   return {
     get shared() { return shared; },
     settled,
+    continuation: () =>
+      settledOnce || terminated
+        ? null
+        : { iterations: Math.max(0, iterations - tick), warm: { heat: heatAfter(schedule.heat, schedule.decaying, iterations, tick), decaying: schedule.decaying } },
     stop() {
       if (terminated) return;
       const stop: MainToWorker = { type: "stop" };

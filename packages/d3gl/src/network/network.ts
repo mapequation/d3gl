@@ -15,7 +15,7 @@ import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from 
 import { rosetteOffsets, rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type LayoutContinuation, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import { incidenceSourceEdges } from "./spatial-rows.js";
@@ -833,6 +833,9 @@ interface ViewLayout {
   placed: boolean;
   /** A switch stopped its run before it settled: it runs again, warm, when its view is shown. */
   interrupted: boolean;
+  /** Where that run stood (#495): it goes on over the ticks it had left at the heat it had reached. Null when its
+   *  transport could not say (a nested solve, a transition): it then runs again from full heat. */
+  resume: LayoutContinuation | null;
   nestedDiscs: { tree: LODTree; discs: BoundaryDiscs; size: ArrayLike<number> | undefined; drag?: NestedDragCache } | null;
   moduleTree: { graph: NetworkGraph; modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; tree: LODTree } | null;
   moduleSprings: { tree: LODTree; graph: NetworkGraph; springs: ModuleSprings | null } | null;
@@ -847,7 +850,7 @@ function layoutFamily(view: "state" | "physical" | "both"): "state" | "physical"
 
 /** A state-network layout that has not run yet (#495). */
 function newViewLayout(graph: NetworkGraph, hierarchy: Hierarchy | null): ViewLayout {
-  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null };
+  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null };
 }
 
 /** `opts` continued from where the nodes are (#495): a warm flat or nested start, for a view laid out on first show
@@ -1283,6 +1286,9 @@ export class Network extends BaseEngine {
   /** The app's last {@link layout} options in state-network mode (#495): what a view never laid out runs with
    *  when it is first shown, and a view whose run a switch interrupted when it is shown again. */
   private lastStateLayout: NetworkLayoutOptions | null = null;
+  /** The continuation the run a view switch is starting goes on from (#495), read by {@link startStreamingLayout}
+   *  during that call only. */
+  private layoutResume: LayoutContinuation | null = null;
 
   /** The active view of the state network (#171). `physical` = aggregated links + overlapping-module
    *  pie glyphs; `state` = the state graph with its modules, laid out on its own (#495); `both` = state
@@ -1632,7 +1638,11 @@ export class Network extends BaseEngine {
     if (this.lodOptions) this.recomputeLODGeometry();
     const last = this.lastStateLayout;
     if (switching && last && last.backend !== "positions" && (layout.interrupted || !layout.laidOut)) {
+      // An interrupted run goes on at the heat it had reached, over the ticks it had left (a flat streaming run).
+      this.layoutResume = layout.interrupted ? layout.resume : null;
+      layout.resume = null;
       this.runLayout(layout.placed ? warmLayout(last) : last); // rebuilds
+      this.layoutResume = null;
       return;
     }
     this.rebuild();
@@ -1645,6 +1655,8 @@ export class Network extends BaseEngine {
    */
   private parkLayout(layout: ViewLayout): void {
     if (this.layoutLive || this.nestedSolving || this.transition?.running === true) {
+      // Read where it stands before stopping it: it goes on from there, not from full heat.
+      layout.resume = this.transition?.running ? null : (this.layoutHandle?.continuation?.() ?? null);
       this.haltLayout();
       layout.handle = null;
       layout.interrupted = true;
@@ -2690,10 +2702,12 @@ export class Network extends BaseEngine {
     const leafStyle = useLod ? this.lodLeafStyle(graph) : null;
     this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;
     if (leafStyle) this.lodStylePosted = leafStyle.version;
+    // A state-network run a view switch stopped goes on where it stood (#495): its ticks left, its heat.
+    const resume = warm ? this.layoutResume : null;
     const workerOpts: WorkerLayoutOptions = {
       width: this.width,
       height: this.height,
-      iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
+      iterations: resume?.iterations ?? opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
       force: opts.force,
       multilevel: opts.multilevel,
       // When LOD is on, the worker builds + streams the tree; its coarsening is shared with the
@@ -2706,7 +2720,7 @@ export class Network extends BaseEngine {
       coarsen: this.lodOptions?.coarsen,
       // A warm start (#454) continues the positions on screen — the worker's and the GPU run's own
       // continuation (#311): no disc, no multilevel seed, a fresh cooling schedule from full heat.
-      ...(warm ? { warm: { heat: 1, decaying: true } } : {}),
+      ...(warm ? { warm: resume?.warm ?? { heat: 1, decaying: true } } : {}),
     };
     // …and the nodes chase its frames from where they are, as a warm nested map's (#454) — unless a worker streams
     // the LOD tree, whose geometry is the solve's: then its frames are painted as they land.
@@ -3031,6 +3045,7 @@ export class Network extends BaseEngine {
       get transport() {
         return solve.transport;
       },
+      continuation: () => solve.continuation?.() ?? null,
       settled,
       stop: () => {
         solve.stop();
@@ -4200,7 +4215,7 @@ export class Network extends BaseEngine {
    * Each view of a state network drags its own layout (#495), as a plain network does: the physical view the
    * physical layout, the state view its own. In the both view a held container is its physical node, held in the
    * physical layout while that reheats around it, its state dots keeping their places in it; any other held
-   * state dot moves inside its container ({@link bothPlaces}), the layout left alone.
+   * state dot moves inside its container, held within its disc ({@link placeDots}), the layout left alone.
    */
   protected override beginNodeDrag(hit: HoverHit, sx: number, sy: number): NodeDragSession | null {
     if (!this.graph || !this.interactiveOpts?.draggable) return null;
@@ -4434,23 +4449,33 @@ export class Network extends BaseEngine {
     return leaves.filter((s) => !carried.has(sg.stateToPhysical[s]!));
   }
 
-  /** Move both-view state dots to `start + (dx, dy)` and keep each there as its place in its container (#495):
-   *  O(dots). */
+  /** Move both-view state dots to `start + (dx, dy)`, kept inside their container's disc less their own radius,
+   *  and keep each there as its place in its container (#495): O(dots). The bound is a share of the container's
+   *  radius that does not change when the containers re-size (a dot's radius follows its container's). */
   private placeDots(ids: Uint32Array, start: Float32Array, dx: number, dy: number): void {
     const sg = this.stateData;
     const pos = this.bothGraph?.positions;
     const places = this.bothPlaces;
     const radii = this.containerRadii;
-    if (!sg || !pos || !places || !radii) return;
+    const dots = this.bothDots();
+    if (!sg || !pos || !places || !radii || !dots) return;
     const phys = sg.physical.positions;
     for (let k = 0; k < ids.length; k++) {
       const s = ids[k]!;
       const p = sg.stateToPhysical[s]!;
-      const x = start[2 * k]! + dx, y = start[2 * k + 1]! + dy;
-      pos[2 * s] = x;
-      pos[2 * s + 1] = y;
-      places[2 * s] = (x - phys[2 * p]!) / radii[p]!;
-      places[2 * s + 1] = (y - phys[2 * p + 1]!) / radii[p]!;
+      const r = radii[p]!;
+      let ox = start[2 * k]! + dx - phys[2 * p]!, oy = start[2 * k + 1]! + dy - phys[2 * p + 1]!;
+      const room = Math.max(0, r - dots[s]!);
+      const d = Math.hypot(ox, oy);
+      if (d > room) {
+        const f = d > 0 ? room / d : 0;
+        ox *= f;
+        oy *= f;
+      }
+      pos[2 * s] = phys[2 * p]! + ox;
+      pos[2 * s + 1] = phys[2 * p + 1]! + oy;
+      places[2 * s] = ox / r;
+      places[2 * s + 1] = oy / r;
     }
   }
 
