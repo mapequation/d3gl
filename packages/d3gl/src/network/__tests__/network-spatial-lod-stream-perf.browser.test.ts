@@ -6,7 +6,7 @@ import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { perfHost } from "../../__tests__/engine-sweep.js";
 
 /**
- * Per-frame guard for a **streamed** spatial LOD tree's links (#433, AGENTS lifecycle §5), through the real
+ * Per-frame guard for a **streamed** spatial LOD tree's links (#433, docs/agents/performance.md), through the real
  * trigger: `network().lod({ source: "spatial" }).layout({ backend: "worker", fit: true })`, real animation frames.
  *
  * With the spatial source every streamed frame brings a new tree, so the lazy gather's per-tree row memo never

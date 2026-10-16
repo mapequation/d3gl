@@ -52,7 +52,7 @@ const H = 400;
 // regressions it backstops — re-running the accessors or re-tessellating `draw` per frame — cost
 // ~200ms+ at 50k, so the detection margin stays >20x at every N.
 const FRAME_MS = perfBudget(6 + (6 * N) / 50_000);
-// Registration is the O(N) phase; a timeout is a harness limit, not a budget (AGENTS.md §Tests).
+// Registration is the O(N) phase; a timeout is a harness limit, not a budget (docs/agents/performance.md).
 const SETUP_MS = perfBudget(120_000 + N / 2);
 
 interface Point {

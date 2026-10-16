@@ -142,7 +142,7 @@ describe("network node-drag (#140)", () => {
   });
 
   it("drag moves update the LOD geometry incrementally — no full-tree pass per move, exact on release (#211)", async () => {
-    // Deterministic engine-path signature (AGENTS.md step 5): a drag move is a continuous pointer
+    // Deterministic engine-path signature (docs/agents/performance.md): a drag move is a continuous pointer
     // interaction, so it must fold in ONLY the held leaves' ancestor chains — never rerun the full
     // O(tree) `computeLODPositions`/`computeLODStyle`. Sentinels poisoned into tree nodes OUTSIDE the
     // dragged chains detect any full pass: a full positions pass would overwrite the position sentinel

@@ -370,7 +370,7 @@ function packLevels(width: number, height: number, top: number): Pick<TileAtlas,
  * the grid's float `G` with a plain `float(side)`, never `float(1 << rootLevel)`. The #251 near field
  * needs the two shaders to round the cell centre `lo + (cell + 0.5) / G · boxSide` bit for bit alike,
  * and a visible power of two lets a fast-math compiler reassociate that expression differently in one
- * of them (measured on ANGLE Metal; see AGENTS.md).
+ * of them (measured on ANGLE Metal; see LOG.md).
  */
 export function segmentInfo(seg: SlotRange, tile: Tile | null, frozen = false): [number, number, number, number] {
   const extra = frozen ? SEGMENT_FROZEN : 0;

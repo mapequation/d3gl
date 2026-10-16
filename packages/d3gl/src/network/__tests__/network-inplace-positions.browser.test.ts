@@ -17,7 +17,7 @@ import type { InstancedLayer } from "../../core/backend.js";
  *    accessors O(edges) times EVERY frame (~600k `colorOf`/`widthOf` calls per frame at scale).
  *    Now the style-derived attributes are cached per resolved-style version; a position-only
  *    frame recomputes ONLY the position-derived endpoints. So the accessors run O(edges) ONCE
- *    at data/style registration, NOT per position frame — the signature AGENTS.md §5 mandates.
+ *    at data/style registration, NOT per position frame — the signature docs/agents/performance.md mandates.
  */
 
 function host(): HTMLElement {

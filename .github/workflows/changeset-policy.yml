@@ -1,6 +1,6 @@
 name: Changeset policy
 
-# Gates every PR on the AGENTS.md lifecycle (steps 5 + 7): a change to the
+# Gates every PR on the docs/agents/workflow.md lifecycle (steps 5 + 7): a change to the
 # published package needs a changeset, and a PR that closes an issue needs a
 # `## Performance` section. Same rules as the local pre-merge hook
 # (scripts/premerge-gate.sh) — both call scripts/check-pr-policy.mjs.

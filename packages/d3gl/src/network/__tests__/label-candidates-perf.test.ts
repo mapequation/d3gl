@@ -12,7 +12,7 @@ import {
 } from "../label-candidates.js";
 
 /**
- * Per-frame regression guard for #212 (AGENTS.md lifecycle §5): the no-LOD label branch of
+ * Per-frame regression guard for #212 (docs/agents/performance.md): the no-LOD label branch of
  * `refreshLabels` used to scan ALL `nodeCount` positions (plus a full comparator sort when capped)
  * on EVERY pan/zoom frame. The gather now lives in `label-candidates.ts`; `network.ts` marks the
  * source stale from `rebuild()` / `scheduleLayoutRepaint()` (every position-mutating repaint) and

@@ -79,7 +79,7 @@ function makeGraph(nodes: number, edges: number): { graph: NetworkGraph; positio
 }
 
 /** `n` small square cells tiled over the globe. Rings are wound CLOCKWISE in [lon, lat] —
- *  a counter-clockwise ring is its own complement and fills the whole map (see AGENTS.md). */
+ *  a counter-clockwise ring is its own complement and fills the whole map (see LOG.md). */
 function makeCells(n: number): GeoJSON.Feature[] {
   const cols = Math.ceil(Math.sqrt(n * 2));
   const rows = Math.ceil(n / cols);

@@ -79,7 +79,7 @@ import type { LayoutProgram } from "../programs.js";
 // degenerate (never-terminating) case.
 //
 // Padded texels (slot ≥ u_count) write a neutral 0 and RETURN: `discard` does not end the invocation
-// on ANGLE Metal (AGENTS.md, #350), and both paths loop over texture data.
+// on ANGLE Metal (LOG.md, #350), and both paths loop over texture data.
 
 /** Which repulsion paths and segment lookup a program is compiled for — fixed per layout. */
 export interface RepulsionVariant {

@@ -9,7 +9,7 @@ import type { ViewTransform } from "../../core/index.js";
 import { centredOn, collapsedGlyph, ringOnCentreLines, type Grab } from "./_ring-grab.js";
 
 /**
- * ENGINE-level per-frame guard for a node-drag on a **nested** module map (AGENTS.md lifecycle §5 — a drag
+ * ENGINE-level per-frame guard for a node-drag on a **nested** module map (docs/agents/performance.md — a drag
  * is a per-frame path). Through the real trigger: pointer events on the host grab a leaf, each animation
  * frame of the drag session runs ONE tick of the re-solved module ({@link NestedDrag}: the leaf's
  * siblings, inside its module's disc) and repaints; the release cools it, at most
@@ -105,7 +105,7 @@ function flush(): void {
  * it: the LOD OFF legs (the leaf drag and its translate-only baseline, while LOD is off) and the
  * every-module-open legs (the ring grab and its baseline). On the headless runner's software GL (SwiftShader)
  * the LOD OFF leaf drag's frames queued ~200 s of GPU work, and the stall surfaced in a later leg, at the
- * first call that waited on the queue (AGENTS.md, "Local headless Chromium rasterises on SwiftShader").
+ * first call that waited on the queue (LOG.md, "Local headless Chromium rasterises on SwiftShader").
  * Those legs assert one render per held frame; network-sweep-perf.browser.test.ts owns the LOD-off
  * full-detail draw and network-module-boundary-perf.browser.test.ts the every-module-open view's. The LOD ON
  * zoomed-in legs leave it unset and draw for real.

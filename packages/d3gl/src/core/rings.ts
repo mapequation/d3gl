@@ -67,7 +67,7 @@ interface Ring {
  * boundary vs. a hole, so we recover it from the geometry. The rule is the NONZERO
  * winding rule — the same rule Canvas (`ctx.fill()`) and SVG (`fill-rule: nonzero`)
  * apply natively to the very same subpaths, so all three backends agree by
- * construction (AGENTS.md "Backend compositing equivalence"). For each ring we
+ * construction (LOG.md "Backend compositing equivalence"). For each ring we
  * compute the winding number of the region just OUTSIDE it (the signed sum of the
  * rings that enclose it) and just INSIDE it (that sum plus the ring's own
  * direction). A ring is then:
@@ -79,7 +79,7 @@ interface Ring {
  * - **dropped** when both sides are filled or both empty, since it bounds nothing.
  *
  * With the documented winding convention (exterior rings clockwise in `[lon, lat]`,
- * holes wound the opposite way, so nesting levels alternate — see AGENTS.md "GeoJSON
+ * holes wound the opposite way, so nesting levels alternate — see LOG.md "GeoJSON
  * winding") this is exactly alternating solid/hole by depth: land → lake → island →
  * pond. Rings that do NOT alternate (two nested rings wound the same way) stay solid,
  * which is what the Canvas/SVG nonzero fill already draws.

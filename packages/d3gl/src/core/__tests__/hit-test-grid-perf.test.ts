@@ -173,7 +173,7 @@ describe("HitIndex grid equivalence (#216)", () => {
 });
 
 describe("HitIndex grid per-pointer-event cost (#216)", () => {
-  // AGENTS lifecycle §5: hover-move is a continuous interaction path. Realistic large input,
+  // docs/agents/performance.md: hover-move is a continuous interaction path. Realistic large input,
   // driven through the actual trigger (pick per pointer position), asserting both a wall-clock
   // budget and the deterministic signature: entries tested per pick stays ≪ N.
   const N = 1_000_000;

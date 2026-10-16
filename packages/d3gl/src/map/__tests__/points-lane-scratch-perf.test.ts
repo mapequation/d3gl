@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { declutterPointsStrategy } from "../points-lane.js";
 
 /**
- * Per-frame regression guard for the declutter points-lane `select()` (#217, AGENTS.md step 5).
+ * Per-frame regression guard for the declutter points-lane `select()` (#217, docs/agents/performance.md).
  *
  * `select` runs on EVERY zoom/pan frame of a plot/geo instanced points layer. It used to allocate a
  * fresh `Uint32Array(count)` per frame as the visible set — with `count` approaching n when zoomed in

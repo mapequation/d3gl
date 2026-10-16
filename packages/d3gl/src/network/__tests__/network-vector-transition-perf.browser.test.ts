@@ -25,7 +25,7 @@ vi.mock("../glyphs.js", async (importOriginal) => {
 
 /**
  * ENGINE-level per-frame guard for a **fitted position transition** on a **Canvas / SVG** network with zoom
- * enabled (#427, AGENTS.md lifecycle §5).
+ * enabled (#427, docs/agents/performance.md).
  *
  * With `layout({ transition, fit: true })` the camera eases along with the nodes, moving the view on every
  * frame without `setTransform`: `frameView` sets the transform state and re-seeds d3-zoom (its handler

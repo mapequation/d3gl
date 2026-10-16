@@ -3,7 +3,7 @@ import { Scene } from "../../core/scene.js";
 import type { RenderLayer, ViewTransform } from "../../core/index.js";
 
 /**
- * Per-frame regression guard for the Canvas full-detail zoom sweep (#220, AGENTS.md lifecycle §5).
+ * Per-frame regression guard for the Canvas full-detail zoom sweep (#220, docs/agents/performance.md).
  *
  * Canvas repaints every visible drawable on each transform change — the per-frame cost is
  * inherently O(visible drawables) — so the guard pins that cost to EXACTLY one pass and nothing

@@ -310,7 +310,7 @@ export class GpuForceLayout {
    * `[posWrite, velWrite]` attachment sets. `fbos[0]` wraps the initial write
    * textures, `fbos[1]` wraps the post-swap ones. A per-tick `parity` selects the
    * one whose attachments currently match the write side — NO `createFramebuffer`
-   * on the hot path (AGENTS.md: "buffers updated in place, not recreated per frame").
+   * on the hot path (docs/agents/performance.md: "buffers updated in place, not recreated per frame").
    */
   private readonly fbos: readonly [Framebuffer, Framebuffer];
   /** Selects which pre-created FBO this tick writes into; flipped each tick alongside swap(). */

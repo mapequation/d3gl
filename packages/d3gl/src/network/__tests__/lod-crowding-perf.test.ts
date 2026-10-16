@@ -22,7 +22,7 @@ import { multilevelSeed } from "../coarsen.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 
 /**
- * Regression guard for the overlap-aware cut (#426, AGENTS.md lifecycle §5).
+ * Regression guard for the overlap-aware cut (#426, docs/agents/performance.md).
  *
  * Two costs move:
  *   - **the crowding pass** ({@link computeLODCrowding}) runs with every position + style pass — on the

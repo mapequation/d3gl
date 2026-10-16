@@ -88,7 +88,7 @@ This restores O(new) streaming on canvas; full redraw only on interaction.
 - **WebGL (browser):** append across a capacity-doubling boundary still renders all drawables (old + new); colors of new drawables correct (texture growth); recolor after append still works; pick works.
 - **Changeset** (patch/minor): O(new) incremental append on WebGL + Canvas.
 
-> Browser tests are written but **cannot be executed in this environment** (the vitest-browser/Playwright harness hangs — see AGENTS.md). The Scene delta is node-tested; WebGL/Canvas correctness must be verified locally / in CI.
+> Browser tests are written but **cannot be executed in this environment** (the vitest-browser/Playwright harness hangs — see LOG.md). The Scene delta is node-tested; WebGL/Canvas correctness must be verified locally / in CI.
 
 ## Out of scope
 

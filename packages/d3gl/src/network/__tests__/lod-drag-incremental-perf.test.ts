@@ -6,7 +6,7 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 import { fitInto } from "./fit-into.js";
 
 /**
- * Incremental LOD geometry during node-drag (#211, AGENTS.md lifecycle §5). A node-drag is a
+ * Incremental LOD geometry during node-drag (#211, docs/agents/performance.md). A node-drag is a
  * continuous pointer interaction (a per-frame path): before #211 every drag move ran the full
  * O(tree size) geometry recompute (`computeLODPositions` + `computeLODStyle`) even though only the
  * held leaves moved. The drag path now folds the held leaves in incrementally
@@ -34,7 +34,7 @@ const OUT = "/tmp/lod-drag-perf.txt";
 // The at-scale leg gates rather than only reporting (#258). Calibration at N=500k on an M-series
 // laptop: BEFORE (full pass per move) ~307ms, AFTER (incremental) 0.001ms held=1 / 0.056ms held=100
 // — a >5000× gap, so a 100× floor is far clear of noise while still catching a collapse back to
-// the full pass. Node-drag is a continuous pointer interaction: AGENTS §5 treats it as per-frame.
+// the full pass. Node-drag is a continuous pointer interaction: docs/agents/performance.md treats it as per-frame.
 const ASSERT = !!process.env.PERF_ASSERT;
 const MOVE_MS = Number(process.env.PERF_DRAG_MOVE_MS) || 5;
 const MIN_SPEEDUP = Number(process.env.PERF_DRAG_MIN_SPEEDUP) || 100;

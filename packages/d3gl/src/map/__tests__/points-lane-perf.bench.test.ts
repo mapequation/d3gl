@@ -93,7 +93,7 @@ describe("points-lane select() per-frame performance (#217)", () => {
 
       // --- signatures (always, whenever the bench runs) --------------------------------------
       // The sweep must actually reach a near-N visible set at its widest — otherwise it is
-      // measuring a cheap zoomed-in frame and the at-scale claim is hollow (AGENTS §5).
+      // measuring a cheap zoomed-in frame and the at-scale claim is hollow (docs/agents/performance.md).
       expect(maxKept, `widest frame kept only ${maxKept.toLocaleString()} of ${N.toLocaleString()} points`).toBeGreaterThan(N * 0.9);
       // Allocation-free steady state — the #217 scratch-reuse guarantee, at scale.
       expect(allocPerFrame / 1024, `${(allocPerFrame / 1024).toFixed(1)}KB/frame of typed-array growth in select()`).toBeLessThan(ALLOC_KB_PER_FRAME);

@@ -5,7 +5,7 @@ import { BarnesHutTree } from "../quadtree.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 
 /**
- * Per-frame guard for the main-thread force drag (AGENTS.md lifecycle §5). With `layout({ backend:
+ * Per-frame guard for the main-thread force drag (docs/agents/performance.md). With `layout({ backend:
  * "force" })` a node-drag runs one {@link ForceLayout.tick} per animation frame over the WHOLE graph
  * (network.ts: the `backend === "force"` branch of the drag session) — a continuous pointer
  * interaction, so a per-frame path. The tick is O(all nodes · log) Barnes-Hut + O(all edges) springs
@@ -49,7 +49,7 @@ const FRAME_MS_100K = Number(process.env.PERF_FORCE_DRAG_FRAME_MS) || 300;
 /** The N-independent share of the ceiling (GC and scheduler jitter): the tick itself has no constant term. */
 const FRAME_MS_CONST = 50;
 /**
- * The frame ceiling at `n` nodes, split into its constant and N·log N terms per AGENTS (scaling the whole
+ * The frame ceiling at `n` nodes, split into its constant and N·log N terms per docs/agents/performance.md (scaling the whole
  * calibrated ceiling would inflate the constant and hide a regression at large N). Exactly
  * {@link FRAME_MS_100K} at 100k.
  */

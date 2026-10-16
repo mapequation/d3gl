@@ -5,7 +5,7 @@ import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { perfHost, sweepFrames, zoomSteps } from "../../__tests__/engine-sweep.js";
 
 /**
- * ENGINE-level per-frame guard for #204 (AGENTS.md §5): `network.labels()` now measures every
+ * ENGINE-level per-frame guard for #204 (docs/agents/performance.md): `network.labels()` now measures every
  * candidate's text so its collision box is real. Text measurement is the expensive part of label
  * placement (a `CanvasRenderingContext2D.measureText` per string), and the network derives label
  * text PER FRAME from the current frontier / viewport — so the one thing that must never regress is
@@ -46,7 +46,7 @@ const COLS = Math.max(1, Math.round(Math.sqrt(N)));
 // Measured worst frame (best-of-3 per step, local headless Chromium) at N = 20k: 8.3ms with LOD
 // off and 8.1ms with LOD on and the frontier fully expanded — i.e. the same work either way, which
 // is the property the two legs exist to prove. That is a whole `setTransform` (lane emit + render +
-// label refresh), not the placement pass alone. Constant + N-linear terms, per AGENTS §Perf-guard,
+// label refresh), not the placement pass alone. Constant + N-linear terms, per LOG.md §Perf-guard coverage map,
 // so the tier's larger N gets room only for the part that really is linear (the candidate scan).
 const FRAME_OFF_MS = perfBudget(12 + 20 * (N / 20_000));
 const FRAME_ON_MS = perfBudget(12 + 20 * (N / 20_000));
@@ -168,7 +168,7 @@ describe(`network.labels() per-frame cost (n=${N})`, () => {
   }, 120_000);
 
   it("LOD on with an ALL-LEAVES frontier costs no more than the non-reduced draw", () => {
-    // AGENTS core values: LOD is a helper, not a guarantee — a fully expanded frontier is as large
+    // LOG.md core values: LOD is a helper, not a guarantee — a fully expanded frontier is as large
     // as the graph, and must be as cheap as the LOD-off leg above (same budget, deliberately).
     net.lod({ modules: MODULES, expandPx: 1 }); // every module expands ⇒ frontier = leaves in view
     warm();

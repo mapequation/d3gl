@@ -1,5 +1,5 @@
 /**
- * The GPU nested layout's per-frame guard (#355, AGENTS §5), through the real trigger:
+ * The GPU nested layout's per-frame guard (#355, docs/agents/performance.md), through the real trigger:
  * `network().data(g, { modules }).lod(…).layout({ backend: "gpu", nested: true })`, real animation frames,
  * one engine for both reduction states (LOD off, then LOD on over the module tree).
  *

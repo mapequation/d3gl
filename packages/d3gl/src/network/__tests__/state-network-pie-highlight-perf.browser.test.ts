@@ -64,7 +64,7 @@ const RING_BYTES_PER_EVENT = 4 * 1024;
 const SELECT_SLACK_BYTES = 16 * 1024;
 // LOD on: the frontier re-cut uploads per frame, screen-bounded (same ceiling as network-sweep-perf).
 const LOD_UPLOAD_BYTES_PER_FRAME = 1024 * 1024;
-// Wall-clock ceilings, split constant + linear (AGENTS.md §Scaling a browser guard). A hover move is a
+// Wall-clock ceilings, split constant + linear (docs/agents/performance.md §Scaling a guard). A hover move is a
 // CPU pick (pickNodes scans the full graph with LOD off — the linear term) + one ring emit + four uniform
 // writes + a render submit: measured median 0.2 ms at 20k (local headless Chromium, under load), so 1.5 ms
 // is ~7x — while a base-lane re-emit on hover (the #186 shape) costs what a drag move does, ~4.4 ms.
