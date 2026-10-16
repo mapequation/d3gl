@@ -53,6 +53,9 @@ export interface PhysicalPieWedges {
   color: string[];
   /** Per-wedge module key (the grouping-level path prefix), for legends / hit reporting. */
   moduleKey: string[];
+  /** Per-wedge module path (the grouping-level path prefix as numbers, `[]` for a node in no module) — what
+   *  `nodeFill: { by: "module", color }` colours the wedge by (#494). Wedges of one module share one array. */
+  modulePath: (readonly number[])[];
   /** Per-physical wedge count; `≤ 1` ⇒ solid disc (single module). Length `physicalCount`. */
   wedgeCount: Uint32Array;
 }
@@ -150,6 +153,8 @@ export function physicalPieWedges(
   const end = new Float32Array(total);
   const color = new Array<string>(total);
   const moduleKey = new Array<string>(total);
+  const modulePath = new Array<readonly number[]>(total);
+  const pathOf = new Map<string, readonly number[]>(allKeys.map((k) => [k, k === "root" ? [] : k.split(":").map(Number)]));
   for (let p = 0; p < physicalCount; p++) {
     const groups = perPhysical[p]!;
     let sum = 0;
@@ -163,9 +168,44 @@ export function physicalPieWedges(
       end[w] = j === keys.length - 1 ? 1 : sum > 0 ? acc / sum : (j + 1) / keys.length; // last wedge closes at exactly 1
       color[w] = colorOf(key);
       moduleKey[w] = key;
+      modulePath[w] = pathOf.get(key) ?? [];
       w++;
     }
   }
 
-  return { offset, end, color, moduleKey, wedgeCount };
+  return { offset, end, color, moduleKey, modulePath, wedgeCount };
+}
+
+/** Two wedge shares closer than this count as a tie: `end` is float32, so an exact split can differ by rounding. */
+const SHARE_TIE = 1e-6;
+
+/**
+ * Each physical node's **dominant** wedge: the absolute index (into `end` / `color` / `moduleKey` / `modulePath`)
+ * of its largest wedge, `end[k] − end[k − 1]` (the first from 0), or `-1` for a node with no wedges. A tie goes to
+ * the earlier wedge, the lower module, so a 50/50 split is deterministic. This is the module a physical node
+ * takes as a whole (its disc and its both-view container), while its pie keeps every wedge in module order.
+ * O(physical nodes + wedges); length `offset.length − 1`.
+ */
+export function dominantWedges(wedges: Pick<PhysicalPieWedges, "offset" | "end">): Int32Array {
+  const { offset, end } = wedges;
+  const n = Math.max(0, offset.length - 1);
+  const out = new Int32Array(n).fill(-1);
+  for (let p = 0; p < n; p++) {
+    const lo = offset[p] ?? 0;
+    const hi = offset[p + 1] ?? lo;
+    let best = -1;
+    let bestShare = -Infinity;
+    let prev = 0;
+    for (let k = lo; k < hi; k++) {
+      const e = end[k] ?? prev;
+      const share = e - prev;
+      if (share > bestShare + SHARE_TIE) {
+        best = k;
+        bestShare = share;
+      }
+      prev = e;
+    }
+    out[p] = best;
+  }
+  return out;
 }
