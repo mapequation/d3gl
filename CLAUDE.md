@@ -86,10 +86,3 @@ shell's working directory can silently reset to the primary repo, so:
   bare `git add -A`;
 - Read / Edit / Write the worktree's absolute paths, and check `git -C <worktree> status` after edits;
 - run `pnpm install` in a new worktree before its first build or test: it has its own empty `node_modules`.
-
-## GeoJSON winding
-
-`geoPath` fills polygons on the sphere, so a ring's orientation picks the region it encloses. Wind
-exterior rings **clockwise** in `[lon, lat]` (negative shoelace area) and holes the opposite way; from an
-angle, step it negatively. A counter-clockwise ring encloses the whole sphere minus the region: one solid
-fill covering the map. Reference rings: `website/src/examples/shared/geo-data.ts`.
