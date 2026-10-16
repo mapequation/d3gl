@@ -124,6 +124,9 @@ export interface InstancedCirclesData {
   /** Optional per-instance **group id** for shader-driven highlight (#162): the node id a circle is,
    *  so the vertex shader can match `u_hoverGroup` / index the selected set. Length `count`. */
   groups?: Float32Array;
+  /** Optional second per-instance group id (#494): the circle is also lit while this group is hovered — a
+   *  state network's state node while its physical container is. Length `count`; absent ⇒ none. */
+  groups2?: Float32Array;
   /** Optional per-instance **selected flag** (0/1) for shader-driven dim/recolour (#162). Length `count`. */
   selected?: Uint8Array;
   count: number;

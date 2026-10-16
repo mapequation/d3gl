@@ -87,3 +87,38 @@ export function moduleColors(nodes: ArrayLike<ModulePathNode>, opts: ModuleColor
   }
   return out;
 }
+
+/**
+ * Every node's **enclosing module** (#494) — its path minus the final rank, as {@link moduleColors} colours
+ * it — with each distinct module listed once, so a colour per module is resolved once per module, not once
+ * per node. `moduleOf[id]` indexes `paths`; −1 for an id no record covers.
+ */
+export interface NodeModules {
+  /** Node id → its enclosing module's index in {@link paths} (−1: no record). Length `nodeCount`. */
+  moduleOf: Int32Array;
+  /** Module index → its path (`[]` for the root: a node whose path is its rank alone). */
+  paths: readonly (readonly number[])[];
+}
+
+/** {@link NodeModules} of `records` over `nodeCount` node ids: O(total path length + modules · depth). */
+export function nodeModules(nodeCount: number, records: ArrayLike<ModulePathNode>): NodeModules {
+  const n = records.length;
+  const offset = new Uint32Array(n + 1);
+  for (let r = 0, total = 0; r < n; r++) {
+    total += records[r]?.path.length ?? 0;
+    offset[r + 1] = total;
+  }
+  const { moduleParent, moduleBranch, recordModule } = internModules(offset, copyRecordPaths(records, offset));
+  // A module is registered after its parent, so one forward pass extends each parent's path.
+  const paths = new Array<readonly number[]>(moduleParent.length);
+  for (let m = 0; m < moduleParent.length; m++) {
+    const parent = moduleParent[m] ?? -1;
+    paths[m] = parent < 0 ? [] : [...(paths[parent] ?? []), moduleBranch[m] ?? 0];
+  }
+  const moduleOf = new Int32Array(nodeCount).fill(-1);
+  for (let r = 0; r < n; r++) {
+    const id = records[r]?.id ?? -1;
+    if (id >= 0 && id < nodeCount) moduleOf[id] = recordModule[r] ?? -1;
+  }
+  return { moduleOf, paths };
+}

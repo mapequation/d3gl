@@ -622,11 +622,66 @@ function constBorderArrays(
  *   is filled with `scale` of its **aggregated** metric, summed like {@link NodeRadiusSpec}'s `{ by }`
  *   (so a module reads as its total flow). A spatial-tree cell is a region, not a unit of the metric, so
  *   it keeps its members' colour mean — as its radius stays area-additive.
+ * - `{ by: "module", color }` — a colour per **module**, from the hierarchy the engine holds (#494):
+ *   `data(graph, { modules })`, or a state network's `modules` (`stateNetwork()`). A node takes its
+ *   enclosing module's colour, `color(path)` with `path` the node's module path minus its own rank (the
+ *   1-based chain, `[]` for a node in no module), as {@link moduleColors} colours. In a state network's
+ *   physical view a disc takes its module at the pie level and each pie wedge its own module (see
+ *   {@link PieWedgeOptions.level}). `color` is asked once per module, not per node; `undefined` (a module
+ *   the palette has no colour for), and every node of a network without a hierarchy, take the default fill.
+ *   An LOD aggregate takes its members' colour mean, as with an accessor.
  */
 export type NodeFillSpec =
   | string
   | ((index: number, graph: NetworkGraph) => string)
-  | { by: NodeMetric; scale: (value: number) => string };
+  | { by: NodeMetric; scale: (value: number) => string }
+  | ModuleFillSpec;
+
+/** {@link NodeFillSpec}'s module form (#494): the app's colour for a module path, e.g. a palette keyed by module. */
+export interface ModuleFillSpec {
+  by: "module";
+  color: (modulePath: readonly number[]) => string | undefined;
+}
+
+/** Whether a {@link NodeFillSpec} is the {@link ModuleFillSpec} form. */
+export function isModuleFill(spec: NodeFillSpec | undefined): spec is ModuleFillSpec {
+  return typeof spec === "object" && spec.by === "module";
+}
+
+/**
+ * Per-node RGBA (length `4·nodeCount`) for a {@link ModuleFillSpec} over `modules` (#494): `color` is asked
+ * once per module that holds a node, and a module it gives no colour (or a node in none) takes `fallback`.
+ * O(nodes + modules); called once per style, never per frame.
+ */
+export function moduleFillColors(
+  modules: { moduleOf: Int32Array; paths: readonly (readonly number[])[] },
+  color: ModuleFillSpec["color"],
+  fallback: string,
+): Uint8Array {
+  const { moduleOf, paths } = modules;
+  const n = moduleOf.length;
+  const rgba = new Uint8Array(paths.length * 4);
+  const done = new Uint8Array(paths.length);
+  const base = toRGBA(fallback);
+  const out = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const m = moduleOf[i]!;
+    let c: ArrayLike<number> = base;
+    if (m >= 0) {
+      if (!done[m]) {
+        done[m] = 1;
+        const css = color(paths[m]!);
+        rgba.set(css === undefined ? base : toRGBA(css), 4 * m);
+      }
+      c = rgba.subarray(4 * m, 4 * m + 4);
+    }
+    out[4 * i] = c[0]!;
+    out[4 * i + 1] = c[1]!;
+    out[4 * i + 2] = c[2]!;
+    out[4 * i + 3] = c[3]!;
+  }
+  return out;
+}
 
 /** A resolved {@link NodeFillSpec}: one colour, or per-node RGBA plus (for `{ by, scale }`) the aggregate rule. */
 export interface ResolvedNodeFill {
@@ -638,11 +693,18 @@ export interface ResolvedNodeFill {
   fillAggregate?: FillAggregate;
 }
 
-/** Resolve a {@link NodeFillSpec} once per `style()`: O(nodeCount) scale/accessor calls, never per frame. */
-export function resolveNodeFill(graph: NetworkGraph, spec: NodeFillSpec | undefined, fallback: string): ResolvedNodeFill {
+/** Resolve a {@link NodeFillSpec} once per `style()`: O(nodeCount) scale/accessor calls, never per frame.
+ *  `modules` is the hierarchy a {@link ModuleFillSpec} resolves through (null: none, the default fill). */
+export function resolveNodeFill(
+  graph: NetworkGraph,
+  spec: NodeFillSpec | undefined,
+  fallback: string,
+  modules: { moduleOf: Int32Array; paths: readonly (readonly number[])[] } | null = null,
+): ResolvedNodeFill {
   if (spec === undefined) return { nodeFill: fallback };
   if (typeof spec === "string") return { nodeFill: spec };
   if (typeof spec === "function") return { nodeFill: fallback, nodeColors: resolveNodeColors(graph, spec) };
+  if (isModuleFill(spec)) return modules ? { nodeFill: fallback, nodeColors: moduleFillColors(modules, spec.color, fallback) } : { nodeFill: fallback };
   const value = metricAccessor(graph, spec.by);
   const { scale } = spec;
   const n = graph.nodeCount;
@@ -2930,7 +2992,14 @@ const TAU = Math.PI * 2;
  * each node-drag frame, not only a data/module change — and it rebuilds + re-parses every column each
  * time; caching the position-independent ones is #314. A zoom/pan never calls it (that lane is static).
  */
-export function physicalPieInstances(wedges: PhysicalPieWedges, positions: ArrayLike<number>, radius: PieRadius): InstancedPieData {
+export function physicalPieInstances(
+  wedges: PhysicalPieWedges,
+  positions: ArrayLike<number>,
+  radius: PieRadius,
+  /** Per-wedge RGBA (length `4·wedges`, wedge index order), resolved once per style (#494); default: each
+   *  wedge's `color`, parsed per call. */
+  rgba?: Uint8Array,
+): InstancedPieData {
   const { offset, end, color, wedgeCount } = wedges;
   const physicalCount = wedgeCount.length;
   const radiusAt = typeof radius === "number" ? () => radius : (p: number) => radius[p]!;
@@ -2956,11 +3025,14 @@ export function physicalPieInstances(wedges: PhysicalPieWedges, positions: Array
       radii[w] = r;
       angles[2 * w] = a0;
       angles[2 * w + 1] = a1;
-      const [rr, gg, bb, aa] = toRGBA(color[k]!);
-      colors[4 * w] = rr;
-      colors[4 * w + 1] = gg;
-      colors[4 * w + 2] = bb;
-      colors[4 * w + 3] = aa;
+      if (rgba) colors.set(rgba.subarray(4 * k, 4 * k + 4), 4 * w);
+      else {
+        const [rr, gg, bb, aa] = toRGBA(color[k]!);
+        colors[4 * w] = rr;
+        colors[4 * w + 1] = gg;
+        colors[4 * w + 2] = bb;
+        colors[4 * w + 3] = aa;
+      }
       groups[w] = p;
       a0 = a1;
       w++;

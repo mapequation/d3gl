@@ -53,6 +53,9 @@ export interface PhysicalPieWedges {
   color: string[];
   /** Per-wedge module key (the grouping-level path prefix), for legends / hit reporting. */
   moduleKey: string[];
+  /** Per-wedge module path (the grouping-level path prefix as numbers, `[]` for a node in no module) — what
+   *  `nodeFill: { by: "module", color }` colours the wedge by (#494). Wedges of one module share one array. */
+  modulePath: (readonly number[])[];
   /** Per-physical wedge count; `≤ 1` ⇒ solid disc (single module). Length `physicalCount`. */
   wedgeCount: Uint32Array;
 }
@@ -150,6 +153,8 @@ export function physicalPieWedges(
   const end = new Float32Array(total);
   const color = new Array<string>(total);
   const moduleKey = new Array<string>(total);
+  const modulePath = new Array<readonly number[]>(total);
+  const pathOf = new Map<string, readonly number[]>(allKeys.map((k) => [k, k === "root" ? [] : k.split(":").map(Number)]));
   for (let p = 0; p < physicalCount; p++) {
     const groups = perPhysical[p]!;
     let sum = 0;
@@ -163,9 +168,10 @@ export function physicalPieWedges(
       end[w] = j === keys.length - 1 ? 1 : sum > 0 ? acc / sum : (j + 1) / keys.length; // last wedge closes at exactly 1
       color[w] = colorOf(key);
       moduleKey[w] = key;
+      modulePath[w] = pathOf.get(key) ?? [];
       w++;
     }
   }
 
-  return { offset, end, color, moduleKey, wedgeCount };
+  return { offset, end, color, moduleKey, modulePath, wedgeCount };
 }

@@ -884,7 +884,15 @@ net
   .layout({ backend: "force" });    // lays out the physical graph + derives rosette state positions
 
 net.view("physical"); // pie glyphs for overlapping nodes · net.view("state") for the rosette
+
+// Your own module palette, in every view: state nodes, pie wedges and physical discs (#494).
+net.style({ nodeFill: { by: "module", color: (modulePath) => palette(modulePath) } });
 ```
+
+`modules` is optional: a raw state network (before Infomap) switches views too, without pies. In the
+**both** view a container hovers, selects and drags as its state nodes; a view switch carries the selection
+over (a physical node ↔ its state nodes), and every hit, selection and label says its `level`
+(`"physical"` or `"state"`), so the app names an id without mapping it.
 
 The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
 of a disc — no wedge texture, no per-fragment loop), so a physical view with many overlapping nodes draws

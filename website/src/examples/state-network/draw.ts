@@ -1,11 +1,15 @@
-import { network, physicalPieWedges, type PhysicalPieWedges } from "@mapequation/d3gl/network";
+import { network, physicalPieWedges, type NetworkHit, type PhysicalPieWedges } from "@mapequation/d3gl/network";
 import { scaleSqrt } from "d3-scale";
+import { schemeTableau10 } from "d3-scale-chromatic";
 import type { ImperativeSetup } from "../types.js";
 import { generateStateNetwork, type SyntheticStateNetwork } from "../shared/state-network-data.js";
 
 const NODES = [10, 100, 1_000, 10_000]; // physical node count (see the large-scale example; capped at 10k)
 const LABEL_CAPS = [6, 12, 20, 30, 50, 100, Infinity];
 const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
+/** An app's own module palette: a colour per module path (here by top module, a shade per sub-module). */
+const palette = (path: readonly number[]): string | undefined =>
+  path.length ? schemeTableau10[((path[0] ?? 1) - 1) % schemeTableau10.length] : undefined;
 
 /**
  * **State (higher-order / memory) networks — physical / state / both views with overlapping-module pies.**
@@ -20,7 +24,14 @@ const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
  * - **State** — every state node on a golden-angle **rosette** around its physical node, coloured by
  *   module. `net.lod({ modules })` (the **LOD** control) aggregates the state nodes into their modules.
  * - **Both** — state nodes confined **inside** each physical node's container disc, with state-level
- *   links: the memory structure in its physical context.
+ *   links: the memory structure in its physical context. Hover, click or drag a container: it acts as
+ *   its state nodes.
+ *
+ * **Colours** — with no `nodeFill`, the engine colours modules itself; `nodeFill: { by: "module", color }`
+ * takes your own palette (a colour per module path) for state nodes, pie wedges and physical discs in every
+ * view. **Modules: Off** loads the raw state network (no Infomap yet): the views still switch, without pies.
+ * A view switch carries the selection over (a physical node ↔ its state nodes), and every hit, selection
+ * and label names its `level` ("physical" or "state"), so the tooltip and labels below need no id mapping.
  *
  * The data is synthetic (`state-network-data.ts`): an LFR physical network + node2vec trigrams, node
  * labels `1,2,…` (physical) and `(i,j)` (state). `layout({ backend })` lays out the physical graph — **Force**
@@ -38,6 +49,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let wedges: PhysicalPieWedges | null = null; // per-physical module wedges, for the physical-view tooltip
   let builtN = -1;
   let builtBackend = ""; // re-run layout() when the Backend control changes, even without new data
+  let builtModules: boolean | null = null;
 
   // Same interactive options as the directed map of modules: multi-select, node-drag, hover rings — plus
   // a tooltip. In the physical view it shows a node's flow + its module share(s); elsewhere the node label.
@@ -45,9 +57,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     selectable: { multi: true },
     draggable: true,
     hover: true,
-    tooltip: (_datum, id) => {
+    tooltip: (datum, id) => {
       if (!data) return null;
-      const p = id as number;
+      const hit = datum as NetworkHit;
+      if (hit.level === "state") return data.stateNames[id as number] ?? null;
+      const p = hit.physical ?? (id as number); // a physical node, or a both-view container
       if (net.stateView === "physical" && wedges) {
         const flow = data.graph.physical.flow?.[p] ?? 0;
         const rows: string[] = [];
@@ -60,7 +74,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         el.innerHTML = `<b>Node ${data.physicalNames[p]}</b> · flow ${flow.toFixed(3)}<br>${rows.join("<br>")}`;
         return el;
       }
-      return net.stateView === "physical" ? data.physicalNames[p] ?? null : data.stateNames[p] ?? null;
+      return data.physicalNames[p] ?? null;
     },
   });
 
@@ -72,8 +86,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const physical = view === "physical";
       const halfArrow = options.links !== "Line"; // default: half-arrows (the map-of-modules glyph)
       const backend = options.backend === "GPU" ? "gpu" : options.backend === "Worker" ? "worker" : "force";
+      const withModules = options.modules !== "Off";
       const dataChanged = !data || builtN !== n;
-      const layoutChanged = dataChanged || builtBackend !== backend; // Backend control also re-lays out
+      // Backend and Modules also re-load the network and re-lay it out.
+      const layoutChanged = dataChanged || builtBackend !== backend || builtModules !== withModules;
       if (dataChanged) {
         data = generateStateNetwork({ nodeCount: n, communityCount: 6, mu: 0.18, avgDegree: 8, seed: 3 });
         wedges = physicalPieWedges(data.graph, data.stateModules); // for the physical-view tooltip
@@ -83,29 +99,31 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
       let hiFlow = 0;
       for (const f of g.graph.physical.flow!) if (f > hiFlow) hiFlow = f;
-      // The engine owns nodeFill (module colours) and, in the "both" view, nodeRadius (dots sized to the
-      // containers) — so this only sets the shared appearance + the physical/state node size.
+      // Without a nodeFill the engine colours modules itself; `{ by: "module", color }` takes the app's palette
+      // in every view. The "both" view sizes its state dots to their containers itself (in world units).
       net.style({
+        nodeFill: options.colors === "Palette" ? { by: "module", color: palette } : undefined,
         directed: true,
-        sizeMode: view === "both" || options.sizing === "World" ? "world" : "screen",
+        sizeMode: options.sizing === "World" ? "world" : "screen",
         linkStyle: halfArrow ? "half-arrow" : "line",
         linkBend: 0.15, // fraction of the link's length, for half-arrows and lines alike
         linkStroke: physical ? "rgba(90,110,150,0.5)" : "rgba(120,132,156,0.32)",
         linkWidth: physical ? { by: "weight", scale: scaleSqrt().domain([0, 8]).range([1, 6]).clamp(true) } : 1,
         nodeBorder: view === "both" ? undefined : { width: 1, color: "#000000" },
-        ...(view === "both" ? {} : { nodeRadius: physical ? { by: "flow" as const, scale: scaleSqrt().domain([0, hiFlow]).range([4, 22]) } : 5 }),
+        nodeRadius: physical ? { by: "flow", scale: scaleSqrt().domain([0, hiFlow]).range([4, 22]) } : 5,
       });
 
       if (layoutChanged) {
         // fit: true (#238, #427) frames the layout with the camera: as it converges on worker/gpu, once as
         // it lands on force. Opens framed, no top-left flash.
-        net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend, fit: true });
+        net.stateNetwork(g.graph, { modules: withModules ? g.stateModules : undefined, view }).layout({ backend, fit: true });
         builtBackend = backend;
+        builtModules = withModules;
       } else net.view(view);
 
       // LOD applies only to the state view (its nodes carry the module tree); default Off. "Modules" cuts
       // on the provided partition; "Standard" coarsens the state graph structurally.
-      const lodOn = view === "state" && options.lod !== "Off";
+      const lodOn = view === "state" && options.lod !== "Off" && (withModules || options.lod !== "Modules");
       net.lod(
         lodOn
           ? {
@@ -133,7 +151,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           ? {
               style: { textShadow: "0 0 3px #fff, 0 0 3px #fff" },
               max: Number.isFinite(cap) ? cap : undefined,
-              labelOf: (id) => (physical ? (physOn ? g.physicalNames[id] ?? null : null) : stateOn ? g.stateNames[id] ?? null : null),
+              // `info.level` names the id's graph: no per-view id mapping in the app.
+              labelOf: (id, info) => (info.level === "physical" ? (physOn ? g.physicalNames[id] ?? null : null) : stateOn ? g.stateNames[id] ?? null : null),
               physical: view === "both" && physOn ? { labelOf: (p) => g.physicalNames[p] ?? null } : undefined,
             }
           : false,
