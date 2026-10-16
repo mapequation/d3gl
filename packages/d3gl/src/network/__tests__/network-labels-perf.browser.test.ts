@@ -221,4 +221,94 @@ describe(`network.labels() per-frame cost (n=${N})`, () => {
     expect(ids.every((id) => importance(id) >= N - MAX), `labelled ids ${ids.join(",")} are not the top ${MAX} by importance`).toBe(true);
     expect(worstFrameMs).toBeLessThan(FRAME_ON_MS);
   }, 120_000);
+  // ── #496: `labels({ maxWidth })` — trimmed labels on the draw path, the full label on the hover path ──
+  /** Long names (the Navigator's state names): every one is cut at MAX_W. */
+  const LONG_NAME = (id: number, info: { aggregate: boolean }): string => (info.aggregate ? `agg${id}` : `{Allentown/Bethlehem,PA:Station${id}}_Albany,NY:AlbanyInternational`);
+  const MAX_W = 60;
+  const ELLIPSIS = "\u2026";
+
+  /** Per reduction state: the draw path (zoom sweep) and the hover path (pointer sweep over glyphs) with
+   *  `maxWidth` on, against the same view without it. All-leaves frontiers, so the visible set is as large
+   *  as the graph's in-view nodes (§5: a reduction is not allowed to shrink what the guard measures). */
+  const legs: Array<[string, () => void]> = [
+    ["LOD off", () => { net.lod(false); }],
+    ["LOD on, all-leaves frontier", () => { net.lod({ modules: MODULES, expandPx: 1 }); }],
+  ];
+  describe.each(legs)("maxWidth (#496) — %s", (_name, setLod) => {
+    it("draw path: trimming adds no measurement per frame and stays within the untrimmed frame budget", () => {
+      setLod();
+      const plain = { labelOf: LONG_NAME };
+      net.labels(plain);
+      warm();
+      const base = sweepFrames(steps, (t) => { net.setTransform(t); });
+      net.labels({ ...plain, maxWidth: MAX_W });
+      warm();
+      const measure = vi.spyOn(CanvasRenderingContext2D.prototype, "measureText");
+      const cut = sweepFrames(steps, (t) => { net.setTransform(t); });
+      expect(measure.mock.calls.length).toBe(0); // texts, trims and boxes are all memoized: nothing measured per frame
+      measure.mockRestore();
+      net.setTransform({ k: 8, x: -3 * W, y: -3 * H }); // zoomed in: labels have room, and the trimmed ones are drawn
+      const els = labelEls(host);
+      expect(els.length).toBeGreaterThan(0);
+      const uncut = els.filter((e) => !(e.textContent ?? "").endsWith(ELLIPSIS) && !e.textContent?.startsWith("agg"));
+      expect(uncut.map((e) => e.textContent), "a long label drawn in full").toEqual([]); // non-vacuous
+      expect(overlappingPairs(els)).toBe(0);
+      // The trimmed boxes are narrower, so placement keeps at least as many labels as the untrimmed frame did.
+      expect(cut.worstFrameMs).toBeLessThan(FRAME_ON_MS);
+      expect(cut.worstFrameMs).toBeLessThan(base.worstFrameMs * 1.5 + 6); // vs the path it adds to
+    }, 120_000);
+
+    it("hover path: a hover sweep shows the full label in O(1) per change (no re-placement, no measurement)", () => {
+      setLod();
+      net.interactive({ hover: true });
+      net.labels({ labelOf: LONG_NAME, maxWidth: MAX_W });
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      warm();
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      const rect = host.getBoundingClientRect();
+      let labelOfCalls = 0;
+      net.labels({ labelOf: (id, info) => { labelOfCalls++; return LONG_NAME(id, info); }, maxWidth: MAX_W });
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      const placed = labelEls(host).length;
+      let changes = 0;
+      net.on("hover", () => { changes++; });
+      const records: number[] = [];
+      const mo = new MutationObserver((r) => { records.push(r.length); });
+      mo.observe(host, { subtree: true, childList: true, attributes: true, characterData: true });
+      const measure = vi.spyOn(CanvasRenderingContext2D.prototype, "measureText");
+      labelOfCalls = 0;
+      let worst = 0;
+      let moves = 0;
+      let full = 0;
+      const BLOCK_N = 36; // a BLOCK_N × BLOCK_N block of the grid, row by row, whole-px pointer
+      for (let row = 0; row < BLOCK_N; row++) {
+        for (let col = 0; col < BLOCK_N; col++) {
+          const id = row * COLS + col;
+          const x = Math.round((col / COLS) * W), y = Math.round((row / COLS) * H);
+          const t0 = performance.now();
+          host.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + x, clientY: rect.top + y, bubbles: true }));
+          worst = Math.max(worst, performance.now() - t0);
+          moves++;
+          if (id % 53 === 0) { // sampled: the hovered glyph's label is in the DOM in full
+            if (labelEls(host).some((e) => !(e.textContent ?? "").endsWith(ELLIPSIS) && (e.textContent ?? "").includes("Station"))) full++;
+          }
+        }
+      }
+      mo.takeRecords();
+      mo.disconnect();
+      const measured = measure.mock.calls.length;
+      measure.mockRestore();
+      expect(moves).toBe(BLOCK_N * BLOCK_N);
+      expect(changes, "hover changed on most moves (non-vacuous)").toBeGreaterThan(moves / 4);
+      expect(full, "the hovered glyph's full label was shown").toBeGreaterThan(0);
+      // O(1) per hover change, whatever number of labels is placed: a couple of labelOf reads (the hovered
+      // glyph's), a few measurements (its full text, at most once per text), a few DOM writes.
+      expect(labelOfCalls / changes).toBeLessThanOrEqual(2);
+      expect(measured / changes).toBeLessThanOrEqual(8);
+      expect(records.reduce((a, b) => a + b, 0) / changes, "DOM mutations per hover change").toBeLessThanOrEqual(8);
+      expect(placed).toBeGreaterThan(50); // there were many labels the hover did not touch
+      expect(worst).toBeLessThan(perfBudget(20));
+      net.interactive(false);
+    }, 120_000);
+  });
 });

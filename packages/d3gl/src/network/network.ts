@@ -158,6 +158,14 @@ export interface NetworkLabelOptions {
    *  creation — never per frame. Backend-native text (SVG/Canvas, incl. export) is styled with
    *  {@link font}/{@link color}/{@link halo}, whose defaults match this look. */
   style?: LabelStyle;
+  /** Longest a label is drawn, in **screen px** of text width (#496): longer text is cut and ends in an
+   *  ellipsis (`…`), and placement (collision culling) uses the trimmed box. The full label shows in place
+   *  while its glyph is hovered (needs `interactive({ hover })`), even where collision dropped it.
+   *  Px, not characters: the collision box is measured in px, so a cap in px bounds the footprint
+   *  whatever the font or the text (`iiii` and `WWWW` differ 3× in width). The text is measured in
+   *  {@link font} (the same measurement placement uses) and trimmed once per distinct text, memoized.
+   *  **Default: unset — labels are drawn in full**, as before. */
+  maxWidth?: number;
   /** Constant screen-px offset `[dx, dy]` from the glyph centroid (labels are centred on it by default). */
   offset?: [number, number];
   /**
@@ -1586,6 +1594,7 @@ export class Network extends BaseEngine {
    */
   interactive(opts: InteractiveLayerOptions<NetworkHit> | false): this {
     this.interactiveOpts = opts || null;
+    if (!this.interactiveOpts?.hover) this.syncHoverLabel(); // hover turned off: the full label goes back to its trimmed one (#496)
     if (!this.interactiveOpts) {
       this.clearLayerSelection(this.NODE_LAYER); // disabling clears managed selection
       this.invalidateNoLodSelected(); // #240: bypasses onLaneSelectionChanged, so drop the flag cache here
@@ -1639,6 +1648,7 @@ export class Network extends BaseEngine {
     // defaults to the overlay default's equivalent; explicit font/color/halo win. Normalized once
     // here, so refreshLabels() reads plain opts with no per-frame defaulting.
     this.labelOpts = { ...DEFAULT_LABEL_TEXT, ...opts };
+    if (this.labelMaxWidth(this.labelOpts) !== undefined) this.attachPointer(); // the full label on hover (#496): the vector backends have no hover lane to attach it
     // Measure label boxes in the font the labels actually render in (explicit `font`, else the
     // overlay's `style.font`, else the shared default) — one memoizing measurer per label set (#204).
     this.labelMeasure = new TextMeasurer(canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font));
@@ -1672,6 +1682,7 @@ export class Network extends BaseEngine {
     const measure = this.labelMeasure ?? (this.labelMeasure = new TextMeasurer(canvasFont(opts.font ?? DEFAULT_LABEL_TEXT.font)));
     /** One glyph label: measured box + the centred placement the overlay CSS, the collision box and
      *  native text are all derived from (never a hand-written transform — #58's lesson). */
+    const maxW = this.labelMaxWidth(opts);
     const anchorFor = (
       id: string | number,
       refX: number,
@@ -1681,7 +1692,8 @@ export class Network extends BaseEngine {
       offset: [number, number] | undefined,
       opacity?: number,
     ): LabelAnchor => ({
-      id, refX, refY, text,
+      id, refX, refY,
+      text: maxW !== undefined ? (text = measure.trim(text, maxW)) : text, // trimmed text; the box below is its width (#496)
       width: measure.width(text),
       height: measure.height,
       priority,
@@ -1792,6 +1804,56 @@ export class Network extends BaseEngine {
     // (`textAnchor`/`baseline` "middle"), which the overlay CSS, the collision box and native text
     // all derive from.
     this.routeLabels(anchors);
+    this.syncHoverLabel(); // the hovered glyph may have moved (layout frame, rebuilt cut): re-point its full label
+  }
+
+  /** The `maxWidth` in effect: a finite, positive px value, else undefined (labels in full). */
+  private labelMaxWidth(opts: NetworkLabelOptions): number | undefined {
+    const w = opts.maxWidth;
+    return w !== undefined && Number.isFinite(w) && w > 0 ? w : undefined;
+  }
+
+  /**
+   * Show the hovered glyph's label in full (#496), or clear it. Only with `maxWidth` set and
+   * `interactive({ hover })` on. Costs O(1): the hovered id (kept per hover change), one `labelOf`, one
+   * memoized measure and trim, and one node rewrite — never a re-placement of the other labels, so a hover
+   * sweep adds nothing that grows with the labels shown or the graph. Called on every hover change and at
+   * the end of {@link refreshLabels}.
+   */
+  /** The node / aggregate under the pointer (#496), set per hover change in {@link onHoverTarget}. */
+  private hoverLabelId: number | null = null;
+
+  protected override wantsHoverTarget(): boolean {
+    return !!this.interactiveOpts?.hover && !!this.labelOpts && this.labelMaxWidth(this.labelOpts) !== undefined;
+  }
+
+  protected override onHoverTarget(hit: HoverHit | null): void {
+    const id = hit && hit.layer === this.NODE_LAYER && this.interactiveOpts?.hover && typeof hit.id === "number" ? hit.id : null;
+    if (id === this.hoverLabelId) return;
+    this.hoverLabelId = id;
+    this.syncHoverLabel();
+  }
+
+  private syncHoverLabel(): void {
+    const opts = this.labelOpts;
+    if (!this.labelLayer || !opts || !this.graph) return;
+    const maxW = this.labelMaxWidth(opts);
+    const id = maxW === undefined || !this.interactiveOpts?.hover ? null : this.hoverLabelId; // interactive(false) ends it, whatever the last hover was
+    let text: string | null | undefined, x = 0, y = 0, priority = 0;
+    if (id !== null) {
+      const tree = this.lodTree;
+      if (this.lodReady() && tree) {
+        if (id < tree.size) { text = labelText(opts, id, this.lodDatum(tree, id)); x = tree.cx[id] ?? 0; y = tree.cy[id] ?? 0; }
+      } else if (!this.lodAwaitsTree() && id < this.graph.nodeCount) {
+        text = labelText(opts, id, NO_LOD_INFO); x = this.graph.positions[2 * id] ?? 0; y = this.graph.positions[2 * id + 1] ?? 0;
+      }
+    }
+    if (id === null || !text || maxW === undefined) { this.setLabelHover(null, ""); return; }
+    const measure = this.labelMeasure ?? (this.labelMeasure = new TextMeasurer(canvasFont(opts.font ?? DEFAULT_LABEL_TEXT.font)));
+    this.setLabelHover({
+      id, refX: x, refY: y, text, width: measure.width(text), height: measure.height, priority,
+      offset: opts.offset, textAnchor: "middle", baseline: "middle",
+    }, measure.trim(text, maxW));
   }
 
   protected override afterTransform(): void {
