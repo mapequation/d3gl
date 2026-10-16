@@ -20,7 +20,7 @@ import { buildGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules.js";
 
 /**
- * Per-frame regression guard for the module boundaries (#329, AGENTS.md lifecycle §5). A LOD frame with
+ * Per-frame regression guard for the module boundaries (#329, docs/agents/performance.md). A LOD frame with
  * `lod({ moduleBoundary, crossLevelEdges })` runs the cut (now also collecting the expanded modules in
  * view), declutter, the super-edge gather (now also anchoring module links at those modules' rings) and
  * the ring build. All of it must stay O(visible), never O(tree):

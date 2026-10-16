@@ -26,7 +26,7 @@ const FRAMES_B = 8;
 const FRAME_MS = perfBudget(8 + N / 4_000);
 // Registration is O(N) on top of FRAMES × O(N), so the harness timeout must scale too — otherwise a
 // scaled run dies on a timeout instead of reporting its budget. A timeout is a harness limit, not a
-// budget (AGENTS.md §Tests).
+// budget (docs/agents/performance.md).
 const TEST_MS = perfBudget(20_000 + N / 20);
 
 function host(w = 480, h = 320): HTMLElement {

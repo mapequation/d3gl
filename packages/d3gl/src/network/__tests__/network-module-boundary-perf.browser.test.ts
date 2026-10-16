@@ -46,8 +46,8 @@ const N = perfN(50_000, { max: 200_000 });
 const W = 640;
 const H = 400;
 // Measured (local headless Chromium, 50k): worst frame 0.1 ms / 0.3 ms in legs 1 / 2 (the adaptive cut
-// keeps the sweep's frontier small), leg 3 ~34 ms (every node and link drawn). Constant + linear terms (AGENTS
-// §Tests), each ~4-6× the measured value — far below an O(N) re-derivation per frame on legs 1-2.
+// keeps the sweep's frontier small), leg 3 ~34 ms (every node and link drawn). Constant + linear terms
+// (docs/agents/performance.md), each ~4-6× the measured value — far below an O(N) re-derivation per frame on legs 1-2.
 const FRAME_MS_LOD = perfBudget(20 + (10 * N) / 50_000);
 const FRAME_MS_ALL_OPEN = perfBudget(150 + (350 * N) / 50_000);
 // Per-frame upload with the boundaries on: ABSOLUTE and N-independent (rings + anchored links in view
@@ -167,7 +167,7 @@ class Probe extends Network {
   }
 }
 const isOpenHit = (h: HoverHit | null): boolean => !!h && typeof h.datum === "object" && h.datum !== null && "open" in h.datum && h.datum.open === true;
-// Worst pointer move (#476), constant + linear terms (AGENTS §Tests). Measured (local headless Chromium): on the
+// Worst pointer move (#476), constant + linear terms (docs/agents/performance.md). Measured (local headless Chromium): on the
 // sweep 1.4 / 1.0 ms at 50k / 200k (a handful of rings drawn); every module open 2.4 / 4.8 ms (~4k / ~16.5k
 // rings tested per move, and a hover change repaints the full-detail frame). The deterministic counts below
 // carry the O(rings drawn) and highlight-lane-only proof; these catch an order-of-magnitude slip.

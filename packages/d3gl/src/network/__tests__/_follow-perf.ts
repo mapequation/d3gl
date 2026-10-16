@@ -8,7 +8,7 @@ import { GlBufferSpy, perfHost } from "../../__tests__/engine-sweep.js";
 import type { ViewTransform } from "../../core/index.js";
 
 /**
- * ENGINE-level per-frame guard for a **followed stream** (#454, AGENTS.md lifecycle §5): a warm layout
+ * ENGINE-level per-frame guard for a **followed stream** (#454, docs/agents/performance.md): a warm layout
  * streamed without a transition, which the engine eases toward frame by frame, from the positions on screen —
  * a nested map's (`layout({ backend: "worker", nested: { warm: true }, fit: true })`, the Navigator's switch to
  * Nested layout) and a force layout's (`layout({ backend: "worker", warm: true, fit: true })`, the switch back),

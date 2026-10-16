@@ -14,7 +14,7 @@
  * (a) Absolute real-GPU ~1M frame-budget is validated MANUALLY on real hardware
  *     (human verification / the website example), since SwiftShader software-GL
  *     timings are not representative of real GPU performance.
- * (b) "Both reduction states (LOD on/off)" from AGENTS.md §5 is a RENDER-path
+ * (b) "Both reduction states (LOD on/off)" from docs/agents/performance.md is a RENDER-path
  *     concept. The layout solver processes all nodes regardless of LOD, so the
  *     LOD on/off distinction does not apply here.
  *
@@ -308,7 +308,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     // 300s per-file budget here — the file would be killed rather than report a ceiling.
     const LOCAL_N = 30_000; // the N the ceiling is calibrated at
     const N = perfN(LOCAL_N, { max: 200_000 });
-    // Split into a constant and a linear term (AGENTS "Scaling a browser guard"): 1.2 s at LOCAL_N,
+    // Split into a constant and a linear term (LOG.md "Scaling a browser guard"): 1.2 s at LOCAL_N,
     // 3.5 s at 100k, 6.9 s at 200k. The measured intercept is ~0, so the constant is only a floor
     // against scheduler jitter; the linear term is 10× the measured slope. The only super-linear term
     // is the pyramid's level count, and chooseGrid clamps G at 1024, so L moves just 9→11 across
@@ -408,7 +408,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
   // whose reduction, pyramid scatter, all-pairs and traversal programs carry the mass branch: the per-tick
   // signatures below run on both kinds of solver.
   it.each([false, true])("pyramid ticking at N=30000 allocates no framebuffers or textures (all pre-created), multilevel %s", (multilevel) => {
-    // Re-affirms the "updated in place, not recreated per frame" AGENTS.md §5 signature
+    // Re-affirms the "updated in place, not recreated per frame" docs/agents/performance.md signature
     // at scale on the pyramid path. Mirrors the same assertion from gpu-pyramid.browser.test.ts
     // but at a larger N representative of the hot path.
     const N = 30_000;

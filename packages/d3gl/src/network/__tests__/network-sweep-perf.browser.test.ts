@@ -16,7 +16,7 @@ import type { InstancedLayer } from "../../core/index.js";
  * re-emit → `frontierLayers` → `emitInstancedLane`'s in-place `updateInstancedLayer` — was never
  * driven end-to-end at scale. An O(N)-per-frame cost in the glue between those modules trips nothing.
  *
- * Both reduction states run, per AGENTS.md §5 — a green result on one does not prove the other:
+ * Both reduction states run, per docs/agents/performance.md — a green result on one does not prove the other:
  *   - **LOD OFF** (full detail, the lane is `dynamic: false`): the whole graph is drawn every frame
  *     from a static emit. This is where an O(N)-per-frame cost hides, precisely because nothing is
  *     *supposed* to happen per frame.
@@ -93,7 +93,7 @@ const LOD_UPLOAD_BYTES_PER_FRAME = 1024 * 1024;
 const MAX_DECLUTTER_PROBES_PER_GLYPH = 8;
 const MAX_DECLUTTER_CELLS_PER_GLYPH = 16;
 // Registration (graph + layout + LOD tree) is the O(N) phase; a timeout is a harness limit, not a
-// budget (AGENTS.md §Tests).
+// budget (docs/agents/performance.md).
 const SETUP_MS = perfBudget(120_000 + N / 2);
 
 /** A binary-tree graph on a square grid: deterministic positions, a real hierarchy for LOD to coarsen. */

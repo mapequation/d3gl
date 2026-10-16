@@ -1,5 +1,5 @@
 /**
- * A node drag and a zoom sweep while the GPU nested solve runs (#375, AGENTS §5: continuous pointer
+ * A node drag and a zoom sweep while the GPU nested solve runs (#375, docs/agents/performance.md: continuous pointer
  * interaction and a `setTransform` sweep are per-frame paths). `layout({ backend: "auto", nested })` moves
  * a nested layout from the worker, which costs the main thread no frame while it solves, to the GPU
  * transport, whose work shares each frame with the interaction. Through the real triggers — pointer

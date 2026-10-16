@@ -5,7 +5,7 @@ import { nestedBoundaryDiscs, type NestedLayoutTopology } from "../nested-layout
 import { NestedDrag, NestedDragCache } from "../nested-drag.js";
 
 /**
- * Per-frame guard for the nested drag reheat (AGENTS.md lifecycle §5: a node drag is a per-frame path).
+ * Per-frame guard for the nested drag reheat (docs/agents/performance.md: a node drag is a per-frame path).
  * One tick runs per animation frame. Every level above the dragged item re-solves at the drag heat, so a
  * tick moves the whole map as a flat reheat does: its work is O(the re-solved modules' children and
  * links + the nodes that moved), each moved leaf written once (and each LOD tree node once, with LOD on) —

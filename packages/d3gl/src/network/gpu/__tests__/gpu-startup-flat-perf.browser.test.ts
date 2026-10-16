@@ -4,8 +4,8 @@
  * `gpu-startup-nested-perf.browser.test.ts` (the same harness, `_startup-perf.ts`).
  *
  * While a run's programs compile (1-2 s on ANGLE Metal with a cold shader cache), the transport polls them once
- * per animation frame, and the user may pan and zoom meanwhile. That poll is per-frame work, so per AGENTS.md
- * §5 it is pinned at a large input in both reduction states:
+ * per animation frame, and the user may pan and zoom meanwhile. That poll is per-frame work, so per
+ * docs/agents/performance.md it is pinned at a large input in both reduction states:
  *
  * - **Deterministic signature, per animation frame of the compile:** at most one completion query
  *   (`COMPLETION_STATUS_KHR`) per program the run compiles, no other program or shader query (a link status read

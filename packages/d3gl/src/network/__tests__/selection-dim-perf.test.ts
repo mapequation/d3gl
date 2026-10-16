@@ -6,7 +6,7 @@ import { buildGraph } from "../graph.js";
 import { dimOthers } from "../../map/selection-dim.js";
 
 /**
- * Per-frame regression guard for the #162 highlight on the LOD node lane (AGENTS.md step 5).
+ * Per-frame regression guard for the #162 highlight on the LOD node lane (docs/agents/performance.md).
  *
  * The dim/recolour itself is now applied in the GPU shader from per-instance columns + uniforms (a hover
  * is a uniform change — the browser test `network-interactive` proves hover issues no geometry re-emit).

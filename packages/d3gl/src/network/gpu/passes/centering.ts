@@ -14,7 +14,7 @@ import type { LayoutProgram } from "../programs.js";
 // {@link SegmentedReduce} — and its segment's centering strength from `param.y`, and writes
 //   o_force = centering * (Σpos / max(count, 1) − pos_i)
 // into the force texture with additive blend (accumulating alongside repulsion + attraction).
-// Padded texels are discarded (no loops here, so `discard` is safe — see AGENTS.md #350).
+// Padded texels are discarded (no loops here, so `discard` is safe — see LOG.md #350).
 //
 // The flat layout has one segment, so the segment id is a compile-time constant (SINGLE_SEGMENT) and
 // every node reads texel (0, 0) of the 1×1 table textures. With more segments each node reads its

@@ -18,7 +18,7 @@
  *   and at most one leaf per viewport pixel (a cold disc start draws every leaf for its first frame).
  * - **Main thread per repaint:** the commit (8 B per node of positions + the O(1) adoption) under a ceiling
  *   split into constant and linear terms. **Against the worker backend** on the same engine, graph and view
- *   (AGENTS lifecycle §5: the baseline the GPU path must not exceed), both from a disc cold start: the same
+ *   (docs/agents/performance.md: the baseline the GPU path must not exceed), both from a disc cold start: the same
  *   deterministic per-repaint work on both sides — no main-thread tree build or style pass, no edge
  *   incidence walked, no row computed or built here, the overlap rule's frontier — everywhere; and commit +
  *   repaint within the worker backend's repaint **only on a hardware GPU** (`PERF_REAL_GPU=1`, the tier #392

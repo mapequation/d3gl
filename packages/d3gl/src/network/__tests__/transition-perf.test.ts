@@ -7,7 +7,7 @@ import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } fr
 import { positionTransition, type PositionTransition } from "../transition.js";
 
 /**
- * Per-frame regression guard for position transitions (#328, AGENTS.md lifecycle §5). A transition is
+ * Per-frame regression guard for position transitions (#328, docs/agents/performance.md). A transition is
  * a draw loop: every animation frame writes every node's position, then the engine repaints
  * positions-only. It must cost no more than the frame it stands in for — a **streamed layout frame**
  * (the worker posts positions, `scheduleLayoutRepaint` repaints) — and allocate nothing of its own.

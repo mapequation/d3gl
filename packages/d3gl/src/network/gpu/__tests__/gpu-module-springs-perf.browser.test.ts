@@ -1,5 +1,5 @@
 /**
- * Per-tick guard for the GPU module springs (#455, AGENTS.md lifecycle §5). A GPU flat tick — every streamed
+ * Per-tick guard for the GPU module springs (#455, docs/agents/performance.md). A GPU flat tick — every streamed
  * layout frame's, and a drag reheat's — adds the module springs' passes: the centroid reduction over the
  * leaves in tree order (its gather levels and one range query over the endpoints), the endpoint centroids,
  * the endpoint springs, and one hand-down pass over the leaves in the force pass. The layout moves every node

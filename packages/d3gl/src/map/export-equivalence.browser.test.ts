@@ -17,7 +17,7 @@
  * control (where `bake = 1` and the bug cannot appear).
  *
  * Bordered nodes are deliberately absent: WebGL exports one stroked ring, the Scene path two stacked
- * discs (AGENTS.md § Backend compositing equivalence, #269). That divergence is pinned by
+ * discs (LOG.md § Backend compositing equivalence, #269). That divergence is pinned by
  * `network/__tests__/network-export.browser.test.ts`; mixing it in here would mask a real bake error
  * behind a known one.
  */

@@ -161,7 +161,15 @@ export class GeoMap extends BaseEngine {
    * `passThrough: true` — a callback re-invoked each repaint (the uncapped, non-pickable
    * streaming path). Re-declaring an existing `name` replaces the layer and resets its
    * interaction/style state. Returns a {@link LayerHandle} for appending data and per-layer
-   * styling. (Wind exterior polygon rings clockwise in `[lon, lat]` — see the project docs.)
+   * styling.
+   *
+   * WINDING (Polygon/MultiPolygon): d3-geo fills on the sphere, so a ring's orientation picks
+   * the region it encloses. Wind exterior rings CLOCKWISE in `[lon, lat]` (latitude up; negative
+   * signed area) and holes the opposite way; when generating a ring from an angle, step the angle
+   * negatively. A counter-clockwise exterior ring encloses the whole sphere minus the region, so
+   * the polygon renders as one solid fill covering the map: if that happens, reverse the ring.
+   * Nested rings (land ▸ lake ▸ island) must alternate, as Canvas and SVG fill by the nonzero rule
+   * and WebGL reproduces it (`groupRings`, core/rings.ts).
    *
    * @typeParam F - the feature/datum type carried through to accessors and hit results.
    */

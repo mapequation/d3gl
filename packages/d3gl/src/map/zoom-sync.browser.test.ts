@@ -65,7 +65,7 @@ describe("programmatic setTransform keeps the zoom gesture in step (#202)", () =
     // Count how often the engine re-seeds d3-zoom, by spying on the protected hook through the
     // instance. A gesture frame must NOT re-seed: that call is already in step with d3-zoom, and
     // putting a `behavior.transform` apply on the interaction path would be per-frame work on a
-    // continuous pointer interaction (AGENTS.md §5).
+    // continuous pointer interaction (docs/agents/performance.md).
     const engine = chart as unknown as { syncZoomToView: () => void };
     const original = engine.syncZoomToView.bind(chart);
     let syncs = 0;

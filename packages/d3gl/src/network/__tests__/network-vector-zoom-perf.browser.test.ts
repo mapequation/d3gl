@@ -24,7 +24,7 @@ vi.mock("../glyphs.js", async (importOriginal) => {
 
 /**
  * ENGINE-level per-frame guard for a programmatic `setTransform` on a **Canvas / SVG** network with zoom
- * enabled (#309, AGENTS.md lifecycle §5).
+ * enabled (#309, docs/agents/performance.md).
  *
  * A retained backend cannot re-cut per frame, so a programmatic view change settles like a gesture's end:
  * `afterProgrammaticTransform` → `syncScreenGeometry` → one Scene rebuild, O(drawn nodes + edges) — every

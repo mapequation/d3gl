@@ -6,7 +6,7 @@
  * `RGBA/FLOAT` into a retained scratch and compacts it: twice the bytes plus an O(N) loop over all layout
  * nodes. That path is new per-frame work on those devices, so this guard drives the real call at a
  * realistic N on a device that reads `rg32f` only as `RGBA/FLOAT` (`makeRgbaReadDevice`), and on a plain
- * device for the `RG/FLOAT` path the measured hardware takes (AGENTS lifecycle §5). It pins the
+ * device for the `RG/FLOAT` path the measured hardware takes (docs/agents/performance.md). It pins the
  * deterministic signature on both: exact positions, no texture or framebuffer created per readback, one
  * `readPixels` per readback, and on the `RGBA/FLOAT` path the same retained scratch every time and no
  * `RG/FLOAT` read attempted.

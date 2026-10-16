@@ -240,7 +240,7 @@ describe("a programmatic view change is not a gesture (#309)", () => {
   }
 });
 
-/** The `<circle>` glyphs a view exports — the drawn LOD frontier on Canvas/SVG (see AGENTS.md: `toSVG()`
+/** The `<circle>` glyphs a view exports — the drawn LOD frontier on Canvas/SVG (see LOG.md: `toSVG()`
  *  is the typed probe for what was actually emitted). */
 const circles = (svg: string): number => (svg.match(/<circle/g) ?? []).length;
 

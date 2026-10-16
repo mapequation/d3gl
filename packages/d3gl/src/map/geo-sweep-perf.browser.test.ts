@@ -37,7 +37,7 @@
  * covered for the engines that have one (network `frontier-perf`, plot `points-lane-perf`).
  *
  * Cells are exterior-CW in [lon, lat] — a counter-clockwise ring is its own complement and fills
- * the whole map (AGENTS.md "GeoJSON winding").
+ * the whole map (LOG.md "GeoJSON winding").
  */
 import { describe, it, expect } from "vitest";
 import { geoEquirectangular, type GeoProjection, type GeoStream } from "d3-geo";
@@ -107,7 +107,7 @@ const BUILD_MS = perfBudget(400 + 700 * (N / 30_000));
 const SVG_FRAME_MS = perfBudget(25);
 
 /** The harness limit: build + sweep + the WebGL device handshake + the PNG readback. A timeout is
- *  a harness limit, not a budget (AGENTS.md §Tests). */
+ *  a harness limit, not a budget (docs/agents/performance.md). */
 const TEST_MS = perfBudget(20_000 + 20_000 * (N / 30_000));
 
 function host(): HTMLElement {
@@ -161,7 +161,7 @@ function countingProjection(): { proj: GeoProjection; streams: () => number } {
  * layer is registered — `setTransform` and `render` touch nothing but a uniform and the draw call.
  * Zero of them during a sweep, together with a zero delta on `groupRendererConstructions`, is proof
  * that the frame re-derived, re-allocated and re-uploaded *nothing*: exactly the "a path that
- * re-uploads per frame what the old path retained is a regression" rule (AGENTS.md lifecycle §5).
+ * re-uploads per frame what the old path retained is a regression" rule (docs/agents/performance.md).
  * Patching the prototype rather than an instance catches the backend the engine builds internally.
  */
 interface BackendWatch {

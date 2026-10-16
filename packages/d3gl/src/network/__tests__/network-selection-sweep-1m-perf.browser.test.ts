@@ -5,7 +5,7 @@ import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost, sweepFrames, zoomSteps } from "../../__tests__/engine-sweep.js";
 
 /**
- * `network-sweep-perf`'s full-detail selection leg (#428) at ≈1M nodes (AGENTS lifecycle §5), on an engine of
+ * `network-sweep-perf`'s full-detail selection leg (#428) at ≈1M nodes (docs/agents/performance.md), on an engine of
  * its own: LOD off, interactive, every 97th node selected, a `setTransform` zoom sweep. The no-LOD
  * selected-flag cache is keyed on the selection set's identity (#428: a `select()` made while the lane waited
  * must invalidate it), one reference compare per no-LOD emit; a key that stopped matching per frame would
