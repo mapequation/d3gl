@@ -354,10 +354,6 @@ export abstract class BaseEngine {
   private readonly labelCull = labelCullScratch();
   /** The label shown in full while hovered (#496), and the text it returns to; null when none. */
   private labelHover: { anchor: LabelAnchor; restore: string } | null = null;
-  /** Native-text path only (#496): the last placed set as pushed, with the ids it was placed for —
-   *  kept so a hover change patches one entry instead of re-placing every label. */
-  private nativeBase: TextData[] = [];
-  private nativeIds: (string | number)[] = [];
   /** Retained plot/geo data-label anchors (#223): measured + built ONCE at `labels(data, opts)` call,
    *  re-placed (not rebuilt/re-measured) on every transform. `max` caps the shown set (default ∞). */
   private dataLabels: { anchors: LabelAnchor[]; max: number } | null = null;
@@ -1727,8 +1723,7 @@ export abstract class BaseEngine {
     this.labelLayer = null;
     this.labelText = null;
     this.labelHover = null;
-    this.nativeBase = [];
-    this.nativeIds = [];
+    this.backend()?.setHoverText?.(null);
     this.exportAnchors = [];
     this.backend()?.setTextLayer?.([]);
   }
@@ -1750,9 +1745,7 @@ export abstract class BaseEngine {
     const backend = this.backend();
     if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
       const survivors = placeLabels(anchors, this.transform, viewport, this.labelCull);
-      this.nativeBase = this.toTextData(survivors);
-      this.nativeIds = survivors.map((b) => b.id);
-      backend.setTextLayer(this.labelHover ? this.hoverPatched(this.labelHover.anchor) : this.nativeBase);
+      backend.setTextLayer(this.toTextData(survivors));
       layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
     } else {
       layer.update(anchors, this.transform, viewport);
@@ -1766,10 +1759,10 @@ export abstract class BaseEngine {
   /**
    * Show `anchor`'s text in full while hovered, in place of its (trimmed) placed twin, or clear it
    * (`null`) — #496. `restore` is the text the label returns to. The anchor is NOT culled: the hovered
-   * label is shown even where collision dropped it. On the HTML overlay (WebGL) this is O(1): one node
-   * is rewritten, nothing is re-placed ({@link LabelLayer.setHover}). On a native-text backend
-   * (SVG/Canvas) the retained placed set is patched at one entry and re-pushed: O(placed labels), which
-   * those backends' own `render()` that follows already pays (they redraw every label).
+   * label is shown even where collision dropped it. Every backend has a one-label slot, so a hover change
+   * writes exactly one label and never re-places or re-pushes the placed set: the HTML overlay's one node
+   * ({@link LabelLayer.setHover}, WebGL), `Backend.setHoverText` on SVG (one element) and Canvas (one
+   * label-sized rectangle, no scene repaint).
    */
   protected setLabelHover(anchor: LabelAnchor | null, restore: string): void {
     const layer = this.labelLayer;
@@ -1777,20 +1770,10 @@ export abstract class BaseEngine {
     this.labelHover = anchor ? { anchor, restore } : null;
     const backend = this.backend();
     if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
-      backend.setTextLayer(anchor ? this.hoverPatched(anchor) : this.nativeBase);
+      backend.setHoverText?.(anchor ? { text: this.toTextData([anchorBox(anchor, this.transform)])[0]!, width: anchor.width ?? 0, height: anchor.height ?? 0 } : null);
     } else {
       layer.setHover(anchor, restore, this.transform);
     }
-  }
-
-  /** {@link nativeBase} with `anchor`'s label in full: its placed entry rewritten, or one appended. */
-  private hoverPatched(anchor: LabelAnchor): TextData[] {
-    const out = this.nativeBase.slice();
-    const full = this.toTextData([anchorBox(anchor, this.transform)])[0]!;
-    const at = this.nativeIds.indexOf(anchor.id);
-    if (at >= 0) out[at] = { ...out[at]!, text: full.text }; // keeps the placed centre
-    else out.push(full);
-    return out;
   }
 
   /** Map placed label boxes to backend {@link TextData} — the one shape both the live native-text

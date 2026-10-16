@@ -14,6 +14,8 @@ const NAMES = [LONG, `{Boston,MA:LoganInternational}_Chicago,IL:OHareInternation
 const POS = new Float32Array([30, 100, 110, 100, 190, 100]);
 const graph = () => buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
 const BACKENDS = ["webgl", "canvas", "svg"] as const;
+// Canvas draws into pixels, so its hover leg is separate (below); the others read their label text live.
+const LIVE = ["webgl", "svg"] as const;
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -34,6 +36,7 @@ async function setup(backend: (typeof BACKENDS)[number], opts: { maxWidth?: numb
   /** The label texts drawn right now (live overlay on WebGL, native text on SVG/Canvas). */
   const texts = (): string[] => {
     if (backend === "webgl") return [...h.querySelectorAll("[data-label-id]")].map((e) => e.textContent ?? "");
+    if (backend === "svg") return [...h.querySelectorAll("svg text")].map((e) => e.textContent ?? ""); // live DOM: placed set + hover slot
     return [...net.toSVG().matchAll(/<text[^>]*>([^<]*)<\/text>/g)].map((m) => m[1]!);
   };
   const hoverAt = (x: number, y: number) => {
@@ -76,15 +79,26 @@ describe.each(BACKENDS)("network.labels({ maxWidth }) (#496) — %s", (backend) 
     cut.net.destroy(); cut.h.remove();
   });
 
+  it("without maxWidth, hover changes nothing about the labels", async () => {
+    const { net, h, texts, hoverAt } = await setup(backend, {});
+    const before = texts();
+    hoverAt(30, 100);
+    expect(texts()).toEqual(before);
+    net.destroy(); h.remove();
+  });
+});
+
+describe.each(LIVE)("network.labels({ maxWidth }) (#496) hover — %s", (backend) => {
   it("hovering a node shows its label in full; leaving restores the trimmed one", async () => {
     const { net, h, texts, hoverAt } = await setup(backend, { maxWidth: MAX });
     hoverAt(30, 100); // node 0
     expect(texts()).toContain(LONG);
-    expect(texts().filter((t) => t.endsWith(ELLIPSIS)).length).toBe(1); // node 1's, still trimmed
+    const covered = backend === "svg" ? 1 : 0; // SVG keeps node 0's trimmed twin in the DOM, under the hover chip
+    expect(texts().filter((t) => t.endsWith(ELLIPSIS)).length).toBe(1 + covered); // node 1's, still trimmed
     hoverAt(110, 100); // node 1
     expect(texts()).toContain(NAMES[1]);
     expect(texts()).not.toContain(LONG); // node 0 is back to its trimmed text
-    expect(texts().length).toBe(3); // one label per node, none duplicated
+    expect(texts().length).toBe(3 + covered); // one label per node (+ the covered twin on SVG)
     hoverAt(110, 20); // empty space
     expect(texts()).not.toContain(NAMES[1]);
     expect(texts().filter((t) => t.endsWith(ELLIPSIS)).length).toBe(2);
@@ -109,13 +123,6 @@ describe.each(BACKENDS)("network.labels({ maxWidth }) (#496) — %s", (backend) 
     net.destroy(); h.remove();
   });
 
-  it("without maxWidth, hover changes nothing about the labels", async () => {
-    const { net, h, texts, hoverAt } = await setup(backend, {});
-    const before = texts();
-    hoverAt(30, 100);
-    expect(texts()).toEqual(before);
-    net.destroy(); h.remove();
-  });
 });
 
 describe("network.labels({ maxWidth }) (#496) — hovered label that placement dropped (WebGL)", () => {
@@ -137,6 +144,53 @@ describe("network.labels({ maxWidth }) (#496) — hovered label that placement d
     expect(els().length).toBe(2);
     h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 10, clientY: r.top + 10, bubbles: true }));
     expect(els().length).toBe(1);
+    net.destroy(); h.remove();
+  });
+});
+
+describe("network.labels({ maxWidth }) (#496) hover — canvas", () => {
+  it("paints the full label over the canvas with no repaint, and restores the pixels under it on leave", async () => {
+    const { net, h, hoverAt } = await setup("canvas", { maxWidth: MAX });
+    const cv = h.querySelector("canvas")!;
+    const ctx = cv.getContext("2d")!;
+    const before = ctx.getImageData(0, 0, cv.width, cv.height).data.slice();
+    const fills: string[] = [];
+    const orig = CanvasRenderingContext2D.prototype.fillText;
+    let clears = 0;
+    const origClear = CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.fillText = function (this: CanvasRenderingContext2D, t: string, ...r: [number, number]) { fills.push(t); return orig.call(this, t, ...r); };
+    CanvasRenderingContext2D.prototype.clearRect = function (this: CanvasRenderingContext2D, ...r: [number, number, number, number]) { clears++; return origClear.apply(this, r); };
+    try {
+      hoverAt(30, 100);
+      expect(fills).toEqual([LONG]); // exactly one label painted: the hovered one, in full
+      expect(clears).toBe(0); // the scene was not repainted
+      const during = ctx.getImageData(0, 0, cv.width, cv.height).data;
+      expect(during.some((v, i) => v !== before[i])).toBe(true);
+      hoverAt(110, 20); // leave
+      expect(clears).toBe(0);
+      const after = ctx.getImageData(0, 0, cv.width, cv.height).data;
+      let bad = 0, firstAt = -1; for (let i = 0; i < after.length; i++) if (after[i] !== before[i]) { bad++; if (firstAt < 0) firstAt = i; }
+      expect(bad, `first diff at px ${(firstAt / 4) % cv.width | 0},${(firstAt / 4 / cv.width) | 0} ch ${firstAt % 4}: ${after[firstAt]} vs ${before[firstAt]}`).toBe(0); // pixels restored exactly
+    } finally {
+      CanvasRenderingContext2D.prototype.fillText = orig;
+      CanvasRenderingContext2D.prototype.clearRect = origClear;
+    }
+    net.destroy(); h.remove();
+  });
+
+  it("keeps the full label through a repaint while hovered, and ends without a trace", async () => {
+    const { net, h, hoverAt } = await setup("canvas", { maxWidth: MAX });
+    const cv = h.querySelector("canvas")!;
+    const ctx = cv.getContext("2d")!;
+    hoverAt(30, 100);
+    net.setTransform({ k: 1, x: 5, y: 0 }); // re-places and repaints
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    const clean = (await setup("canvas", { maxWidth: MAX }));
+    clean.net.destroy(); clean.h.remove();
+    hoverAt(110, 20);
+    const ref = ctx.getImageData(0, 0, cv.width, cv.height).data.slice();
+    net.interactive(false); // clears nothing visible: the hover was already off
+    expect(ctx.getImageData(0, 0, cv.width, cv.height).data.every((v, i) => v === ref[i])).toBe(true);
     net.destroy(); h.remove();
   });
 });

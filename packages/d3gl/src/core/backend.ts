@@ -317,6 +317,17 @@ export interface TextData {
   halo?: { color: string; width: number };
 }
 
+/**
+ * The one label shown in full while its glyph is hovered (#496): a {@link TextData} on a solid chip of
+ * `width` × `height` px (centred on the text's anchor per its `align`), so it covers the trimmed twin
+ * drawn beneath it. Set and cleared on its own, never through the placed set.
+ */
+export interface HoverText {
+  text: TextData;
+  width: number;
+  height: number;
+}
+
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {
   setLayers(layers: RenderLayer[]): void;
@@ -424,6 +435,14 @@ export interface Backend {
    * pushes the placed set only at export time (#219). Replaces the whole set; pass `[]` to clear.
    */
   setTextLayer?(texts: readonly TextData[]): void;
+  /**
+   * The one-label hover slot (#496), optional: show `hover` in full over the placed labels, or clear it
+   * (`null`). **O(1) in the placed labels:** the placed set is not re-pushed and not re-serialized. SVG
+   * writes one dedicated element; Canvas paints the chip and text over the live canvas and restores the
+   * small rectangle under them on clear (no repaint of the scene). Not called on an export-only text
+   * backend (WebGL: the HTML overlay shows the hovered label).
+   */
+  setHoverText?(hover: HoverText | null): void;
   /**
    * How {@link setTextLayer} text is rendered (#219). `"live"` (default when absent): the backend
    * draws the set on screen (SVG `<text>` / Canvas `fillText`), so the engine routes labels away from
