@@ -20,6 +20,7 @@ export default function FlowBorders() {
           display: ["0", "0.07", "0.14", "0.21", "0.28"],
         },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["World", "Screen"] },
+        { type: "segmented", key: "border", label: "Border", options: ["Absolute", "Share"] },
       ]}
       width={720}
       height={440}

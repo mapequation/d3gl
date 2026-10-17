@@ -166,7 +166,9 @@ Every visual channel maps a flow quantity through a d3 scale, so the map reads q
 - **`flowBorder`** — `flow` is a per-node value (your `Float32Array` of enter/exit flow, or a built-in
   metric like `"strength"`); `scale` maps it to ring width and `color` may be a `(value, index, graph)`
   accessor so the ring colour encodes it too. d3gl doesn't compute enter/exit flow — you supply it
-  (Infomap gives it), per node and, with `moduleFlow`, per module (below).
+  (Infomap gives it), per node and, with `moduleFlow`, per module (below). With **`share: true`** (and no
+  `scale`) the flow border covers the share of the node's flow that leaves it instead: its exit flow over
+  its flow (the graph's `nodeFlow`), as a share of its area — see below.
 - **`linkWidth` + `linkStroke`** — link flow (the per-edge weight) → half-arrow width **and** colour.
   Each takes a constant, a `(weight) => …` scale (a bare d3 colour scale fits `linkStroke` —
   `scaleSqrt().range([light, dark])` interpolates RGBA, alpha included), or **`{ by, scale }`** like
@@ -208,6 +210,24 @@ flow is smaller: the flow between its own submodules never leaves it. Pass the m
 net.data(graph, { modules: infomapResult.nodes }).style({
   nodeFill: { by: "flow", scale: scaleSequentialLog(interpolateViridis).domain([minFlow, 1]) },
   flowBorder: { flow: enterExitFlow, scale: borderWidth, moduleFlow: (path) => moduleFlow.get(path.join(":")) },
+});
+```
+
+**Absolute or share.** By default a flow border is `scale(flow)` wide, whatever the node's size, so two
+nodes whose flow all leaves them can show anything from a thin border to a fully covered disc. With
+**`share: true`** it reads as the share of the node's flow that leaves it: a node of radius `r`, flow `f`
+(the graph's `nodeFlow`) and exit flow `e` (`flow`) keeps an inner disc of radius `r · √(1 − e/f)`, so the
+border covers `e/f` of its area — all of it when `e = f` (common in a map with no self-links), half when
+`e = f/2`, none when `e = 0`, and none when `f` is 0 or missing. The share does not depend on the radius,
+so it reads the same in both size modes. An aggregate takes its members' summed exit flow over their summed
+flow, a module with `moduleFlow` its own exit flow over its summed flow, and each view of a state network
+its own graph's node flow (a physical node's flow is the sum of its state nodes'). The **Border** control
+below switches the two modes.
+
+```ts
+net.data(graph).style({
+  nodeRadius: { by: "flow", scale: radius },
+  flowBorder: { share: true, flow: exitFlow }, // covers exitFlow / nodeFlow of each node's area
 });
 ```
 
