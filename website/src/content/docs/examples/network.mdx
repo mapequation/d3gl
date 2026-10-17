@@ -166,7 +166,9 @@ Every visual channel maps a flow quantity through a d3 scale, so the map reads q
 - **`flowBorder`** — `flow` is a per-node value (your `Float32Array` of enter/exit flow, or a built-in
   metric like `"strength"`); `scale` maps it to ring width and `color` may be a `(value, index, graph)`
   accessor so the ring colour encodes it too. d3gl doesn't compute enter/exit flow — you supply it
-  (Infomap gives it), per node and, with `moduleFlow`, per module (below).
+  (Infomap gives it), per node and, with `moduleFlow`, per module (below). A flow border, like a
+  `nodeBorder`, is drawn inside the node and covers at most a third of its radius, so the fill always
+  shows: keep `scale`'s range under a third of your smallest radius to encode every value.
 - **`linkWidth` + `linkStroke`** — link flow (the per-edge weight) → half-arrow width **and** colour.
   Each takes a constant, a `(weight) => …` scale (a bare d3 colour scale fits `linkStroke` —
   `scaleSqrt().range([light, dark])` interpolates RGBA, alpha included), or **`{ by, scale }`** like

@@ -410,7 +410,7 @@ describe("network() engine", () => {
       .style({
         nodeRadius: 10,
         nodeFill: "#4878d0",
-        flowBorder: { flow: new Float32Array([4, 4, 4]), scale: (v) => v, color: "#123456" },
+        flowBorder: { flow: new Float32Array([3, 3, 3]), scale: (v) => v, color: "#123456" },
       })
       .layout({ backend: "positions", positions: new Float32Array([20, 20, 100, 100, 180, 40]) });
 
@@ -418,8 +418,8 @@ describe("network() engine", () => {
     // ONE circle per node, the border carried as its stroke — never a second, stacked disc, which
     // would paint over the ring for a translucent fill (#269).
     expect((svg.match(/<circle/g) ?? []).length).toBe(3);
-    // r = 10, flow 4 ⇒ ring 4 wide, centreline 10 − 2 = 8.
-    expect((svg.match(/r="8"[^/]*stroke-width="4"/g) ?? []).length).toBe(3);
+    // r = 10, flow 3 (under the #506 cap of 10/3) ⇒ flow border 3 wide, centreline 10 − 1.5 = 8.5.
+    expect((svg.match(/r="8\.5"[^/]*stroke-width="3"/g) ?? []).length).toBe(3);
 
     // Disabling the border keeps 3 circles at the full radius and drops the ring (none lingers);
     // the links keep their own stroke-width, so scope the check to the node circles.

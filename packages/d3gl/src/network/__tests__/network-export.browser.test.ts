@@ -87,7 +87,7 @@ describe("network toSVG() on the WebGL backend (#200)", () => {
   it("bordered nodes: WebGL and Canvas both export ONE stroked ring per node", async () => {
     // A TRANSLUCENT fill — the case the stacked-disc encoding got wrong. Under it the fill disc
     // painted over the border disc, so this glyph's interior read the ring colour through it.
-    const style = { nodeRadius: 8, nodeFill: "rgba(31, 119, 180, 0.5)", nodeBorder: { width: 3, color: "#ff0000" } } as const;
+    const style = { nodeRadius: 8, nodeFill: "rgba(31, 119, 180, 0.5)", nodeBorder: { width: 2, color: "#ff0000" } } as const;
 
     const gl = network(host(), { width: 200, height: 200 }); // webgl default
     await gl.whenReady();
@@ -106,9 +106,9 @@ describe("network toSVG() on the WebGL backend (#200)", () => {
     expect(count(b, "circle")).toBe(count(a, "circle"));
     expect(a).toMatch(/stroke-width/);
     expect(b).toMatch(/stroke-width/);
-    // Same geometry, not merely the same element count: r = 8, b = 3/8 ⇒ centreline 8·(1−3/16) = 6.5
-    // with stroke-width 3. Both documents must carry that ring on every node.
-    const rings = (svg: string): number => (svg.match(/r="6\.5"[^/]*stroke-width="3"/g) ?? []).length;
+    // Same geometry, not merely the same element count: r = 8, b = 2/8 (under the #506 cap) ⇒ centreline
+    // 8·(1−1/8) = 7 with stroke-width 2. Both documents must carry that node border on every node.
+    const rings = (svg: string): number => (svg.match(/r="7"[^/]*stroke-width="2"/g) ?? []).length;
     expect(rings(a)).toBe(3);
     expect(rings(b)).toBe(3);
     // The ring is an OPAQUE stroke over a half-transparent fill on both paths — nothing occludes it.

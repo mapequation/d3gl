@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { rgb } from "d3-color";
 import { buildGraph } from "../graph.js";
-import { resolveFlowBorder, nodeCircles, frontierCircles, flowBorderInnerRadii } from "../glyphs.js";
+import { resolveFlowBorder, nodeCircles, frontierCircles, flowBorderInnerRadii, borderFraction, borderInnerRadius, MAX_BORDER_FRACTION } from "../glyphs.js";
 import { buildModuleLODTree } from "../modules.js";
 import { computeLODPositions, computeLODStyle } from "../lod.js";
 
@@ -34,12 +34,12 @@ describe("resolveFlowBorder", () => {
 });
 
 describe("nodeCircles flow border", () => {
-  it("emits ring thickness as scale(metric)/radius, clamped to [0,1], with a repeated colour", () => {
+  it("emits flow border thickness as scale(metric)/radius, capped at MAX_BORDER_FRACTION, with a repeated colour", () => {
     const g = buildGraph({ nodeCount: 3, source: [0], target: [1] });
-    const border = resolveFlowBorder(g, { flow: new Float32Array([5, 0, 40]), scale: id, color: "#ff0000" }, "#000");
+    const border = resolveFlowBorder(g, { flow: new Float32Array([2.5, 0, 40]), scale: id, color: "#ff0000" }, "#000");
     const data = nodeCircles(g, { radii: new Float32Array([10, 10, 10]), fill: "#0000ff", border });
-    // 5/10 = 0.5; 0/10 = 0; 40/10 = 4 → clamped to 1.
-    expect(Array.from(data.borders!)).toEqual([0.5, 0, 1]);
+    // 2.5/10 = 0.25; 0/10 = 0; 40/10 = 4 → capped at a third (#506), so the fill still shows.
+    expect(Array.from(data.borders!)).toEqual([0.25, 0, Math.fround(MAX_BORDER_FRACTION)]);
     expect(Array.from(data.borderColors!.slice(0, 4))).toEqual([255, 0, 0, 255]);
   });
 
@@ -83,18 +83,57 @@ describe("frontierCircles flow border", () => {
       { id: 3, path: [2, 2] },
     ]);
     computeLODPositions(tree, new Float32Array([0, 0, 1, 0, 2, 0, 3, 0]));
-    computeLODStyle(tree, new Float32Array([10, 10, 10, 10]), new Float32Array([1, 1, 1, 1]), new Float32Array([5, 5, 5, 5]));
+    computeLODStyle(tree, new Float32Array([10, 10, 10, 10]), new Float32Array([1, 1, 1, 1]), new Float32Array([2.5, 2.5, 2.5, 2.5]));
     const fc = frontierCircles(tree, Uint32Array.from([0, 1, 2, 3]), {
       nodeFill: "#00f",
       aggregateFill: "#999",
       border: { metric: new Float32Array(0), scale: id, color: [255, 0, 0, 255], colorCss: "#f00" },
     });
-    expect(Array.from(fc.borders!)).toEqual([0.5, 0.5, 0.5, 0.5]); // 5 / radius 10
+    expect(Array.from(fc.borders!)).toEqual([0.25, 0.25, 0.25, 0.25]); // 2.5 / radius 10
   });
 });
 
-describe("flowBorderInnerRadii (SVG two-disc export)", () => {
-  it("shrinks each radius by the ring width, clamped so it never goes negative", () => {
-    expect(Array.from(flowBorderInnerRadii(new Float32Array([10, 10]), new Float32Array([3, 20]), id))).toEqual([7, 0]);
+describe("flowBorderInnerRadii (Canvas/SVG node path)", () => {
+  it("shrinks each radius by the flow border width, the border capped at MAX_BORDER_FRACTION of the radius", () => {
+    expect(Array.from(flowBorderInnerRadii(new Float32Array([10, 10]), new Float32Array([3, 20]), id))).toEqual([7, Math.fround(10 - 10 / 3)]);
+  });
+});
+
+describe("border cap rule (#506)", () => {
+  it("leaves a border that is small next to the radius unchanged", () => {
+    expect(borderFraction(1, 10)).toBe(0.1);
+    expect(borderInnerRadius(10, 1)).toBe(9);
+    // Exactly at the cap (radius = 3 widths) nothing changes either.
+    expect(borderFraction(1, 3)).toBe(1 / 3);
+    expect(borderInnerRadius(3, 1)).toBe(2);
+  });
+
+  it("caps a border at a third of the radius, so a node at or below the border width keeps its fill", () => {
+    expect(MAX_BORDER_FRACTION).toBe(1 / 3);
+    for (const r of [0.1, 0.5, 1, 2]) {
+      expect(borderFraction(1, r)).toBe(MAX_BORDER_FRACTION);
+      expect(borderInnerRadius(r, 1)).toBeCloseTo((2 / 3) * r, 12);
+    }
+  });
+
+  it("states the same rule as a fraction and as a radius", () => {
+    for (const [w, r] of [[0.2, 5], [1, 0.5], [4, 6], [3, 9]] as const) {
+      expect(borderInnerRadius(r, w)).toBeCloseTo(r * (1 - borderFraction(w, r)), 12);
+    }
+  });
+
+  it("draws no border for a zero or negative width, or a non-positive radius", () => {
+    expect(borderFraction(0, 5)).toBe(0);
+    expect(borderFraction(-1, 5)).toBe(0);
+    expect(borderFraction(1, 0)).toBe(0);
+    expect(borderInnerRadius(5, 0)).toBe(5);
+    expect(borderInnerRadius(5, -1)).toBe(5);
+    expect(borderInnerRadius(0, 1)).toBe(0);
+  });
+
+  it("caps a node border (nodeBorder) in the instanced circles too", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
+    const data = nodeCircles(g, { radii: new Float32Array([10, 0.5]), fill: "#0000ff", constBorder: { width: 1, color: [255, 255, 255, 255] } });
+    expect(Array.from(data.borders!)).toEqual([Math.fround(0.1), Math.fround(MAX_BORDER_FRACTION)]);
   });
 });

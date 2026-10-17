@@ -34,7 +34,7 @@ const STYLE: NetworkStyle = {
   nodeFill: { by: "flow", scale: (v) => `rgb(${byte(v)}, 0, 0)` }, // red ∝ flow
   flowBorder: {
     flow: ENTER_EXIT,
-    scale: (v) => 4 * v, // ring width ∝ enter/exit flow
+    scale: (v) => 3 * v, // flow border width ∝ enter/exit flow, under the #506 cap (a third of the module radius √128 ≈ 11.3)
     color: (v) => `rgb(0, ${byte(v)}, 0)`, // green ∝ the value the ring draws
     moduleFlow: (path) => (path.length === 1 && path[0] === 1 ? 0.3 : undefined), // only module [1] has one
   },
@@ -70,8 +70,8 @@ describe("nodeFill { by, scale } + flowBorder.moduleFlow through the engine (#44
       expect(agg[0]!.fill).toEqual([byte(0.3), 0, 0]);
       expect(agg[1]!.fill).toEqual([byte(0.7), 0, 0]);
       // Ring: module [1] draws its own value 0.3 (not the members' 1.0); module [2] has none → the sum.
-      expect(agg[0]!.strokeWidth).toBeCloseTo(4 * 0.3, 3);
-      expect(agg[1]!.strokeWidth).toBeCloseTo(4 * 1.0, 3);
+      expect(agg[0]!.strokeWidth).toBeCloseTo(3 * 0.3, 3);
+      expect(agg[1]!.strokeWidth).toBeCloseTo(3 * 1.0, 3);
       expect(agg[0]!.stroke).toEqual([0, byte(0.3), 0]);
       expect(agg[1]!.stroke).toEqual([0, byte(1.0), 0]);
 
@@ -80,7 +80,7 @@ describe("nodeFill { by, scale } + flowBorder.moduleFlow through the engine (#44
       const leaves = circles(net.toSVG()).sort((a, b) => a.fill[0]! - b.fill[0]!);
       expect(leaves.map((c) => c.fill[0])).toEqual([0.1, 0.2, 0.3, 0.4].map(byte));
       for (const c of leaves) {
-        expect(c.strokeWidth).toBeCloseTo(4 * 0.5, 3);
+        expect(c.strokeWidth).toBeCloseTo(3 * 0.5, 3);
         expect(c.stroke).toEqual([0, byte(0.5), 0]);
       }
       net.destroy();

@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, borderInnerRadius, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -210,7 +210,8 @@ export interface NetworkStyle {
   /**
    * Constant border ring (#104 rework): a fixed **pixel** outline on every node/module (e.g.
    * `{ width: 1, color: "#fff" }`). Independent of {@link flowBorder} (which encodes flow);
-   * `flowBorder` wins if both are set.
+   * `flowBorder` wins if both are set. Drawn inside the radius and capped at a third of it
+   * (#506), so a node smaller than three border widths keeps its fill.
    */
   nodeBorder?: { width: number; color?: string };
   /**
@@ -265,8 +266,9 @@ export interface NetworkStyle {
    * own value from `moduleFlow(path)` (#445). With `moduleFlow` alone — no `flow`, as for an Infomap
    * `.ftree`, which has each module's flow but none per node (#471) — only the modules with a value are
    * ringed. Fill/size still come
-   * from `nodeFill`/`nodeRadius` (size by total flow with `nodeRadius: { by: "flow", scale }`). Omit
-   * for plain filled nodes. @see {@link FlowBorderSpec}
+   * from `nodeFill`/`nodeRadius` (size by total flow with `nodeRadius: { by: "flow", scale }`). Like
+   * {@link nodeBorder}, the width is drawn inside the radius and capped at a third of it (#506): a
+   * wider value draws at the cap. Omit for plain filled nodes. @see {@link FlowBorderSpec}
    */
   flowBorder?: FlowBorderSpec;
   /**
@@ -2778,7 +2780,7 @@ export class Network extends BaseEngine {
     // Draw the pie at the node's INNER radius (inside any constant border), so the "nodes" circle's
     // border ring shows around the pie exactly as it does around a single-module disc (#171 review).
     const cb = resolved.constBorder;
-    const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width))) : resolved.nodeRadii;
+    const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => borderInnerRadius(r, cb.width)) : resolved.nodeRadii;
     const pie = physicalPieInstances(this.pieWedges, graph.positions, radii);
     if (pie.count === 0) return null;
     // #175: the per-wedge `selected` flags travel ON the emit (like the nodes' via attachNoLodHighlight).
@@ -4852,7 +4854,7 @@ export class Network extends BaseEngine {
     const innerRadii = flow
       ? flowBorderInnerRadii(style.nodeRadii, flow.metric, flow.scale)
       : cb
-        ? Float32Array.from(style.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width)))
+        ? Float32Array.from(style.nodeRadii, (r) => borderInnerRadius(r, cb.width))
         : style.nodeRadii;
     this.registerLayer({
       name: "nodes",

@@ -257,8 +257,9 @@ const FLOW_STYLE: NetworkStyle = {
   ...STYLE,
   // Each top module in its own colour: its sub-modules, and the module itself, are filled with it.
   nodeFill: (i) => css(MODULES[i]!.path[0] === 1 ? C1 : C2),
-  // World units, so a ring's exported stroke width is directly the flow ring's width.
-  flowBorder: { scale: (v) => 10 * v, color: "#000000", moduleFlow: (path) => MODULE_FLOW.get(path.join(":")) },
+  // World units, so a glyph's exported stroke width is directly its flow border's width (kept under the
+  // #506 cap of a third of the sub-modules' radius √27 ≈ 5.2).
+  flowBorder: { scale: (v) => 3 * v, color: "#000000", moduleFlow: (path) => MODULE_FLOW.get(path.join(":")) },
 };
 /** Each module's enter flow, already through the app's ring scale (world units): the open module's ring
  *  width. [2, 2] has none — the constant default. */
@@ -288,7 +289,7 @@ describe("module boundaries in the module's own fill and width (#471)", () => {
       // own `moduleFlow` value — none for [2, 2], which has none.
       const collapsed = exportedCircles(top).filter((c) => c.fill[3] > 0);
       const glyphs = collapsed.map((c): [number[], number] => [c.fill.slice(0, 3), c.strokeWidth]).sort((a, b) => a[1] - b[1]);
-      expect(glyphs.map(([, w]) => Number(w.toFixed(3)))).toEqual([0, 2, 4, 5]); // scale(0.2 | 0.4 | 0.5), none
+      expect(glyphs.map(([, w]) => Number(w.toFixed(3)))).toEqual([0, 0.6, 1.2, 1.5]); // scale(0.2 | 0.4 | 0.5), none
       // Each ring is in the fill its collapsed module was drawn with.
       for (const [color, w] of tops) {
         const fill = w < 3 ? C1 : C2;

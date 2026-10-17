@@ -561,11 +561,37 @@ function darkenColors(fill: ArrayLike<number>, count: number, factor: number): U
   return out;
 }
 
-const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
+/**
+ * The most of a node's radius its node border (`nodeBorder`) or flow border (`flowBorder`) may cover
+ * (#506). Both are drawn INSIDE the radius, so a width at or above the radius would paint the whole disc
+ * in the border colour and hide the fill. Capped at a third, the fill keeps at least two thirds of the
+ * radius; a border thinner than that (any node at least three border widths in radius) is unchanged.
+ */
+export const MAX_BORDER_FRACTION = 1 / 3;
 
 /**
- * Per-instance border-ring arrays for a batch of circles: thickness as a fraction of the *drawn*
- * radius (`scale(value)/radius`, clamped to `[0,1]`) plus a repeated RGBA ring colour.
+ * A node border's or flow border's thickness as a fraction of the node's drawn `radius`: `width/radius`,
+ * clamped to `[0, MAX_BORDER_FRACTION]`, and 0 for a non-positive radius. Unit-free, so one rule serves
+ * both size modes. The instanced-circle shader, its export and the LOD Scene trace all read this
+ * fraction; {@link borderInnerRadius} is the same rule as a radius.
+ */
+export function borderFraction(width: number, radius: number): number {
+  if (!(radius > 0)) return 0;
+  const b = width / radius;
+  return b < 0 ? 0 : b > MAX_BORDER_FRACTION ? MAX_BORDER_FRACTION : b;
+}
+
+/**
+ * The radius left for a node's fill inside a border `width` wide: `radius − min(width, MAX_BORDER_FRACTION·radius)`,
+ * the {@link borderFraction} rule as a radius (the vector node path and the pies use it).
+ */
+export function borderInnerRadius(radius: number, width: number): number {
+  return radius > 0 && width > 0 ? radius - Math.min(width, MAX_BORDER_FRACTION * radius) : radius;
+}
+
+/**
+ * Per-instance border arrays for a batch of circles: thickness as a fraction of the *drawn*
+ * radius ({@link borderFraction}: `scale(value)/radius`, capped) plus a repeated RGBA border colour.
  */
 function buildBorders(
   count: number,
@@ -583,7 +609,7 @@ function buildBorders(
     const r = radii[i]!;
     const v = valueOf(i);
     // `NaN` = no value (#471): no ring, and the scale is never asked for one.
-    borders[i] = r > 0 && !Number.isNaN(v) ? clamp01(scale(v) / r) : 0;
+    borders[i] = r > 0 && !Number.isNaN(v) ? borderFraction(scale(v), r) : 0;
     if (adopt && perNodeColors) continue;
     if (perNodeColors) {
       borderColors[i * 4] = perNodeColors[i * 4]!;
@@ -670,9 +696,9 @@ export function resolveNodeColors(graph: NetworkGraph, color: (index: number, gr
 }
 
 /**
- * Inner-disc radii (`radius − ring width`) for rendering a flow border as two stacked discs (a
- * border-colour disc under a smaller fill disc) on the SVG/Canvas export path, which has no
- * per-element ring primitive. `metric` is the raw per-node flow.
+ * Inner (fill) radii inside a flow border ({@link borderInnerRadius}: `radius − border width`, the border
+ * capped at {@link MAX_BORDER_FRACTION} of the radius) for the Canvas/SVG node path, which draws each
+ * node as one circle stroked over its border band. `metric` is the raw per-node flow.
  */
 export function flowBorderInnerRadii(radii: ArrayLike<number>, metric: ArrayLike<number>, scale: (v: number) => number): Float32Array {
   const n = radii.length;
@@ -680,7 +706,7 @@ export function flowBorderInnerRadii(radii: ArrayLike<number>, metric: ArrayLike
   for (let i = 0; i < n; i++) {
     const r = radii[i]!;
     const v = metric[i]!;
-    inner[i] = Number.isNaN(v) ? r : Math.max(0, r - Math.min(r, scale(v))); // `NaN`: no value, no ring (#471)
+    inner[i] = Number.isNaN(v) ? r : borderInnerRadius(r, scale(v)); // `NaN`: no value, no flow border (#471)
   }
   return inner;
 }
