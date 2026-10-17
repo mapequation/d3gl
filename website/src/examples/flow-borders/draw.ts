@@ -13,7 +13,7 @@ const BENDS = [0, 0.07, 0.14, 0.21, 0.28]; // the Bend slider's stops (⟂ offse
  * `linkStyle: "half-arrow"` each directed link is one filled shape that pinches to the source centre
  * and lands its barbed tip on the target node's boundary; a reciprocal pair nests around a shared
  * centre curve. Switch the **backend** (WebGL / Canvas / SVG) — the render is equivalent — export, go
- * fullscreen, scroll to zoom, and drag the **Bend** slider.
+ * fullscreen, scroll to zoom, drag the **Bend** slider, and switch the **Border** mode.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -43,13 +43,17 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // publication layout). Screen: they're constant pixels as you zoom, while the nodes still move
       // apart/together — the navigation register LOD wants. (Screen-mode half-arrows are WebGL-only.)
       const sizeMode = options.sizing === "Screen" ? "screen" : "world";
+      // Absolute: the flow border is `scale(exit flow)` wide. Share: it covers the share of the node's flow
+      // that leaves it (exit flow / flow) as a share of its area — here half of each node.
+      const color = (v: number) => borderColor(v);
+      const flowBorder = options.border === "Share" ? { share: true as const, flow: g.outFlow, color } : { flow: g.outFlow, scale: borderWidth, color };
       net.style({
         directed: true,
         linkStyle: "half-arrow",
         sizeMode,
         nodeRadius: { by: "flow", scale: radius }, // radius ∝ total flow
         nodeFill: { by: "flow", scale: fillColor }, // fill ∝ total flow
-        flowBorder: { flow: g.outFlow, scale: borderWidth, color: (v) => borderColor(v) }, // ring ∝ enter/exit flow
+        flowBorder, // ∝ enter/exit flow
         linkBend: bend,
         linkWidth, // half-arrow width ∝ link flow
         linkStroke: linkColor, // half-arrow colour ∝ link flow
