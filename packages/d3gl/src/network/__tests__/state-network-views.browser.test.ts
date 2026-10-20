@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { network, type Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
 import { buildGraph } from "../graph.js";
+import { physicalPieWedges } from "../pie.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedHighlight, InstancedLayer } from "../../core/backend.js";
@@ -107,6 +108,18 @@ function circlesOf(svg: string): Circle[] {
 
 /** Where state node `s` is drawn in the active view (#495: the both view's dots have positions of their own). */
 const statePos = (net: Network, s: number): [number, number] => [net.positions![2 * s]!, net.positions![2 * s + 1]!];
+
+/** The fill of the stroked (container) circle centred on physical `p` in an SVG export, as `r,g,b`. */
+function containerFillOf(net: Network, p: number): string | undefined {
+  for (const m of net.toSVG().matchAll(/<circle([^>]*)>/g)) {
+    const a = m[1] ?? "";
+    const num = (k: string) => Number(new RegExp(`\\b${k}="([^"]+)"`).exec(a)?.[1] ?? NaN);
+    if (!(num("stroke-width") > 0) || Math.abs(num("cx") - POS[2 * p]!) > 0.01 || Math.abs(num("cy") - POS[2 * p + 1]!) > 0.01) continue;
+    const rgb = /fill="rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(a);
+    return rgb ? `${rgb[1]},${rgb[2]},${rgb[3]}` : /fill="([^"]+)"/.exec(a)?.[1];
+  }
+  return undefined;
+}
 
 /** A screen point inside physical `p`'s container but clear of every state dot: the container's top edge. */
 function containerPoint(net: Network, g: ReturnType<typeof fixture>["graph"], p: number): [number, number] {
@@ -815,18 +828,9 @@ describe("the app's module palette reaches the pies whatever the node fill: styl
     const net = await engine(host());
     net.style({ nodeFill: { by: "flow", scale: () => "#00c000" }, moduleColor: colorOf }).stateNetwork(graph, { modules, view: "both" });
     place(net);
-    /** The fill of the stroked (container) circle centred on physical `p`, as `r,g,b`. */
-    const containerFill = (p: number): string | undefined => {
-      for (const m of net.toSVG().matchAll(/<circle([^>]*)>/g)) {
-        const a = m[1] ?? "";
-        const num = (k: string) => Number(new RegExp(`\\b${k}="([^"]+)"`).exec(a)?.[1] ?? NaN);
-        if (!(num("stroke-width") > 0) || Math.abs(num("cx") - POS[2 * p]!) > 0.01 || Math.abs(num("cy") - POS[2 * p + 1]!) > 0.01) continue;
-        const rgb = /fill="rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(a);
-        return rgb ? `${rgb[1]},${rgb[2]},${rgb[3]}` : /fill="([^"]+)"/.exec(a)?.[1];
-      }
-      return undefined;
-    };
-    // Physical 1 holds module [1] alone (red), physical 2 module [2] (blue), physical 0 a pie whose first wedge is [1].
+    const containerFill = (p: number) => containerFillOf(net, p);
+    // Physical 1 holds module [1] alone (red), physical 2 module [2] (blue), physical 0 a 50/50 pie of [1] and
+    // [2], whose tie goes to the lower module, [1].
     expect(containerFill(1)).toBe(RGB["#d62728"]!.join(","));
     expect(containerFill(2)).toBe(RGB["#1f77b4"]!.join(","));
     expect(containerFill(0)).toBe(RGB["#d62728"]!.join(","));
@@ -853,6 +857,55 @@ describe("the app's module palette reaches the pies whatever the node fill: styl
     await check("no nodeFill");
     net.style({ nodeFill: { by: "module" } });
     await check("{ by: 'module' }");
+    net.destroy();
+  });
+});
+
+describe("a physical node takes its dominant module's colour, not its first wedge's", () => {
+  // The fixture with physical 0's flow skewed: state 0 (module [1]) holds 0.1, state 1 (module [2]) 0.9. Its pie
+  // still draws [1] first; the node as a whole is [2]'s, the module holding most of its flow.
+  function skewed() {
+    const { modules } = fixture();
+    const graph = buildStateGraph({
+      stateCount: S,
+      stateToPhysical: [0, 0, 1, 2, 1],
+      source: [0, 1, 4],
+      target: [2, 3, 0],
+      nodeFlow: [0.1, 0.9, 1, 1, 1],
+      directed: false,
+    });
+    return { graph, modules };
+  }
+  const blue = RGB["#1f77b4"]!.join(",");
+
+  it("the both view's container, under style({ moduleColor })", async () => {
+    const { graph, modules } = skewed();
+    const net = await engine(host());
+    net.style({ nodeFill: { by: "flow", scale: () => "#00c000" }, moduleColor: colorOf }).stateNetwork(graph, { modules, view: "both" });
+    place(net);
+    expect(containerFillOf(net, 0), "the container took its first wedge's module").toBe(blue);
+    net.destroy();
+  });
+
+  it("the both view's container, under nodeFill { by: 'module', color }", async () => {
+    const { graph, modules } = skewed();
+    const net = await engine(host());
+    net.style({ nodeRadius: 12, nodeFill: { by: "module", color: colorOf } }).stateNetwork(graph, { modules, view: "both" });
+    place(net);
+    expect(containerFillOf(net, 0), "the container took its first wedge's module").toBe(blue);
+    net.destroy();
+  });
+
+  it("the both view's container, with the engine's own colours (no nodeFill)", async () => {
+    const { graph, modules } = skewed();
+    const own = physicalPieWedges(graph, modules);
+    const want = own.color[own.offset[0]! + 1]!; // physical 0's second wedge: module [2]
+    expect(want).not.toBe(own.color[own.offset[0]!]);
+    const net = await engine(host());
+    net.style({ nodeRadius: 12 }).stateNetwork(graph, { modules, view: "both" });
+    place(net);
+    const [r, g, b] = [1, 3, 5].map((i) => Number.parseInt(want.slice(i, i + 2), 16));
+    expect(containerFillOf(net, 0), "the container took its first wedge's colour").toBe(`${r},${g},${b}`);
     net.destroy();
   });
 });

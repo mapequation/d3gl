@@ -175,3 +175,37 @@ export function physicalPieWedges(
 
   return { offset, end, color, moduleKey, modulePath, wedgeCount };
 }
+
+/** Two wedge shares closer than this count as a tie: `end` is float32, so an exact split can differ by rounding. */
+const SHARE_TIE = 1e-6;
+
+/**
+ * Each physical node's **dominant** wedge: the absolute index (into `end` / `color` / `moduleKey` / `modulePath`)
+ * of its largest wedge, `end[k] − end[k − 1]` (the first from 0), or `-1` for a node with no wedges. A tie goes to
+ * the earlier wedge, the lower module, so a 50/50 split is deterministic. This is the module a physical node
+ * takes as a whole (its disc and its both-view container), while its pie keeps every wedge in module order.
+ * O(physical nodes + wedges); length `offset.length − 1`.
+ */
+export function dominantWedges(wedges: Pick<PhysicalPieWedges, "offset" | "end">): Int32Array {
+  const { offset, end } = wedges;
+  const n = Math.max(0, offset.length - 1);
+  const out = new Int32Array(n).fill(-1);
+  for (let p = 0; p < n; p++) {
+    const lo = offset[p] ?? 0;
+    const hi = offset[p + 1] ?? lo;
+    let best = -1;
+    let bestShare = -Infinity;
+    let prev = 0;
+    for (let k = lo; k < hi; k++) {
+      const e = end[k] ?? prev;
+      const share = e - prev;
+      if (share > bestShare + SHARE_TIE) {
+        best = k;
+        bestShare = share;
+      }
+      prev = e;
+    }
+    out[p] = best;
+  }
+  return out;
+}
