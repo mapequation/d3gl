@@ -878,7 +878,6 @@ export class InstancedArrows {
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
       u_pickBase: 0,
-      u_radiusWorld: data.radiiWorld ? 1 : 0, // #494: world setbacks on a screen layer
       ...highlightUniforms(1), // arrows recolour with their link
     };
     const bufferLayout = [
@@ -961,7 +960,6 @@ export class InstancedArrows {
   update(device: Device, data: InstancedArrowsData): boolean {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     if (!!data.half !== this._half) return false; // vertex template changed — caller must recreate
-    this.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
@@ -1123,7 +1121,6 @@ export class InstancedHalfArrows {
       u_screen: 0,
       u_viewport: [width, height],
       u_pickBase: 0,
-      u_radiusWorld: data.radiiWorld ? 1 : 0, // #494: world radii on a screen layer
       ...highlightUniforms(1), // half-arrows recolour toward the highlight hue
     };
     const bufferLayout = [
@@ -1207,7 +1204,6 @@ export class InstancedHalfArrows {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
-    this.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();

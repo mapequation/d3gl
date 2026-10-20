@@ -208,13 +208,8 @@ export interface InstancedArrowsData {
   sources: Float32Array;
   /** [x, y] target *centre* per arrow, length `2 * count`; the tip is set back by `radii` in-shader. */
   targets: Float32Array;
-  /** Target node radius per arrow (active sizeMode units, or world units with {@link radiiWorld}), length
-   *  `count` — the boundary setback. */
+  /** Target node radius per arrow (active sizeMode units), length `count` — the boundary setback. */
   radii: Float32Array;
-  /** `radii` are **world** units on a `screen`-sized layer (#494): px-sized arrowheads meeting world-sized
-   *  nodes (a state network's both view). The setback is scaled to px by the zoom (in-shader on WebGL, at
-   *  the bake on the vector paths), so the tip stays on the node boundary. No effect on a world layer. */
-  radiiWorld?: boolean;
   /** arrow size (active sizeMode units) per arrow, length `count`. */
   sizes: Float32Array;
   /** RGBA bytes per arrow, length `4 * count`. */
@@ -266,8 +261,6 @@ export interface InstancedHalfArrowsData {
   targets: Float32Array;
   /** [r0, r1] source/target node radii per link, length `2 * count` (the tip lands on r1). */
   radii: Float32Array;
-  /** `radii` are **world** units on a `screen`-sized layer (#494): see {@link InstancedArrowsData.radiiWorld}. */
-  radiiWorld?: boolean;
   /** [width, oppositeWidth] per link, length `2 * count` (opposite width spaces the source foot). */
   widths: Float32Array;
   /** Bend per link (⟂ offset as a fraction of the chord, #296; sign picks the bow side), length `count`. */

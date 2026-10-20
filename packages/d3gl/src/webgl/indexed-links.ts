@@ -117,7 +117,6 @@ class IndexedLinkDraw {
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
       u_pickBase: 0,
-      u_radiusWorld: 0, // arrows / half-arrows: their data's `radiiWorld` (#494)
       u_hoverGroup: -1,
       u_hoverInstances: [0, 0],
       u_dimActive: 0,
@@ -494,14 +493,12 @@ export class IndexedArrows extends IndexedLinks {
     this.half = !!data.half;
     this.template = device.createBuffer({ data: this.half ? HALF_ARROW_TEMPLATE : ARROW_TEMPLATE });
     this.draw = new IndexedLinkDraw(device, { vs: INDEXED_ARROW_VS, template: this.template, templateName: "a_tri", ends: ["a_source", "a_target"], vertexCount: 3, topology: "triangle-list" }, inst, tableCount, arrowSpecs(data), width, height, pick);
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0; // #494: world setbacks on a screen layer
   }
   update(_device: Device, data: InstancedArrowsData): boolean {
     if (!data.index || !!data.half !== this.half) return false;
     const { inst, tableCount } = instancesOf(data);
     this.tableCount = tableCount;
     this.draw.update(inst, tableCount, arrowSpecs(data));
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     return true;
   }
 }
@@ -518,14 +515,12 @@ export class IndexedHalfArrows extends IndexedLinks {
     const template = halfArrowTemplate(this.samples);
     this.template = device.createBuffer({ data: template });
     this.draw = new IndexedLinkDraw(device, { vs: INDEXED_HALF_ARROW_VS, template: this.template, templateName: "a_kind", ends: ["a_p0", "a_p1"], vertexCount: template.length / 2, topology: "triangle-list" }, inst, tableCount, halfArrowSpecs(data), width, height, pick);
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0; // #494: world radii on a screen layer
   }
   update(_device: Device, data: InstancedHalfArrowsData): boolean {
     if (!data.index || Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0) !== this.samples) return false;
     const { inst, tableCount } = instancesOf(data);
     this.tableCount = tableCount;
     this.draw.update(inst, tableCount, halfArrowSpecs(data));
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     return true;
   }
 }
