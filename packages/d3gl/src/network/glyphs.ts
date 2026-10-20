@@ -131,10 +131,17 @@ export function resolveImportance(graph: NetworkGraph, spec: ImportanceSpec | un
   return out;
 }
 
-/** A constant ring of a fixed pixel width (#104 rework) — e.g. a 1px white outline on every node. */
+/**
+ * A node border (`nodeBorder`): a ring of a fixed pixel width (#104 rework) on every node and aggregate.
+ * With an explicit colour, every ring is that colour; without one (#506), each ring is a darker shade of
+ * its own glyph's fill, as a flow border's is.
+ */
 export interface ConstBorder {
   width: number;
+  /** The ring colour, or with {@link ConstBorder.darken} set, a representative (the default fill darkened). */
   color: [number, number, number, number];
+  /** When set (no colour given), each glyph's ring is its own fill with RGB × this factor: {@link BORDER_DARKEN}. */
+  darken?: number;
 }
 
 export interface NodeStyleResolved {
@@ -473,7 +480,7 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
   if (spec.color === undefined) {
     // No explicit colour → each glyph's ring is a darker shade of its OWN fill (per-module under LOD).
     // The renderers derive it from the glyph colours via `darken`; colorCss is a representative fallback.
-    return { metric, scale: spec.scale, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: 0.62, moduleFlow };
+    return { metric, scale: spec.scale, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: BORDER_DARKEN, moduleFlow };
   }
   const colorCss = spec.color;
   return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, moduleFlow };
@@ -549,14 +556,33 @@ export function treeBorderColors(tree: LODTree, border: ResolvedFlowBorder | nul
   return out;
 }
 
+/**
+ * The factor a border with no colour given multiplies its glyph's fill RGB by: one rule for flow borders
+ * ({@link resolveFlowBorder}) and node borders ({@link resolveNodeBorder}, #506).
+ */
+export const BORDER_DARKEN = 0.62;
+
+/**
+ * Resolve a `nodeBorder` once per `style()`. An explicit `color` is the ring colour of every glyph; without
+ * one (#506), each glyph's ring is its own fill darkened by {@link BORDER_DARKEN} (`darken`), and `color`
+ * is `fallbackColor` (the default node fill) darkened, for paths that need one representative colour.
+ */
+export function resolveNodeBorder(spec: { width: number; color?: string }, fallbackColor: string): ConstBorder {
+  if (spec.color !== undefined) return { width: spec.width, color: toRGBA(spec.color) };
+  const [r, g, b, a] = toRGBA(fallbackColor);
+  const k = BORDER_DARKEN;
+  return { width: spec.width, color: [Math.round(r * k), Math.round(g * k), Math.round(b * k), a], darken: k };
+}
+
 /** Per-instance ring colours = the glyph fill colours darkened (RGB × factor); alpha preserved. */
 function darkenColors(fill: ArrayLike<number>, count: number, factor: number): Uint8Array {
   const out = new Uint8Array(count * 4);
-  for (let i = 0; i < count; i++) {
-    out[i * 4] = Math.round(fill[i * 4]! * factor);
-    out[i * 4 + 1] = Math.round(fill[i * 4 + 1]! * factor);
-    out[i * 4 + 2] = Math.round(fill[i * 4 + 2]! * factor);
-    out[i * 4 + 3] = fill[i * 4 + 3]!;
+  // `(x + 0.5) | 0` is `Math.round` for these non-negative bytes, without the call per channel.
+  for (let i = 0, o = 0; i < count; i++, o += 4) {
+    out[o] = (fill[o]! * factor + 0.5) | 0;
+    out[o + 1] = (fill[o + 1]! * factor + 0.5) | 0;
+    out[o + 2] = (fill[o + 2]! * factor + 0.5) | 0;
+    out[o + 3] = fill[o + 3]!;
   }
   return out;
 }
@@ -600,14 +626,20 @@ function buildBorders(
   return { borders, borderColors };
 }
 
-/** Per-instance ring arrays for a constant px-width border (fraction = width/radius), one colour. */
+/**
+ * Per-instance ring arrays for a node border (fraction = width/radius): one colour, or with `darken` each
+ * glyph's own fill (`colors`, RGBA per instance) darkened. The darkened array is this batch's own, so it is
+ * adopted as the ring colours: one RGBA allocation either way.
+ */
 function constBorderArrays(
   count: number,
   radii: ArrayLike<number>,
-  width: number,
-  color: [number, number, number, number],
+  border: ConstBorder,
+  colors: ArrayLike<number>,
 ): { borders: Float32Array; borderColors: Uint8Array } {
-  return buildBorders(count, radii, () => width, (w) => w, color);
+  const { width, color, darken } = border;
+  const ring = darken !== undefined ? darkenColors(colors, count, darken) : undefined;
+  return buildBorders(count, radii, () => width, (w) => w, color, ring, ring !== undefined);
 }
 
 /**
@@ -803,7 +835,7 @@ export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): Inst
     return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color, borderNodeColors) };
   }
   if (style.constBorder) {
-    return { ...base, ...constBorderArrays(count, style.radii, style.constBorder.width, style.constBorder.color) };
+    return { ...base, ...constBorderArrays(count, style.radii, style.constBorder, colors) };
   }
   return base;
 }
@@ -931,7 +963,8 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
       darken !== undefined ? darkenColors(colors, count, darken) : explicit ? frontierRingColors(tree, frontier, explicit, style.borderColors, color) : undefined;
     result = { ...result, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors, borderColors !== undefined) };
   } else if (style.constBorder) {
-    result = { ...result, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };
+    // A node border without a colour (#506): each glyph's ring is its own (module) colour darkened.
+    result = { ...result, ...constBorderArrays(count, radii, style.constBorder, colors) };
   }
   // Cross-fade (#133): scale fill (and ring) alpha by the per-node fade alpha, so a transitioning
   // aggregate/child eases across the expand threshold.
@@ -2900,6 +2933,11 @@ export function emitHalfLinks(
 /** RGBA byte quad at instance `i` of a packed colour buffer → a CSS `rgba()` string for a Scene accessor. */
 export function rgbaCss(colors: Uint8Array, i: number): string {
   return `rgba(${colors[i * 4]},${colors[i * 4 + 1]},${colors[i * 4 + 2]},${colors[i * 4 + 3]! / 255})`;
+}
+
+/** {@link rgbaCss} of entry `i` darkened (RGB × `factor`, alpha kept): the CSS twin of `darkenColors`. */
+export function darkenedCss(colors: ArrayLike<number>, i: number, factor: number): string {
+  return `rgba(${Math.round(colors[i * 4]! * factor)},${Math.round(colors[i * 4 + 1]! * factor)},${Math.round(colors[i * 4 + 2]! * factor)},${colors[i * 4 + 3]! / 255})`;
 }
 
 /**
