@@ -4,7 +4,7 @@
  * Within each physical node the state nodes are sorted by radius, largest first (ties by state id). State node i
  * sits at the golden angle `i · 2.39996` rad and at the distance `sqrt(A_before / (π · fill))`, where `A_before`
  * is the summed area of the state nodes placed before it: the spiral holds their area at a density of `fill`.
- * The physical node's radius is the largest `distance + radius` over its state nodes, plus a padding.
+ * The second state node starts from the centre instead, so it touches the first.
  *
  * The plain spiral overlaps a few pairs: near the centre (the second state node lands inside the first when their
  * radii are similar) and where the radii step down (a small state node lands on a large one placed just inside
@@ -18,8 +18,15 @@
  * the state nodes after the sort, O(S log s) with the sort (s: the largest physical node's state-node count). A
  * physical node of at most {@link SMALL} state nodes is checked pairwise, which is faster there than the grid.
  *
+ * The largest state node sits at the spiral's centre, which leaves the arrangement lopsided (two equal state nodes
+ * of radius r would need a physical node of 3r). So the physical node is then centred on the smallest circle
+ * enclosing its state nodes: all of its offsets shift by one vector, so the arrangement and every pair's clearance
+ * are unchanged. Its radius is that circle's (two state nodes: the sum of their radii), plus a padding. The circle
+ * is exact (Welzl, as d3-hierarchy's `packEnclose`, on a seeded shuffle) up to {@link EXACT} state nodes and
+ * Ritter's single pass beyond, both O(s); one or two state nodes are packed in closed form.
+ *
  * It runs once per style or data change, in size units: the offsets depend on neither the zoom nor the layout.
- * Deterministic (no RNG): identical inputs → identical output.
+ * Deterministic (the shuffle is a fixed-seed LCG per physical node): identical inputs → identical output.
  */
 import type { PhysicalToState } from "./state-graph.js";
 
@@ -29,6 +36,10 @@ const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 const DEFAULT_FILL = 0.62;
 /** A physical node of at most this many state nodes is checked pairwise instead of through the grid. */
 const SMALL = 64;
+/** A physical node of at most this many state nodes is centred on its exact smallest enclosing circle (Welzl);
+ *  a larger one on Ritter's single pass, whose spiral is round enough that it comes within a fraction of a percent
+ *  (#509: Welzl on every Pareto-sized physical node cost about 40 % more time, this split about 28 %). */
+const EXACT = 64;
 /** The last radius class: state nodes smaller than r₀/2^LAST_CLASS share its cells. Only radii that differ by more
  *  than 2^16 within one physical node reach it, where its cells may hold more state nodes than the other classes'. */
 const LAST_CLASS = 16;
@@ -131,8 +142,9 @@ function float32Up(v: number): number {
 /**
  * Pack each physical node's state nodes with the area spiral (D2), in size units. `nodeRadii` holds each state
  * node's resolved radius (length `stateCount`); `physicalToState` is the state graph's CSR. Returns each state
- * node's offset from its physical node's centre and each physical node's radius: the largest
- * `|offset| + radius` over its state nodes, plus `padding`. No two state nodes of a physical node overlap
+ * node's offset from its physical node's centre, the centre of the smallest circle enclosing them (approximate
+ * beyond {@link EXACT} state nodes), and each physical node's radius: the largest `|offset| + radius` over its
+ * state nodes, plus `padding`. No two state nodes of a physical node overlap
  * (their distance is at least the sum of their radii), and every state node lies within its physical node's
  * radius minus the padding.
  *
@@ -177,9 +189,8 @@ export function packStateNodes(
   // state node's x, y, radius and the next place in its grid cell side by side, so a pair check reads one cache line.
   const order = new Uint32Array(maxCount);
   const placed = new Float64Array(PLACED * maxCount);
+  const perm = new Uint32Array(maxCount);
   const grid = maxCount > SMALL ? new RadiusClassGrid(maxCount) : null;
-  const cos = Math.cos(GOLDEN_ANGLE);
-  const sin = Math.sin(GOLDEN_ANGLE);
 
   for (let p = 0; p < physicalCount; p++) {
     const start = starts[p] ?? 0;
@@ -188,40 +199,119 @@ export function packStateNodes(
       radii[p] = float32Up(padding);
       continue;
     }
+    if (count <= 2) {
+      radii[p] = float32Up(packFew(nodeRadii, states, start, count, offsets) + padding);
+      continue;
+    }
     for (let k = 0; k < count; k++) order[k] = states[start + k] ?? 0;
     sortStates(order, 0, count, nodeRadii);
     const r0 = radiusOf(nodeRadii, order[0] ?? 0);
-    const useGrid = grid !== null && count > SMALL && r0 > 0;
-    if (useGrid) grid.reset(count, r0);
-    let area = 0; // Σ r² of the state nodes placed so far (the π cancels against the spiral's)
-    let ux = 1; // the ray of state node i: the golden angle times i, turned one step per state node
-    let uy = 0;
-    let enclosing = 0;
-    for (let i = 0; i < count; i++) {
-      const s = order[i] ?? 0;
-      const r = radiusOf(nodeRadii, s);
-      let t = Math.sqrt(area / fill);
-      if (r0 > 0) t = useGrid ? grid.clear(t, ux, uy, r, placed) : clearPairwise(i, t, ux, uy, r, placed);
-      const x = t > 0 ? t * ux : 0; // not -0 at the centre
-      const y = t > 0 ? t * uy : 0;
-      placed[PLACED * i] = x;
-      placed[PLACED * i + 1] = y;
-      placed[PLACED * i + 2] = r;
-      if (useGrid && r > 0) grid.insert(i, x, y, r, placed);
-      const fx = Math.fround(x);
-      const fy = Math.fround(y);
-      offsets[2 * s] = fx;
-      offsets[2 * s + 1] = fy;
-      const reach = Math.sqrt(fx * fx + fy * fy) + r;
-      if (reach > enclosing) enclosing = reach;
-      area += r * r;
-      const nx = ux * cos - uy * sin;
-      uy = ux * sin + uy * cos;
-      ux = nx;
+    placeStates(nodeRadii, order, count, r0, fill, placed, grid !== null && count > SMALL && r0 > 0 ? grid : null);
+    // Centre the physical node on the smallest circle enclosing its state nodes.
+    let cx = 0;
+    let cy = 0;
+    if (r0 > 0) {
+      if (count <= EXACT) encloseCircles(placed, count, perm);
+      else encloseRitter(placed, count);
+      cx = ENCLOSING[0] ?? 0;
+      cy = ENCLOSING[1] ?? 0;
     }
-    radii[p] = float32Up(enclosing + padding);
+    radii[p] = float32Up(writeOffsets(placed, order, count, cx, cy, offsets) + padding);
   }
   return { offsets, radii };
+}
+
+const GOLDEN_COS = Math.cos(GOLDEN_ANGLE);
+const GOLDEN_SIN = Math.sin(GOLDEN_ANGLE);
+
+/** Place a physical node's `count` state nodes, sorted into `order` (the largest, of radius `r0`, first), on the area
+ *  spiral into `placed`, each pushed out along its ray until it clears the earlier ones: through `grid` when given,
+ *  else pairwise. The second state node starts from the centre, so it touches the first. */
+function placeStates(
+  nodeRadii: Float32Array,
+  order: Uint32Array,
+  count: number,
+  r0: number,
+  fill: number,
+  placed: Float64Array,
+  grid: RadiusClassGrid | null,
+): void {
+  if (grid !== null) grid.reset(count, r0);
+  let area = 0; // Σ r² of the state nodes placed so far (the π cancels against the spiral's)
+  let ux = 1; // the ray of state node i: the golden angle times i, turned one step per state node
+  let uy = 0;
+  for (let i = 0; i < count; i++) {
+    const r = radiusOf(nodeRadii, order[i] ?? 0);
+    let t = i === 1 ? 0 : Math.sqrt(area / fill);
+    if (r0 > 0) t = grid !== null ? grid.clear(t, ux, uy, r, placed) : clearPairwise(i, t, ux, uy, r, placed);
+    const x = t > 0 ? t * ux : 0; // not -0 at the centre
+    const y = t > 0 ? t * uy : 0;
+    placed[PLACED * i] = x;
+    placed[PLACED * i + 1] = y;
+    placed[PLACED * i + 2] = r;
+    if (grid !== null && r > 0) grid.insert(i, x, y, r, placed);
+    area += r * r;
+    const nx = ux * GOLDEN_COS - uy * GOLDEN_SIN;
+    uy = ux * GOLDEN_SIN + uy * GOLDEN_COS;
+    ux = nx;
+  }
+}
+
+/** Pack a physical node of one or two state nodes (`states[start, start + count)`) in closed form, as the spiral and
+ *  the centring would, and return the reach of its state nodes: a lone state node sits at the centre; of two, the
+ *  smaller sits on the golden-angle ray just clear of the larger, and the pair is centred on its enclosing circle,
+ *  so the reach is the sum of their radii (and the clearance margin). The bench's pairs are mostly these. */
+function packFew(nodeRadii: Float32Array, states: Uint32Array, start: number, count: number, offsets: Float32Array): number {
+  const s0 = states[start] ?? 0;
+  if (count === 1) {
+    offsets[2 * s0] = 0;
+    offsets[2 * s0 + 1] = 0;
+    return radiusOf(nodeRadii, s0);
+  }
+  const s1 = states[start + 1] ?? 0;
+  const first = before(nodeRadii, s0, s1);
+  const a = first ? s0 : s1;
+  const b = first ? s1 : s0;
+  const ra = radiusOf(nodeRadii, a);
+  const rb = radiusOf(nodeRadii, b);
+  // The push from the centre clears ra + rb plus twice the margin (see pushPast); the centre of the enclosing circle
+  // lies on the ray, h from the larger state node.
+  const reach = ra + rb;
+  const d = reach + 2 * EPS * reach;
+  const h = (d + rb - ra) / 2;
+  const ax = h > 0 ? Math.fround(-h * GOLDEN_COS) : 0; // not -0 when both radii are 0
+  const ay = h > 0 ? Math.fround(-h * GOLDEN_SIN) : 0;
+  const bx = d > h ? Math.fround((d - h) * GOLDEN_COS) : 0;
+  const by = d > h ? Math.fround((d - h) * GOLDEN_SIN) : 0;
+  offsets[2 * a] = ax;
+  offsets[2 * a + 1] = ay;
+  offsets[2 * b] = bx;
+  offsets[2 * b + 1] = by;
+  return Math.max(Math.sqrt(ax * ax + ay * ay) + ra, Math.sqrt(bx * bx + by * by) + rb);
+}
+
+/** Write a physical node's placed state nodes as offsets from (`cx`, `cy`), in float32, and return the largest
+ *  reach `|offset| + radius` measured on the stored offsets, so the radius encloses them whatever the rounding.
+ *  One shift for all of them: the arrangement, and with it the clearance between every pair, is unchanged. */
+function writeOffsets(
+  placed: Float64Array,
+  order: Uint32Array,
+  count: number,
+  cx: number,
+  cy: number,
+  offsets: Float32Array,
+): number {
+  let enclosing = 0;
+  for (let i = 0; i < count; i++) {
+    const s = order[i] ?? 0;
+    const fx = Math.fround((placed[PLACED * i] ?? 0) - cx);
+    const fy = Math.fround((placed[PLACED * i + 1] ?? 0) - cy);
+    offsets[2 * s] = fx;
+    offsets[2 * s + 1] = fy;
+    const reach = Math.sqrt(fx * fx + fy * fy) + (placed[PLACED * i + 2] ?? 0);
+    if (reach > enclosing) enclosing = reach;
+  }
+  return enclosing;
 }
 
 /** Doubles per placed state node in the scratch: x, y, radius, and the next place in the same grid cell (-1: none). */
@@ -403,3 +493,190 @@ class RadiusClassGrid {
     return t;
   }
 }
+
+/** The smallest circle enclosing the latest physical node's state nodes, `[x, y, r]`, as {@link encloseCircles}
+ *  leaves it. Module scratch: the packing runs synchronously and allocates nothing per physical node. */
+const ENCLOSING = new Float64Array(3);
+/** A candidate circle while the basis is extended. */
+const CANDIDATE = new Float64Array(3);
+/** The basis: the places of the up to three state nodes the enclosing circle touches. */
+const BASIS = new Int32Array(3);
+/** The linear congruential generator d3-hierarchy's `packEnclose` shuffles with, from the same seed. */
+const LCG_A = 1664525;
+const LCG_C = 1013904223;
+const LCG_M = 4294967296;
+
+/**
+ * The smallest circle enclosing the circles at places `[0, count)` of `placed` (count ≥ 3), into {@link ENCLOSING}:
+ * Welzl's algorithm in the move-to-front form of d3-hierarchy's `packEnclose`, ported without allocation, on a
+ * seeded shuffle of the places (deterministic, expected O(count)). Should the
+ * float arithmetic defeat it (no basis found, or far more steps than expected), Ritter's single pass stands in:
+ * an enclosing circle, if not the smallest. Either way the caller measures the radius from the offsets.
+ */
+function encloseCircles(placed: Float64Array, count: number, perm: Uint32Array): void {
+  for (let k = 0; k < count; k++) perm[k] = k;
+  let seed = 1;
+  for (let m = count; m > 0; ) {
+    seed = (LCG_A * seed + LCG_C) % LCG_M;
+    const k = Math.floor((seed / LCG_M) * m);
+    m--;
+    swap(perm, m, k);
+  }
+  let size = 0;
+  let steps = 0;
+  const limit = 64 * count + 1024;
+  for (let i = 0; i < count; ) {
+    const at = PLACED * (perm[i] ?? 0);
+    if (size > 0 && enclosesWeak(ENCLOSING, 0, placed, at)) {
+      i++;
+    } else {
+      size = extendBasis(placed, size, at);
+      i = 0;
+    }
+    if (size === 0 || ++steps > limit) {
+      encloseRitter(placed, count);
+      return;
+    }
+  }
+}
+
+/** Ritter's single pass over the places in order: grow the circle to enclose each circle it misses. Exact for two. */
+function encloseRitter(placed: Float64Array, count: number): void {
+  ENCLOSING[0] = placed[0] ?? 0;
+  ENCLOSING[1] = placed[1] ?? 0;
+  ENCLOSING[2] = placed[2] ?? 0;
+  for (let i = 1; i < count; i++) {
+    if (!enclosesWeak(ENCLOSING, 0, placed, PLACED * i)) enclose2(ENCLOSING, 0, placed, PLACED * i, ENCLOSING);
+  }
+}
+
+/** Extend the basis of `size` circles (their offsets in `placed`) by the circle at offset `at`, which the current
+ *  enclosing circle misses, and set {@link ENCLOSING} to the new basis's circle. Returns the new basis's size, or 0
+ *  when none is found (only through float error). As d3-hierarchy's `extendBasis`. */
+function extendBasis(placed: Float64Array, size: number, at: number): number {
+  let alone = true;
+  for (let k = 0; k < size && alone; k++) alone = enclosesWeak(placed, at, placed, BASIS[k] ?? 0);
+  if (alone) {
+    BASIS[0] = at;
+    ENCLOSING[0] = placed[at] ?? 0;
+    ENCLOSING[1] = placed[at + 1] ?? 0;
+    ENCLOSING[2] = placed[at + 2] ?? 0;
+    return 1;
+  }
+  for (let k = 0; k < size; k++) {
+    const b = BASIS[k] ?? 0;
+    if (!enclosesNot(placed, at, placed, b)) continue;
+    enclose2(placed, b, placed, at, CANDIDATE);
+    if (enclosesBasis(CANDIDATE, placed, size)) {
+      BASIS[0] = b;
+      BASIS[1] = at;
+      ENCLOSING.set(CANDIDATE);
+      return 2;
+    }
+  }
+  for (let k = 0; k < size - 1; k++) {
+    const a = BASIS[k] ?? 0;
+    for (let l = k + 1; l < size; l++) {
+      const b = BASIS[l] ?? 0;
+      enclose2(placed, a, placed, b, CANDIDATE);
+      if (!enclosesNot(CANDIDATE, 0, placed, at)) continue;
+      enclose2(placed, a, placed, at, CANDIDATE);
+      if (!enclosesNot(CANDIDATE, 0, placed, b)) continue;
+      enclose2(placed, b, placed, at, CANDIDATE);
+      if (!enclosesNot(CANDIDATE, 0, placed, a)) continue;
+      enclose3(placed, a, b, at, CANDIDATE);
+      if (enclosesBasis(CANDIDATE, placed, size)) {
+        BASIS[0] = a;
+        BASIS[1] = b;
+        BASIS[2] = at;
+        ENCLOSING.set(CANDIDATE);
+        return 3;
+      }
+    }
+  }
+  return 0;
+}
+
+/** Whether the circle at `c[0..3)` encloses each of the `size` basis circles, with d3's tolerance. */
+function enclosesBasis(c: Float64Array, placed: Float64Array, size: number): boolean {
+  for (let k = 0; k < size; k++) if (!enclosesWeak(c, 0, placed, BASIS[k] ?? 0)) return false;
+  return true;
+}
+
+/** Whether circle a (`[x, y, r]` at `a[ao]`) does not enclose circle b. */
+function enclosesNot(a: Float64Array, ao: number, b: Float64Array, bo: number): boolean {
+  const dr = (a[ao + 2] ?? 0) - (b[bo + 2] ?? 0);
+  const dx = (b[bo] ?? 0) - (a[ao] ?? 0);
+  const dy = (b[bo + 1] ?? 0) - (a[ao + 1] ?? 0);
+  return dr < 0 || dr * dr < dx * dx + dy * dy;
+}
+
+/** Whether circle a encloses circle b, up to a relative 1e-9 of the larger radius. */
+function enclosesWeak(a: Float64Array, ao: number, b: Float64Array, bo: number): boolean {
+  const ar = a[ao + 2] ?? 0;
+  const br = b[bo + 2] ?? 0;
+  const dr = ar - br + Math.max(ar, br) * 1e-9;
+  const dx = (b[bo] ?? 0) - (a[ao] ?? 0);
+  const dy = (b[bo + 1] ?? 0) - (a[ao + 1] ?? 0);
+  return dr > 0 && dr * dr > dx * dx + dy * dy;
+}
+
+/** The smallest circle enclosing circles a and b, neither enclosing the other, into `out` (which may be a). */
+function enclose2(a: Float64Array, ao: number, b: Float64Array, bo: number, out: Float64Array): void {
+  const x1 = a[ao] ?? 0;
+  const y1 = a[ao + 1] ?? 0;
+  const r1 = a[ao + 2] ?? 0;
+  const x2 = b[bo] ?? 0;
+  const y2 = b[bo + 1] ?? 0;
+  const r2 = b[bo + 2] ?? 0;
+  const x21 = x2 - x1;
+  const y21 = y2 - y1;
+  const l = Math.sqrt(x21 * x21 + y21 * y21);
+  if (l === 0) {
+    // Concentric: the larger encloses both.
+    out[0] = x1;
+    out[1] = y1;
+    out[2] = Math.max(r1, r2);
+    return;
+  }
+  const k = (r2 - r1) / l;
+  out[0] = (x1 + x2 + x21 * k) / 2;
+  out[1] = (y1 + y2 + y21 * k) / 2;
+  out[2] = (l + r1 + r2) / 2;
+}
+
+/** The circle tangent to the placed circles at offsets `ia`, `ib`, `ic` and enclosing them (Apollonius), into `out`;
+ *  NaN when their centres are collinear, which the caller's enclosure test then rejects. As d3's `encloseBasis3`. */
+function enclose3(placed: Float64Array, ia: number, ib: number, ic: number, out: Float64Array): void {
+  const x1 = placed[ia] ?? 0;
+  const y1 = placed[ia + 1] ?? 0;
+  const r1 = placed[ia + 2] ?? 0;
+  const x2 = placed[ib] ?? 0;
+  const y2 = placed[ib + 1] ?? 0;
+  const r2 = placed[ib + 2] ?? 0;
+  const x3 = placed[ic] ?? 0;
+  const y3 = placed[ic + 1] ?? 0;
+  const r3 = placed[ic + 2] ?? 0;
+  const a2 = x1 - x2;
+  const a3 = x1 - x3;
+  const b2 = y1 - y2;
+  const b3 = y1 - y3;
+  const c2 = r2 - r1;
+  const c3 = r3 - r1;
+  const d1 = x1 * x1 + y1 * y1 - r1 * r1;
+  const d2 = d1 - x2 * x2 - y2 * y2 + r2 * r2;
+  const d3 = d1 - x3 * x3 - y3 * y3 + r3 * r3;
+  const ab = a3 * b2 - a2 * b3;
+  const xa = (b2 * d3 - b3 * d2) / (ab * 2) - x1;
+  const xb = (b3 * c2 - b2 * c3) / ab;
+  const ya = (a3 * d2 - a2 * d3) / (ab * 2) - y1;
+  const yb = (a2 * c3 - a3 * c2) / ab;
+  const A = xb * xb + yb * yb - 1;
+  const B = 2 * (r1 + xa * xb + ya * yb);
+  const C = xa * xa + ya * ya - r1 * r1;
+  const r = -(Math.abs(A) > 1e-6 ? (B + Math.sqrt(B * B - 4 * A * C)) / (2 * A) : C / B);
+  out[0] = x1 + xa + xb * r;
+  out[1] = y1 + ya + yb * r;
+  out[2] = r;
+}
+

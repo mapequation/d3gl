@@ -60,14 +60,49 @@ describe("packStateNodes (#509, the both view's area spiral)", () => {
     expect(radii[0]).toBe(6);
   });
 
-  it("puts the larger of two state nodes at the centre and the smaller just clear of it", () => {
-    const csr = csrOf([2]);
-    const { offsets, radii } = packChecked(Float32Array.of(3, 5), csr, 0);
-    expect(Array.from(offsets.subarray(2, 4))).toEqual([0, 0]); // state 1, the larger, first
-    const d = Math.hypot(offsets[0] ?? 0, offsets[1] ?? 0);
+  it("centres two state nodes on their enclosing circle: the radius is the sum of theirs, plus the padding", () => {
+    const csr = csrOf([2, 2]);
+    const { offsets, radii } = packChecked(Float32Array.of(3, 5, 4, 4), csr, 2);
+    expect(radii[0]).toBeCloseTo(3 + 5 + 2, 4);
+    expect(radii[1]).toBeCloseTo(4 + 4 + 2, 4); // equal radii: 2r, not 3r with the larger at the centre
+    // Each touches the enclosing circle: |offset| + r = the radius minus the padding.
+    expect(Math.hypot(offsets[0] ?? 0, offsets[1] ?? 0) + 3).toBeCloseTo(8, 4);
+    expect(Math.hypot(offsets[2] ?? 0, offsets[3] ?? 0) + 5).toBeCloseTo(8, 4);
+    expect(Math.hypot(offsets[4] ?? 0, offsets[5] ?? 0)).toBeCloseTo(4, 4);
+    // Just clear of each other.
+    const d = Math.hypot((offsets[0] ?? 0) - (offsets[2] ?? 0), (offsets[1] ?? 0) - (offsets[3] ?? 0));
     expect(d).toBeGreaterThanOrEqual(8);
     expect(d).toBeLessThan(8.001);
-    expect(radii[0]).toBeCloseTo(11, 2);
+  });
+
+  it("centres each physical node on its smallest enclosing circle: at least two state nodes touch it", () => {
+    const rng = seeded(13);
+    const csr = csrOf(Uint32Array.from({ length: 300 }, () => 2 + Math.floor(rng() * 63))); // 2–64: the exact circle
+    const radii = flowRadii(csr.states.length, rng);
+    const { offsets, radii: physical } = packChecked(radii, csr, 0);
+    for (let p = 0; p < 300; p++) {
+      const start = csr.offsets[p] ?? 0;
+      const end = csr.offsets[p + 1] ?? 0;
+      const R = physical[p] ?? 0;
+      let touching = 0;
+      let largest = start;
+      for (let k = start; k < end; k++) {
+        const s = csr.states[k] ?? 0;
+        if ((radii[s] ?? 0) > (radii[csr.states[largest] ?? 0] ?? 0)) largest = k;
+        if (Math.hypot(offsets[2 * s] ?? 0, offsets[2 * s + 1] ?? 0) + (radii[s] ?? 0) > R * (1 - 1e-5)) touching++;
+      }
+      expect(touching, `physical node ${p}`).toBeGreaterThanOrEqual(2);
+      // Never larger than with the largest state node at the centre, as before the centring.
+      const l = csr.states[largest] ?? 0;
+      let lopsided = 0;
+      for (let k = start; k < end; k++) {
+        const s = csr.states[k] ?? 0;
+        const dx = (offsets[2 * s] ?? 0) - (offsets[2 * l] ?? 0);
+        const dy = (offsets[2 * s + 1] ?? 0) - (offsets[2 * l + 1] ?? 0);
+        lopsided = Math.max(lopsided, Math.hypot(dx, dy) + (radii[s] ?? 0));
+      }
+      expect(R).toBeLessThanOrEqual(lopsided * (1 + 1e-6));
+    }
   });
 
   it("gives a physical node with no state nodes the padding alone as its radius", () => {
