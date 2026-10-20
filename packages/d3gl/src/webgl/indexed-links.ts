@@ -2,7 +2,7 @@ import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass, Texture } from "@luma.gl/core";
 import { INDEXED_LINE_VS, INDEXED_ARROW_VS, INDEXED_HALF_ARROW_VS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import { ARROW_TEMPLATE, HALF_ARROW_TEMPLATE, HALF_ARROW_SAMPLES, halfArrowTemplate, lineTemplate } from "./instanced.js";
+import { ARROW_TEMPLATE, HALF_ARROW_TEMPLATE, HALF_ARROW_SAMPLES, END_OFFSETS, halfArrowTemplate, lineTemplate, offsetLayout, zeroOffsets } from "./instanced.js";
 import type { InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
 
 /**
@@ -180,8 +180,9 @@ class IndexedLinkDraw {
     return out;
   }
 
+  /** The ends take no offsets (#509): the shared shader's offset attributes read the constant zero, no buffer. */
   private makeModel(fs: string, parameters: typeof BLEND | typeof NO_BLEND): Model {
-    return new Model(this.device, {
+    const model = new Model(this.device, {
       vs: this.shape.vs,
       fs,
       bufferLayout: [
@@ -190,6 +191,7 @@ class IndexedLinkDraw {
         { name: this.shape.ends[0], format: "float32x2", stepMode: "instance" },
         { name: this.shape.ends[1], format: "float32x2", stepMode: "instance" },
         { name: "a_fade", format: "float32", stepMode: "instance" },
+        ...END_OFFSETS.map(offsetLayout),
       ],
       attributes: { [this.shape.templateName]: this.shape.template, ...this.laneBuffers() },
       bindings: this.bindings(),
@@ -199,6 +201,8 @@ class IndexedLinkDraw {
       vertexCount: this.shape.vertexCount,
       instanceCount: this.count,
     });
+    zeroOffsets(model, END_OFFSETS);
+    return model;
   }
 
   /** Draw `inst.count` edges of `inst.index`, from tables re-packed only where a source array changed. Every

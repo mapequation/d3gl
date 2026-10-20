@@ -203,8 +203,9 @@ precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
 uniform vec2 u_viewport;    // device px, for screen sizeMode
-in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
+layout(location = 0) in vec2 a_corner; // per-vertex unit-quad corner in [-1, 1]; location 0 stays buffer-backed (OffsetColumn, instanced.ts)
 in vec2 a_center;           // per-instance world centre
+in vec2 a_offset;           // per-instance offset from the centre in size units (#509); the constant (0, 0) without one
 in float a_radius;          // per-instance radius
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
 uniform float u_borderPx;   // 1.0 = a_border is a ring width in screen px (#495), 0.0 = a fraction of the radius
@@ -222,10 +223,13 @@ void main() {
   v_border = (u_borderPx > 0.5) ? min(1.0, a_border / max(radiusPx, 1e-6)) : a_border;
   v_borderColor = a_borderColor;
   if (!hl && u_dimActive > 0.5) v_borderColor.a *= u_dimOpacity; // dim the flow-border ring with its node (#162)
-  vec3 c = u_transform * vec3(a_center, 1.0);
-  vec2 off = (u_screen > 0.5)
-    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
-    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+  // The offset is in size units (#509): px after the projection in screen mode, world units before it.
+  bool screen = u_screen > 0.5;
+  vec2 centre = screen ? a_center : a_center + a_offset;
+  vec3 c = u_transform * vec3(centre, 1.0);
+  vec2 off = screen
+    ? (a_corner * a_radius + a_offset) * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(centre + a_corner * a_radius, 1.0)).xy - c.xy;
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
@@ -304,41 +308,48 @@ precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
 uniform vec2 u_viewport;    // device px, for screen mode
-in vec2 a_corner;           // per-vertex (t in [0,1], side in {-1,1})
+layout(location = 0) in vec2 a_corner; // per-vertex (t in [0,1], side in {-1,1}); location 0 stays buffer-backed (OffsetColumn, instanced.ts)
 in vec2 a_source;           // per-instance world source
 in vec2 a_target;           // per-instance world target
+in vec2 a_sourceOffset;     // per-instance offsets of the two ends in size units (#509); the constant (0, 0) without them
+in vec2 a_targetOffset;
 in float a_width;           // per-instance line width
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
 in float a_bend;            // per-instance control offset ⟂ to the chord, as a fraction of |chord| (0 = straight)${HL_UNIFORMS}
 uniform float u_pickBase;   // added to the instance's pick id (#447): two pickable link layers decode apart
 out vec4 v_color;
 flat out float v_id;        // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
+vec2 worldToPx(vec2 w) {
+  vec2 clip = (u_transform * vec3(w, 1.0)).xy;
+  return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
+}
 void main() {
   v_color = a_color;${HL_APPLY}
   v_id = float(gl_InstanceID) + u_pickBase;
   float t = a_corner.x;
   float side = a_corner.y;
   float hw = a_width * 0.5;
-  vec2 d = a_target - a_source;
-  vec2 ctrl = 0.5 * (a_source + a_target) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
+  bool screen = u_screen > 0.5;
+  // Screen mode works in px (#509): both ends projected, then offset by their px offsets. The bend is a fraction
+  // of the chord, so the bezier on the projected ends is the projection of the world bezier (a similarity).
+  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
+  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
+  vec2 d = tgt - src;
+  vec2 ctrl = 0.5 * (src + tgt) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
   float u = 1.0 - t;
-  vec2 p = u * u * a_source + 2.0 * u * t * ctrl + t * t * a_target;  // B(t)
-  vec2 tang = 2.0 * u * (ctrl - a_source) + 2.0 * t * (a_target - ctrl); // B'(t)
-  vec2 cp = (u_transform * vec3(p, 1.0)).xy;          // centreline point in clip
-  vec2 off;
-  if (u_screen > 0.5) {
-    // Constant-pixel width: tangent's perpendicular derived in screen px, converted back to clip.
-    vec2 ctan = (u_transform * vec3(p + tang, 1.0)).xy;
-    vec2 dir = normalize((ctan - cp) * u_viewport);   // clip delta -> px direction
-    vec2 perp = vec2(-dir.y, dir.x);
-    off = perp * side * hw * (2.0 / u_viewport);      // px -> clip
+  vec2 p = u * u * src + 2.0 * u * t * ctrl + t * t * tgt;  // B(t)
+  vec2 tang = 2.0 * u * (ctrl - src) + 2.0 * t * (tgt - ctrl); // B'(t)
+  if (screen) {
+    // Constant-pixel width: offset the px centreline point along the tangent's perpendicular, then px -> clip.
+    vec2 dir = normalize(tang);
+    vec2 pos = p + vec2(-dir.y, dir.x) * side * hw;
+    gl_Position = vec4(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0, 0.0, 1.0);
   } else {
     // World width: offset the centreline point in world space along the tangent's perpendicular.
     vec2 dir = normalize(tang);
     vec2 perp = vec2(-dir.y, dir.x);
-    off = (u_transform * vec3(p + perp * side * hw, 1.0)).xy - cp;
+    gl_Position = vec4((u_transform * vec3(p + perp * side * hw, 1.0)).xy, 0.0, 1.0);
   }
-  gl_Position = vec4(cp + off, 0.0, 1.0);
 }`;
 
 // INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
@@ -359,9 +370,11 @@ uniform mat3 u_transform;
 uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
 uniform vec2 u_viewport;  // device px, for screen sizeMode
 uniform float u_radiusWorld; // 1.0 = a_radius is world units on a screen layer (#494): scaled to px by the zoom
-in vec2 a_tri;        // per-vertex (back, across)
+layout(location = 0) in vec2 a_tri; // per-vertex (back, across); location 0 stays buffer-backed (OffsetColumn, instanced.ts)
 in vec2 a_source;     // per-instance source centre (orientation)
 in vec2 a_target;     // per-instance target centre (tip set back by a_radius)
+in vec2 a_sourceOffset; // per-instance offsets of the two ends in size units (#509); the constant (0, 0) without them
+in vec2 a_targetOffset;
 in float a_size;      // per-instance arrow size (world or px per sizeMode)
 in float a_radius;    // per-instance target node radius (setback to the boundary)
 in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
@@ -377,8 +390,8 @@ void main() {
   v_color = a_color;${HL_APPLY}
   v_id = float(gl_InstanceID) + u_pickBase;
   bool screen = u_screen > 0.5;
-  vec2 src = screen ? worldToPx(a_source) : a_source;
-  vec2 tgt = screen ? worldToPx(a_target) : a_target;
+  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
+  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
   vec2 d = tgt - src;
   // Quadratic-bezier end tangent (t=1): 2·(P1 − C), C = midpoint + ⟂(chord)·bend.
   vec2 endTan = 0.5 * d - vec2(-d.y, d.x) * a_bend;
@@ -416,9 +429,11 @@ uniform mat3 u_transform;
 uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
 uniform vec2 u_viewport;  // device px, for screen sizeMode
 uniform float u_radiusWorld; // 1.0 = a_radii are world units on a screen layer (#494): scaled to px by the zoom
-in vec2 a_kind;       // per-vertex (code, t)
+layout(location = 0) in vec2 a_kind; // per-vertex (code, t); location 0 stays buffer-backed (OffsetColumn, instanced.ts)
 in vec2 a_p0;         // per-instance source centre
 in vec2 a_p1;         // per-instance target centre
+in vec2 a_sourceOffset; // per-instance offsets of the two ends in size units (#509); the constant (0, 0) without them
+in vec2 a_targetOffset;
 in vec2 a_radii;      // per-instance (r0, r1)
 in vec2 a_widths;     // per-instance (width, oppositeWidth)
 in float a_bend;      // per-instance bend, a fraction of the chord (sign picks the bow side)
@@ -441,8 +456,8 @@ void main() {
   float t = a_kind.y;
   bool screen = u_screen > 0.5;
   // Screen mode: project both node centres to px and build the shape in px (radii/widths are px).
-  vec2 p0 = screen ? worldToPx(a_p0) : a_p0;
-  vec2 p1 = screen ? worldToPx(a_p1) : a_p1;
+  vec2 p0 = screen ? worldToPx(a_p0) + a_sourceOffset : a_p0 + a_sourceOffset;
+  vec2 p1 = screen ? worldToPx(a_p1) + a_targetOffset : a_p1 + a_targetOffset;
   // World-sized nodes under px-sized links (#494): the radii at this zoom, in px.
   float rk = screen && u_radiusWorld > 0.5 ? 0.5 * u_viewport.x * abs(u_transform[0].x) : 1.0;
   float r0 = a_radii.x * rk;

@@ -133,6 +133,13 @@ export interface InstancedCirclesData {
   groups2?: Float32Array;
   /** Optional per-instance **selected flag** (0/1) for shader-driven dim/recolour (#162). Length `count`. */
   selected?: Uint8Array;
+  /**
+   * Optional per-circle offset from its centre (#509), in the layer's size units: the circle is drawn at
+   * `project(centre) + offset` px in `screen` mode and at `centre + offset` in `world` mode. Length `2 * count`;
+   * absent ⇒ no offset, with no buffer and no upload. Uploaded only when the array is a new object, so hand a new
+   * array to change it; a reference-stable column costs nothing per frame.
+   */
+  offsets?: Float32Array;
   count: number;
 }
 
@@ -175,6 +182,14 @@ export interface InstancedLinesData {
   tableCount?: number;
   /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
   fade?: Float32Array;
+  /**
+   * Optional per-instance offsets of the two ends (#509), in the layer's size units: an end is drawn at
+   * `project(P) + offset` px in `screen` mode and at `P + offset` in `world` mode; the bend and the setbacks follow
+   * the offset ends. Length `2 * count` each; absent ⇒ no offset, with no buffer and no upload. Uploaded only when
+   * the array is a new object. Plain draws only: an indexed draw (`index`) takes no offsets.
+   */
+  sourceOffsets?: Float32Array;
+  targetOffsets?: Float32Array;
   count: number;
 }
 
@@ -216,6 +231,14 @@ export interface InstancedArrowsData {
   tableCount?: number;
   /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
   fade?: Float32Array;
+  /**
+   * Optional per-instance offsets of the two ends (#509), in the layer's size units: an end is drawn at
+   * `project(P) + offset` px in `screen` mode and at `P + offset` in `world` mode; the bend and the setbacks follow
+   * the offset ends. Length `2 * count` each; absent ⇒ no offset, with no buffer and no upload. Uploaded only when
+   * the array is a new object. Plain draws only: an indexed draw (`index`) takes no offsets.
+   */
+  sourceOffsets?: Float32Array;
+  targetOffsets?: Float32Array;
   count: number;
 }
 
@@ -258,6 +281,14 @@ export interface InstancedHalfArrowsData {
   tableCount?: number;
   /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
   fade?: Float32Array;
+  /**
+   * Optional per-instance offsets of the two ends (#509), in the layer's size units: an end is drawn at
+   * `project(P) + offset` px in `screen` mode and at `P + offset` in `world` mode; the bend and the setbacks follow
+   * the offset ends. Length `2 * count` each; absent ⇒ no offset, with no buffer and no upload. Uploaded only when
+   * the array is a new object. Plain draws only: an indexed draw (`index`) takes no offsets.
+   */
+  sourceOffsets?: Float32Array;
+  targetOffsets?: Float32Array;
   count: number;
 }
 
