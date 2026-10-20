@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, darkenedCss, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -208,9 +208,10 @@ export interface NetworkStyle {
    */
   nodeFill?: NodeFillSpec;
   /**
-   * Constant border ring (#104 rework): a fixed **pixel** outline on every node/module (e.g.
-   * `{ width: 1, color: "#fff" }`). Independent of {@link flowBorder} (which encodes flow);
-   * `flowBorder` wins if both are set.
+   * Node border (#104 rework): a ring of a fixed **pixel** `width` on every node and module. Without a
+   * `color`, each ring is a darker shade of its own node's fill (a module's of its module colour), as a
+   * {@link flowBorder} is (#506); with one (e.g. `{ width: 1, color: "#fff" }`), every ring is that
+   * colour. Independent of {@link flowBorder} (which encodes flow); `flowBorder` wins if both are set.
    */
   nodeBorder?: { width: number; color?: string };
   /**
@@ -4839,16 +4840,18 @@ export class Network extends BaseEngine {
       : cb
         ? `rgba(${cb.color[0]},${cb.color[1]},${cb.color[2]},${cb.color[3] / 255})`
         : style.nodeFill;
-    // Per-node ring colour: a darker shade of each node's own fill (no explicit colour given), an
-    // accessor's per-node colours (ring ∝ a metric), else the single representative colour.
+    // Per-node ring colour: a darker shade of each node's own fill (a flow or node border with no colour
+    // given, #506), an accessor's per-node colours (ring ∝ a metric), else the single representative colour.
     const flowColors = flow?.colors;
-    const darken = flow?.darken;
+    const darken = flow ? flow.darken : cb?.darken;
+    // The darkened ring reads the fill bytes the instanced lane darkens (`nodeColors`, or the one fill),
+    // alpha kept: no colour parse per node, and the same ring as WebGL's.
+    const singleDarkCss = darken !== undefined && !nodeColors ? darkenedCss(rgbaBytes(style.nodeFill), 0, darken) : "";
     const borderColorAt =
       darken !== undefined
-        ? (i: number) => {
-            const c = rgb(fillOf(i));
-            return `rgb(${Math.round(c.r * darken)},${Math.round(c.g * darken)},${Math.round(c.b * darken)})`;
-          }
+        ? nodeColors
+          ? (i: number) => darkenedCss(nodeColors, i, darken)
+          : () => singleDarkCss
         : flowColors
           ? (i: number) => `rgba(${flowColors[i * 4]},${flowColors[i * 4 + 1]},${flowColors[i * 4 + 2]},${flowColors[i * 4 + 3]! / 255})`
           : () => borderColorCss;
@@ -5056,8 +5059,7 @@ export class Network extends BaseEngine {
     const { nodeFill, nodeColors, fillAggregate: nodeFillAggregate } = resolveNodeFill(graph, this.styleOpts.nodeFill, DEFAULT_NODE_FILL);
     // Constant border (px). flowBorder wins if both are set.
     const nb = this.styleOpts.nodeBorder;
-    const constBorder: ConstBorder | null =
-      nb && !this.styleOpts.flowBorder ? { width: nb.width, color: rgbaBytes(nb.color ?? "#ffffff") } : null;
+    const constBorder: ConstBorder | null = nb && !this.styleOpts.flowBorder ? resolveNodeBorder(nb, nodeFill) : null;
     const nodeRadiusSpec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
     return {
       nodeRadii: resolveNodeRadii(graph, nodeRadiusSpec),

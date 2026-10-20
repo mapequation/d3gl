@@ -495,7 +495,8 @@ to `net.data(graph, { modules })`.
 Each node is coloured by its **top-level module** through a categorical palette, and `nodeFill` accepts
 a per-node accessor — so a module's aggregate glyph and all of its leaves share one colour, and you can
 read the planted hierarchy at every zoom level. Links are simple **bent lines** (`linkBend`), nodes get
-a 1px white outline (`nodeBorder`). Scroll to zoom and watch the three top modules expand → sub-modules
+a 1px white outline (`nodeBorder: { width: 1, color: "#fff" }`; without a `color`, each node's outline
+is a darker shade of its own fill, as a flow border's ring is). Scroll to zoom and watch the three top modules expand → sub-modules
 → leaf triangles; the **Depth** slider grows the gasket from 27 to 2,187 nodes, and **LOD** off draws
 every node.
 
