@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
 import { DRAG_HEAT, ForceLayout } from "../force.js";
@@ -111,6 +111,8 @@ class StreamProbe extends Network {
   }
 }
 
+const isBaseLayer = (name: string): boolean => BASE_LANE.some((n) => n === name);
+
 /** Counts the instanced-layer calls reaching the WebGL backend by layer name, and keeps the container
  *  columns of each container emit (by reference only). */
 class LaneCallSpy {
@@ -121,6 +123,9 @@ class LaneCallSpy {
   nodeEmits: InstancedCirclesData[] = [];
   containerStyles: InstancedHighlight[] = [];
   styleFlagBytes = 0;
+  /** Every distinct offset column a base-lane emit handed the backend (#509): state nodes' and link ends'. Not reset.
+   *  (The highlight lane's rings carry their own few offsets per highlight change.) */
+  readonly offsetColumns = new Set<Float32Array>();
   private readonly origSet = WebGLBackend.prototype.setInstancedLayer;
   private readonly origUpdate = WebGLBackend.prototype.updateInstancedLayer;
   private readonly origRemove = WebGLBackend.prototype.removeInstancedLayer;
@@ -133,6 +138,13 @@ class LaneCallSpy {
       spy.emits.set(layer.name, (spy.emits.get(layer.name) ?? 0) + 1);
       if (layer.name === "phys-container" && layer.primitive === "circles") spy.containerEmits.push(layer.circles);
       if (layer.name === "nodes" && layer.primitive === "circles") spy.nodeEmits.push(layer.circles);
+      const columns =
+        layer.primitive === "circles" ? [layer.circles.offsets]
+        : layer.primitive === "lines" ? [layer.lines.sourceOffsets, layer.lines.targetOffsets]
+        : layer.primitive === "arrows" ? [layer.arrows.sourceOffsets, layer.arrows.targetOffsets]
+        : layer.primitive === "half-arrows" ? [layer.halfArrows.sourceOffsets, layer.halfArrows.targetOffsets]
+        : [];
+      if (isBaseLayer(layer.name)) for (const c of columns) if (c) spy.offsetColumns.add(c);
     };
     WebGLBackend.prototype.setInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
       onEmit(layer);
@@ -182,7 +194,7 @@ class LaneCallSpy {
 }
 
 /** A grid of N physical nodes; 4 in 5 hold two state nodes in different top-level modules. */
-function fixture(n: number) {
+function fixture(n: number, cols = COLS) {
   const stateToPhysical: number[] = [];
   const modules: ModulePathNode[] = [];
   const first = new Int32Array(n);
@@ -198,14 +210,14 @@ function fixture(n: number) {
   const source: number[] = [];
   const target: number[] = [];
   for (let p = 0; p < n; p++) {
-    if ((p + 1) % COLS !== 0 && p + 1 < n) { source.push(first[p] ?? 0); target.push(first[p + 1] ?? 0); }
-    if (p + COLS < n) { source.push(first[p] ?? 0); target.push(first[p + COLS] ?? 0); }
+    if ((p + 1) % cols !== 0 && p + 1 < n) { source.push(first[p] ?? 0); target.push(first[p + 1] ?? 0); }
+    if (p + cols < n) { source.push(first[p] ?? 0); target.push(first[p + cols] ?? 0); }
   }
   const graph = buildStateGraph({ stateCount: stateToPhysical.length, stateToPhysical, source, target, directed: false });
   const positions = new Float32Array(n * 2);
   for (let p = 0; p < n; p++) {
-    positions[2 * p] = (p % COLS) * SPACING;
-    positions[2 * p + 1] = Math.floor(p / COLS) * SPACING;
+    positions[2 * p] = (p % cols) * SPACING;
+    positions[2 * p + 1] = Math.floor(p / cols) * SPACING;
   }
   return { graph, modules, positions };
 }
@@ -249,6 +261,13 @@ let colorCallsTotal = 0;
 /** Colour-accessor calls of the state node drag leg's two sizeMode switches (#509), each a style() call. */
 let restyleCalls = 0;
 let modulesAsked = 0;
+/** The engine every leg shares, handed from the first setup to the ≈1M leg, destroyed after it. */
+let shared: { net: StreamProbe; h: HTMLElement } | null = null;
+afterAll(() => {
+  shared?.net.destroy();
+  shared?.h.remove();
+  shared = null;
+});
 
 const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
@@ -738,8 +757,8 @@ beforeAll(async () => {
     }
     globalThis.requestAnimationFrame = realRaf;
     globalThis.cancelAnimationFrame = realCaf;
-    net.destroy();
-    h.remove();
+    // The ≈1M leg below runs on this engine: never a second WebGL engine after a large one (#287).
+    shared = { net, h };
   } finally {
     globalThis.requestAnimationFrame = realRaf;
     globalThis.cancelAnimationFrame = realCaf;
@@ -891,5 +910,231 @@ describe(`state-network both view — per-interaction cost at N=${N.toLocaleStri
     expect(stateView.off.baseEmits, "a full-detail zoom re-emitted the lane").toBe(0);
     expect(stateView.off.gpu.created).toBe(0);
     expect(stateView.off.worstMs, `full-detail zoom frame ${stateView.off.worstMs.toFixed(2)}ms`).toBeLessThan(STATE_OFF_FRAME_MS);
+  });
+});
+
+// ── ≈1M state nodes, screen mode (#509): a zoom frame does no emit and no upload ────────────────────────────────────
+//
+// The both view draws each state node at project(anchor) + its px offset on the GPU, so a screen-mode zoom frame is a
+// uniform write at any scale. Physical nodes as the fixture above: 1.8 state nodes and ~2 links per physical node.
+// `max`: 560k physical nodes is ≈1.0M state nodes and ≈1.1M state links, the issue's measured scale, each layer under
+// the style tables' ~2.1M-row wall (a 256-wide GrowTexture); the first leg's engine still holds its own arrays.
+const BIG_LOCAL = 560_000;
+const BIG_N = perfN(BIG_LOCAL, { max: BIG_LOCAL });
+const BIG_COLS = Math.max(1, Math.round(Math.sqrt(BIG_N)));
+const BIG_ZOOMS = [0.25, 0.5, 1, 2, 4, 8, 16];
+const BIG_STREAM_FRAMES = 2;
+// A zoom frame's CPU cost (best of 3 per step, worst step), its GPU draws skipped: 3 draws, a uniform write each and
+// one constant-attribute write (the physical nodes' zero offset). Measured 0.0 ms (LOD off) / 0.1 ms (LOD asked) at
+// 1.0M state nodes, local headless Chromium, M1 Max, load ~50. The ceiling catches a per-frame O(state nodes) pass
+// that emits nothing: re-placing every state node alone costs 3.0 ms at 1M (#509, option b).
+const BIG_ZOOM_FRAME_MS = perfBudget(2 + (0.5 * BIG_N) / BIG_LOCAL);
+
+/** Skips the GPU's draw calls, counting them, and counts the constant-attribute writes (`vertexAttrib2fv`) the
+ *  draws make: the zero offset of a layer without offset columns, one per offset attribute per draw (#509, T1).
+ *  A 1M-instance draw rasterised on SwiftShader would queue seconds per frame (LOG.md, "Local headless Chromium
+ *  rasterises on SwiftShader"); every CPU-side call of the frame still runs. `network-sweep-perf` owns the draws. */
+class GlDrawStub {
+  draws = 0;
+  attribs = 0;
+  /** The context and attribute index of the last constant write, for the per-call timing. */
+  ctx: WebGL2RenderingContext | null = null;
+  index = 0;
+  private readonly proto = WebGL2RenderingContext.prototype;
+  private readonly orig = {
+    drawArrays: this.proto.drawArrays,
+    drawElements: this.proto.drawElements,
+    drawArraysInstanced: this.proto.drawArraysInstanced,
+    drawElementsInstanced: this.proto.drawElementsInstanced,
+    vertexAttrib2fv: this.proto.vertexAttrib2fv,
+  };
+  constructor() {
+    const stub = this;
+    const skip = (): void => void stub.draws++;
+    this.proto.drawArrays = skip;
+    this.proto.drawElements = skip;
+    this.proto.drawArraysInstanced = skip;
+    this.proto.drawElementsInstanced = skip;
+    const v2 = this.orig.vertexAttrib2fv;
+    this.proto.vertexAttrib2fv = function (this: WebGL2RenderingContext, index: GLuint, values: Float32List): void {
+      stub.attribs++;
+      stub.ctx = this;
+      stub.index = index;
+      v2.call(this, index, values);
+    };
+  }
+  /** ns per `vertexAttrib2fv` on the engine's context, timed over `calls` writes of (0, 0). */
+  attribNs(calls = 100_000): number {
+    const ctx = this.ctx;
+    if (!ctx) return NaN;
+    const zero = new Float32Array(2);
+    const t0 = performance.now();
+    for (let i = 0; i < calls; i++) this.orig.vertexAttrib2fv.call(ctx, this.index, zero);
+    return ((performance.now() - t0) * 1e6) / calls;
+  }
+  restore(): void {
+    Object.assign(this.proto, this.orig);
+  }
+}
+
+interface BigZoomLeg { frames: number; baseEmits: number; colorCalls: number; gpu: GlBufferUsage; offsetBytes: number; offsetBuffers: number; draws: number; attribs: number; worstMs: number }
+let bigN: { state: number; links: number; registration: GlBufferUsage; offsetColumns: number; regDraws: number };
+let bigZoom: { off: BigZoomLeg; lod: BigZoomLeg };
+let bigStream: { frames: number; emits: number; restyles: number; colorCalls: number; offsetBytes: number; newColumns: number; sameOffsets: boolean; medianMs: number };
+let attribNs = NaN;
+
+describe(`state-network both view, screen mode — zoom frames at ≈1M state nodes (N=${BIG_N.toLocaleString()} physical nodes, #509)`, () => {
+  beforeAll(async () => {
+    const engine = shared;
+    if (!engine) throw new Error("the first leg did not hand over its engine");
+    const { net } = engine;
+    const gl = new GlBufferSpy();
+    const lane = new LaneCallSpy();
+    const stub = new GlDrawStub();
+    const realRaf = globalThis.requestAnimationFrame;
+    const realCaf = globalThis.cancelAnimationFrame;
+    try {
+      const fx = fixture(BIG_N, BIG_COLS);
+      let colorCalls = 0;
+      const color = (path: readonly number[]): string => {
+        colorCalls++;
+        return ["#d62728", "#1f77b4", "#2ca02c"][(path[0] ?? 1) - 1] ?? "#999999";
+      };
+      net.lod(false);
+      // No highlight: the first leg's last hover and selection would leave a ring, whose overlay (a few circles with
+      // their offsets) the highlight lane re-emits per frame — allowed, but not the base lane this leg measures.
+      net.select("nodes", null);
+      engine.h.dispatchEvent(new PointerEvent("pointerleave", { pointerId: 1 }));
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      const reg = gl.mark();
+      net
+        .style({ nodeFill: { by: "module", color }, linkStroke: "rgba(90,110,150,0.5)", sizeMode: "screen" })
+        .stateNetwork(fx.graph, { modules: fx.modules, view: "both" })
+        .layout({ backend: "positions", positions: fx.positions });
+      net.render();
+      bigN = { state: fx.graph.state.nodeCount, links: fx.graph.state.edgeCount, registration: gl.since(reg), offsetColumns: lane.offsetColumns.size, regDraws: stub.draws };
+      const columns = new Set(lane.offsetColumns);
+      const steps = zoomSteps(W, H, BIG_ZOOMS);
+
+      const zoomLeg = (): BigZoomLeg => {
+        sweepFrames(steps, (t) => net.setTransform(t), 1); // warm
+        lane.reset();
+        const c0 = colorCalls;
+        const before = gl.mark();
+        const off0 = { ...offsetColumnStats };
+        const d0 = stub.draws, a0 = stub.attribs;
+        const sweep = sweepFrames(steps, (t) => net.setTransform(t));
+        return {
+          frames: sweep.frames,
+          baseEmits: lane.baseEmits(),
+          colorCalls: colorCalls - c0,
+          gpu: gl.since(before),
+          offsetBytes: offsetColumnStats.bytes - off0.bytes,
+          offsetBuffers: offsetColumnStats.buffers - off0.buffers,
+          draws: stub.draws - d0,
+          attribs: stub.attribs - a0,
+          worstMs: sweep.worstFrameMs,
+        };
+      };
+      const off = zoomLeg();
+      // LOD asked in the both view (the Navigator's order): the full-detail lane stays, with the same signature.
+      net.lod({ declutter: true, maxAggregateRadius: 24 });
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      const lod = zoomLeg();
+      net.lod(false);
+      bigZoom = { off, lod };
+      attribNs = stub.attribNs();
+
+      // Streamed layout frames (one engine frame each, by hand): the anchors are copied, the style is not re-resolved,
+      // and the offset columns are neither rebuilt nor re-uploaded.
+      const queued = new Map<number, FrameRequestCallback>();
+      let frameId = 0;
+      globalThis.requestAnimationFrame = (cb) => {
+        queued.set(++frameId, cb);
+        return frameId;
+      };
+      globalThis.cancelAnimationFrame = (id) => void queued.delete(id);
+      const flush = (): void => {
+        const due = [...queued.values()];
+        queued.clear();
+        for (const cb of due) cb(performance.now());
+      };
+      flush();
+      lane.reset();
+      const c0 = colorCalls;
+      const off0 = offsetColumnStats.bytes;
+      const radii0 = lane.nodeEmits.length;
+      const pos = fx.graph.physical.positions;
+      const times: number[] = [];
+      let dotRadii: Float32Array | undefined;
+      let restyles = 0;
+      for (let f = 1; f <= BIG_STREAM_FRAMES; f++) {
+        for (let i = 0; i < pos.length; i++) pos[i] = (pos[i] ?? 0) * 1.02;
+        const t0 = performance.now();
+        net.streamFrame();
+        flush();
+        times.push(performance.now() - t0);
+        const dots = lane.nodeEmits[lane.nodeEmits.length - 1];
+        if (dotRadii && dots && dots.radii !== dotRadii) restyles++;
+        dotRadii = dots?.radii;
+      }
+      let newColumns = 0;
+      for (const c of lane.offsetColumns) if (!columns.has(c)) newColumns++;
+      bigStream = {
+        frames: BIG_STREAM_FRAMES,
+        emits: lane.nodeEmits.length - radii0,
+        restyles,
+        colorCalls: colorCalls - c0,
+        offsetBytes: offsetColumnStats.bytes - off0,
+        newColumns,
+        sameOffsets: lane.nodeEmits.length > 0 && lane.nodeEmits.every((e) => !!e.offsets && columns.has(e.offsets)),
+        medianMs: median(times),
+      };
+    } finally {
+      globalThis.requestAnimationFrame = realRaf;
+      globalThis.cancelAnimationFrame = realCaf;
+      stub.restore();
+      lane.restore();
+      gl.restore();
+    }
+  }, perfBudget(240_000 + BIG_N / 2));
+
+  it("the fixture is ≈1M state nodes with offset columns (non-vacuity)", () => {
+    console.info(
+      `[both-perf ≈1M] ${bigN.state.toLocaleString()} state nodes, ${bigN.links.toLocaleString()} links; registration upload ${(bigN.registration.uploadedBytes / 1e6).toFixed(1)} MB; ` +
+        `zoom frame worst ${bigZoom.off.worstMs.toFixed(3)} ms (LOD off), ${bigZoom.lod.worstMs.toFixed(3)} ms (LOD asked); ` +
+        `per frame ${(bigZoom.off.gpu.uploadedBytes / bigZoom.off.frames).toFixed(0)} B uploaded, ${(bigZoom.off.draws / bigZoom.off.frames).toFixed(1)} draws, ${(bigZoom.off.attribs / bigZoom.off.frames).toFixed(1)} vertexAttrib2fv at ${attribNs.toFixed(0)} ns each; ` +
+        `streamed frame ${bigStream.medianMs.toFixed(1)} ms`,
+    );
+    expect(bigN.state, "the fixture is not ≈1.8 state nodes per physical node").toBeGreaterThan(1.7 * BIG_N);
+    expect(bigN.offsetColumns, "no offset columns reached the backend: the leg is vacuous").toBeGreaterThanOrEqual(3);
+  });
+
+  it("a screen-mode zoom frame: 0 base-lane emits, 0 geometry and 0 offset bytes uploaded, no colour accessor (LOD off and asked)", () => {
+    for (const [name, leg] of [["LOD off", bigZoom.off], ["LOD asked", bigZoom.lod]] as const) {
+      expect(leg.draws, `${name}: the sweep drew nothing: the leg is vacuous`).toBeGreaterThanOrEqual(leg.frames);
+      expect(leg.baseEmits, `${name}: a zoom frame re-emitted the lane`).toBe(0);
+      // Buffer bytes: the frame's uniform block only (luma.gl writes uniforms through a uniform buffer), an
+      // N-independent few bytes; a geometry re-upload is ≥ 8 B per state node. As a share of the registration too.
+      expect(leg.gpu.uploadedBytes / leg.frames, `${name}: buffer bytes per zoom frame are not the uniform block's few`).toBeLessThan(RING_BYTES_PER_EVENT);
+      expect(leg.gpu.uploadedBytes / leg.frames, `${name}: buffer bytes per zoom frame`).toBeLessThan(bigN.registration.uploadedBytes / 1e5);
+      expect(leg.gpu.created, `${name}: a zoom frame created GPU buffers`).toBe(0);
+      expect(leg.gpu.deleted, `${name}: a zoom frame deleted GPU buffers`).toBe(0);
+      expect(leg.offsetBytes, `${name}: a zoom frame uploaded offset bytes`).toBe(0);
+      expect(leg.offsetBuffers, `${name}: a zoom frame allocated an offset column`).toBe(0);
+      expect(leg.colorCalls, `${name}: a zoom frame resolved the module colours`).toBe(0);
+      // The constant zero offset: a bounded number of writes per draw, never per instance.
+      expect(leg.attribs, `${name}: constant-attribute writes per frame grew past 2 per draw`).toBeLessThanOrEqual(2 * leg.draws);
+      expect(leg.worstMs, `${name}: zoom frame ${leg.worstMs.toFixed(2)} ms`).toBeLessThan(BIG_ZOOM_FRAME_MS);
+    }
+  });
+
+  it("a streamed layout frame: no style re-resolve, the offset columns kept and not re-uploaded", () => {
+    expect(bigStream.emits, "the stream did not repaint once per frame").toBeGreaterThanOrEqual(bigStream.frames);
+    expect(bigStream.restyles, "a streamed frame re-resolved the style").toBe(0);
+    expect(bigStream.colorCalls, "a streamed frame resolved the module colours").toBe(0);
+    expect(bigStream.sameOffsets, "a streamed frame handed the backend a new state node offset column").toBe(true);
+    expect(bigStream.newColumns, "a streamed frame built new offset columns").toBe(0);
+    expect(bigStream.offsetBytes, "a streamed frame re-uploaded offset columns").toBe(0);
   });
 });

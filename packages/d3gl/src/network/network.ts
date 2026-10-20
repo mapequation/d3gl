@@ -2027,6 +2027,9 @@ export class Network extends BaseEngine {
       this.invalidateNoLodSelected(); // #240: bypasses onLaneSelectionChanged, so drop the flag cache here
     }
     this.syncLane(); // re-register the lane with the interactive block + companion highlight lane
+    // A node-drag starts on pointerdown. On WebGL the lane attaches the listeners; Canvas/SVG register no lane, so
+    // `draggable` attaches them here (idempotent), or a drag there never starts (#509).
+    if (this.interactiveOpts?.draggable) this.attachSelectPointer();
     this.render();
     return this;
   }

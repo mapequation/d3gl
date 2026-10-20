@@ -3,6 +3,7 @@ import { network, type Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedCirclesData, InstancedLayer } from "../../core/backend.js";
+import { decodeImage, rasterizeSVG, type PixelBuffer } from "../../map/__tests__/backend-equivalence-harness.js";
 
 /**
  * Interaction in the state network's both view (#509), where each state node is drawn at its physical node's
@@ -236,4 +237,126 @@ describe("state network both view: interaction hits what is drawn (#509)", () =>
     const kept = state(1);
     expect([kept.x, kept.y]).toEqual([dropped.x, dropped.y]);
   });
+});
+
+type Rgba = readonly [number, number, number, number];
+/** The pixel at host px (x, y), as [r, g, b, a]. */
+function px(img: PixelBuffer, x: number, y: number): [number, number, number, number] {
+  const i = 4 * (Math.round(y) * img.width + Math.round(x));
+  return [img.data[i] ?? 0, img.data[i + 1] ?? 0, img.data[i + 2] ?? 0, img.data[i + 3] ?? 0];
+}
+const isNode = ([r, g, b, a]: Rgba): boolean => a > 200 && r > 200 && g < 90 && b < 90;
+const isLink = ([r, g, b, a]: Rgba): boolean => a > 120 && b > 150 && r < 140 && g < 140;
+/** Distance from (x, y) to the segment a–b. */
+function toSegment(x: number, y: number, a: Disc, b: Disc): number {
+  const vx = b.x - a.x, vy = b.y - a.y;
+  const t = Math.max(0, Math.min(1, ((x - a.x) * vx + (y - a.y) * vy) / (vx * vx + vy * vy || 1)));
+  return Math.hypot(x - a.x - t * vx, y - a.y - t * vy);
+}
+
+const BACKENDS = ["webgl", "canvas", "svg"] as const;
+const DRAG_K = 2.5;
+const NODE_FILL = "#ff0000";
+const LINK = "#0000ff";
+const LINK_WIDTH = 3;
+/** The dragged state node, and the far end of its one link (1 → 5, physical node 0 → 2). */
+const HELD = 1;
+const FAR = 5;
+
+describe("state network both view: a state node drag draws where it was dropped, on every backend (#509)", () => {
+  for (const sizeMode of ["screen", "world"] as const) {
+    it(`${sizeMode} mode: the GPU (in-place offset upload) and the retained Scene (re-baked per move) draw the dropped state node and its link`, async () => {
+      // The plan, from what reaches the WebGL backend: the held state node's drawn disc, a drop point inside its
+      // physical node clear of every other state node and of where it was, and points on its new link.
+      const plan = await setup(sizeMode, DRAG_K);
+      const discs = Array.from({ length: S }, (_, s) => plan.state(s));
+      const held = nth(discs, HELD);
+      const far = nth(discs, FAR);
+      const home = plan.physical(plan.graph.stateToPhysical[HELD] ?? 0);
+      const others = discs.filter((_, s) => s !== HELD);
+      // Of the clear points on its physical node's inner rim, the one farthest from its old link, so the new link
+      // runs apart from the old one.
+      let drop: Disc | null = null;
+      let apart = 0;
+      for (let a = 0; a < 128; a++) {
+        const t = (a / 128) * 2 * Math.PI, d = home.r - held.r - 0.5;
+        const c = { x: home.x + d * Math.cos(t), y: home.y + d * Math.sin(t), r: held.r };
+        const clear = Math.hypot(c.x - held.x, c.y - held.y) > 2 * held.r + 2 && others.every((o) => Math.hypot(c.x - o.x, c.y - o.y) > o.r + held.r + 2);
+        // Off the line through the old link (not just its segment), so the two links diverge.
+        const off = Math.abs((far.x - held.x) * (c.y - held.y) - (far.y - held.y) * (c.x - held.x)) / (Math.hypot(far.x - held.x, far.y - held.y) || 1);
+        if (clear && off > apart) {
+          apart = off;
+          drop = c;
+        }
+      }
+      expect(drop, "no drop point clear of the other state nodes: the fixture is too tight").not.toBeNull();
+      if (!drop) return;
+      // Points on its new link just past its rim, clear of every other state node, of the physical nodes' rims and of
+      // the old link (by its half-width and 2 px): what a link end left behind would not cover. Where the held state
+      // node was is not excluded: it must be gone (asserted below).
+      const samples: [number, number][] = [];
+      const len = Math.hypot(far.x - drop.x, far.y - drop.y);
+      const physicals = Array.from({ length: P }, (_, p) => plan.physical(p));
+      const half = (LINK_WIDTH * (sizeMode === "screen" ? 1 : DRAG_K)) / 2;
+      for (let d = held.r + 3; d < len - far.r - 4 && samples.length < 4; d += 1) {
+        const x = drop.x + ((far.x - drop.x) * d) / len, y = drop.y + ((far.y - drop.y) * d) / len;
+        if (others.some((o) => Math.hypot(x - o.x, y - o.y) < o.r + 2)) continue;
+        if (physicals.some((c) => Math.abs(Math.hypot(x - c.x, y - c.y) - c.r) < 3)) continue;
+        if (toSegment(x, y, held, far) < half + 2) continue;
+        samples.push([x, y]);
+      }
+      expect(samples.length, "no point on the new link clear of the rest: the link check is vacuous").toBeGreaterThanOrEqual(2);
+      plan.net.destroy();
+      plan.h.remove();
+
+      for (const backend of BACKENDS) {
+        const h = document.createElement("div");
+        h.style.width = `${W}px`;
+        h.style.height = `${H}px`;
+        document.body.appendChild(h);
+        const net = network(h, { width: W, height: H, backend });
+        await net.whenReady();
+        cleanup.push(() => {
+          net.destroy();
+          h.remove();
+        });
+        net
+          .style({ sizeMode, nodeRadius: 6, nodeFill: NODE_FILL, linkStroke: LINK, linkWidth: LINK_WIDTH })
+          .stateNetwork(fixture(), { view: "both" })
+          .layout({ backend: "positions", positions: POS });
+        net.setTransform({ k: DRAG_K, x: 0, y: 0 });
+        net.interactive({ draggable: true });
+        // A programmatic setTransform without zoom does not re-bake the retained Scene's screen-mode geometry (D3).
+        net.syncScreenGeometry();
+        const pixels = (): Promise<PixelBuffer> => (backend === "svg" ? rasterizeSVG(net.toSVG(), W, H) : decodeImage(net.toPNG(), W, H));
+        const before = await pixels();
+        expect(isNode(px(before, held.x, held.y)), `${backend}: the held state node is not drawn where WebGL draws it`).toBe(true);
+        expect(isNode(px(before, drop.x, drop.y)), `${backend}: the drop point is already covered`).toBe(false);
+
+        const r = h.getBoundingClientRect();
+        // Pointer and mouse events, as a browser fires them (the mouse ones on the window while held).
+        const ev = (type: "down" | "move" | "up", x: number, y: number): void => {
+          const at: MouseEventInit = { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, view: window };
+          h.dispatchEvent(new PointerEvent(`pointer${type}`, { ...at, pointerId: 1 }));
+          (type === "down" ? h : window).dispatchEvent(new MouseEvent(`mouse${type}`, at));
+        };
+        ev("down", held.x, held.y);
+        for (const [x, y] of [[(held.x + drop.x) / 2, (held.y + drop.y) / 2], [drop.x, drop.y], [drop.x, drop.y]] as const) {
+          ev("move", x, y);
+          await frame();
+        }
+        // Mid-gesture: the GPU after the in-place offset upload, the retained Scene after the move's re-register.
+        const during = await pixels();
+        expect(isNode(px(during, drop.x, drop.y)), `${backend} while held: the state node is not drawn where it was dropped`).toBe(true);
+        expect(isNode(px(during, held.x, held.y)), `${backend} while held: the state node is still drawn where it was`).toBe(false);
+        for (const [x, y] of samples) expect(isLink(px(during, x, y)), `${backend} while held: its link does not follow it at (${x.toFixed(1)}, ${y.toFixed(1)})`).toBe(true);
+        ev("up", drop.x, drop.y);
+        await frame();
+        const after = await pixels();
+        expect(isNode(px(after, drop.x, drop.y)), `${backend} after the drop: the state node is not where it was dropped`).toBe(true);
+        expect(isNode(px(after, held.x, held.y)), `${backend} after the drop: the state node is back where it was`).toBe(false);
+        for (const [x, y] of samples) expect(isLink(px(after, x, y)), `${backend} after the drop: its link does not follow it`).toBe(true);
+      }
+    });
+  }
 });

@@ -201,3 +201,76 @@ describe("state network both view: state nodes at the state view's size, inside 
     }
   });
 });
+
+describe("state network physical view: the physical nodes follow the app's sizeMode (#509)", () => {
+  for (const sizeMode of MODES) {
+    for (const { name, spec } of SPECS) {
+      it(`${sizeMode} mode, nodeRadius ${name}: constant px across zooms in screen mode, scaled by k in world mode`, async () => {
+        const host = document.createElement("div");
+        host.style.width = `${W}px`;
+        host.style.height = `${H}px`;
+        document.body.appendChild(host);
+        hosts.push(host);
+        const spy = new LayerSpy();
+        try {
+          const net = new Network(host, { width: W, height: H, backend: "webgl" });
+          await net.whenReady();
+          const { graph, positions } = fixture();
+          net.style({ nodeRadius: spec, sizeMode }).stateNetwork(graph, { view: "physical" });
+          net.layout({ backend: "positions", positions });
+          const P = graph.physical.nodeCount;
+          /** Each physical node's drawn radius in px at zoom k, and the pick model's answer just inside and just outside
+           *  its drawn rim: probes that fall on another physical node's drawn disc are skipped (screen mode by flow
+           *  overlaps its neighbours when zoomed out), so `probes` counts the ones that test this node alone. */
+          const at = (k: number): { px: number[]; probes: number; inside: number; outside: number } => {
+            const t = zoomAbout(k);
+            net.setTransform(t);
+            net.render();
+            expect(spy.sizeMode("nodes"), "the physical nodes do not take the app's sizeMode").toBe(sizeMode);
+            const c = spy.circles("nodes");
+            expect(c.count).toBe(P);
+            const px = Array.from(c.radii.subarray(0, P), (r) => r * (sizeMode === "screen" ? 1 : k));
+            const cx = (p: number): number => t.k * (positions[2 * p] ?? 0) + t.x;
+            const cy = (p: number): number => t.k * (positions[2 * p + 1] ?? 0) + t.y;
+            const onOther = (p: number, x: number, y: number): boolean => {
+              for (let q = 0; q < P; q++) if (q !== p && Math.hypot(x - cx(q), y - cy(q)) <= (px[q] ?? 0) + 1) return true;
+              return false;
+            };
+            let probes = 0;
+            let inside = 0;
+            let outside = 0;
+            for (let p = 0; p < P; p++) {
+              const x = cx(p), y = cy(p), r = px[p] ?? 0;
+              const ix = x + 0.8 * r, ox = x + 1.2 * r + 1;
+              if (onOther(p, x, y) || onOther(p, ix, y) || onOther(p, ox, y)) continue;
+              probes++;
+              // The physical node as the pick model names it at its centre: hit inside its drawn rim, not outside it.
+              const id = net.pick(x, y)?.id;
+              if (id !== undefined && net.pick(ix, y)?.id === id) inside++;
+              if (id !== undefined && net.pick(ox, y)?.id !== id) outside++;
+            }
+            return { px, probes, inside, outside };
+          };
+          const near = at(0.5);
+          const far = at(3);
+          for (const leg of [near, far]) {
+            expect(leg.probes, "no physical node clear of its neighbours: the pick check is vacuous").toBeGreaterThan(0);
+            expect(leg.inside, "a pick inside a physical node's drawn rim missed it").toBe(leg.probes);
+            expect(leg.outside, "a pick outside a physical node's drawn rim hit it").toBe(leg.probes);
+          }
+          for (let p = 0; p < P; p++) {
+            const a = near.px[p] ?? 0, b = far.px[p] ?? 0;
+            expect(a, `physical node ${p} is not drawn`).toBeGreaterThan(0);
+            if (sizeMode === "screen") expect(b, `physical node ${p}: px radius changed with the zoom`).toBeCloseTo(a, 5);
+            else expect(b / a, `physical node ${p}: world radius did not scale with k`).toBeCloseTo(3 / 0.5, 5);
+          }
+          // The pies ride on the physical nodes: the same sizeMode.
+          if (spy.last.has("pie")) expect(spy.sizeMode("pie")).toBe(sizeMode);
+          net.destroy();
+        } finally {
+          spy.restore();
+        }
+      });
+    }
+  }
+});
