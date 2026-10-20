@@ -854,17 +854,20 @@ derives the physical network) plus a per-**state-node** module assignment, and `
 - **Physical** — the derived physical network (flow-sized nodes + directed, flow-summed aggregated
   half-arrow links). A physical node whose state nodes span ≥2 modules renders as a **pie chart** — one
   wedge per module, sized by that module's summed flow and coloured by module; a single-module node is a
-  solid disc.
+  plain circle.
 - **State** — the state graph as an ordinary network with its modules: exactly what
   `net.data(stateGraph, { modules })` gives. It has a layout of its own (the **State layout** control lays it
   out by force, or **nested** by module), the **LOD** control cuts its module tree with a ring around each open
   module — the [modular LOD cut](#modular-level-of-detail) — and every hit names its module `path`. (LOD is a
   state-view feature; the physical/both views draw full detail.)
-- **Both** — a hybrid: each physical node is a faint **container** disc, outlined by a thin ring in a darker
-  shade of its colour, holding its state nodes, drawn with **state-level** links — the memory structure in
-  its physical context. Each state node keeps its place in its container as the physical layout moves, and a
-  state node dragged there stays inside its container, where you put it. The nodes are world-sized so they stay inside their physical node at
-  every zoom.
+- **Both** — a hybrid: each physical node is drawn faintly, outlined by a thin ring in a darker shade of its
+  colour, around its state nodes, with **state-level** links — the memory structure in its physical context.
+  Each state node is drawn at the size the state view gives it (your `nodeRadius` and `sizeMode`), and its
+  physical node packs its state nodes by area, largest first, and is sized to enclose them. In
+  `sizeMode: "screen"` both keep their pixel size at every zoom, so neighbouring physical nodes can overlap when
+  zoomed out, as screen-sized nodes do; in `"world"` they scale with the zoom. Each state node keeps its place
+  in its physical node as the physical layout moves, and a state node dragged there stays inside its physical
+  node, where you put it.
 
 The **Nodes** slider scales the physical network from 10 to 10,000. The cap comes from the demo's
 synthetic data, not from the layout (the Worker and GPU backends lay out far larger graphs, as in the
@@ -887,16 +890,16 @@ net
 
 net.view("state"); // the state graph, laid out now with the same options, and kept · "physical" | "both"
 
-// Your own module palette, in every view: state nodes, pie wedges and physical discs (#494). With a
-// nodeFill by a metric (`{ by: "flow", scale }`) the nodes follow it; pie wedges and containers keep the palette.
+// Your own module palette, in every view: state nodes, pie wedges and physical nodes (#494). With a
+// nodeFill by a metric (`{ by: "flow", scale }`) the nodes follow it; pie wedges and physical nodes keep the palette.
 net.style({ moduleColor: (modulePath) => palette(modulePath) });
 ```
 
 `modules` is optional: a raw state network (before Infomap) switches views too, without pies. In the
-**both** view a container hovers, selects and drags as its state nodes; a view switch carries the selection
+**both** view a physical node hovers, selects and drags as its state nodes; a view switch carries the selection
 over (a physical node ↔ its state nodes), and every hit, selection and label says its `level`
-(`"physical"` or `"state"`), so the app names an id without mapping it. Its dots and containers are world
-regions, while its links keep your `sizeMode`. Call `lod()` once: it holds across view switches and applies
+(`"physical"` or `"state"`), so the app names an id without mapping it. Its state nodes, physical nodes and
+links all follow your `sizeMode`. Call `lod()` once: it holds across view switches and applies
 to the state view; the physical view draws in full, every pie with it, until pies are LOD-aware. Under a
 module palette a collapsed module takes its own colour from it.
 
@@ -914,8 +917,8 @@ is laid out with the app's last `layout()` options, from where its nodes are —
 rosette around their physical node — and every view keeps its positions across switches, so the app never
 re-runs a layout to switch views; a layout still running when its view is left goes on where it stood when the
 view is back (unless `stopLayout()` stopped it), and each view comes back at the pan and zoom it was left at. A node drag reheats the layout of the view it is in, also after a switch;
-in the both view a container drag reheats the physical layout, its state nodes riding along. `net.positions`
-gives the positions of the view on screen (in the both view the state dots', which no graph holds).
+in the both view a physical node drag reheats the physical layout, its state nodes riding along. `net.positions`
+gives the positions of the view on screen (in the both view the drawn state nodes', which no graph holds).
 
 <ExampleCard files={["state-network/draw.ts"]}>
   <StateNetwork client:visible slot="demo" />
