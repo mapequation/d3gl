@@ -2833,10 +2833,9 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
  * back by `1/bake`, so the Scene's ×k view transform reproduces the WebGL constant-px arrowhead — tip
  * size *and* the node-boundary setback. Without it, the world-unit setback grows with zoom and the head
  * drifts off the node. The end-tangent direction is invariant under the uniform ×bake, so only the
- * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched. `radiusScale` turns
- * `nodeRadii` into the solve's px: `bake` for world-sized nodes under px-sized arrows (#494), else 1.
+ * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched.
  */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1, radiusScale = 1): void {
+export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1): void {
   const inv = 1 / bake;
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
@@ -2848,7 +2847,7 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
     const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
-    const setback = nodeRadii[t]! * radiusScale;
+    const setback = nodeRadii[t]!;
     const tipX = tx - ux * setback;
     const tipY = ty - uy * setback;
     const baseX = tipX - ux * 2 * size;
@@ -2874,8 +2873,7 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
  * centres × `bake`, with `nodeRadii`/`widthOf`/`bend` already in px) and the result scaled by `1/bake`,
  * so the Scene's ×k transform reproduces the WebGL constant-px render *exactly* — including the
  * non-linear tip/bend terms, which a naive per-size division would distort (and worse the deeper you
- * zoom). `bake = 1` (world mode) leaves world sizes untouched. `radiusScale` turns `nodeRadii` into the
- * solve's px: `bake` for world-sized nodes under px-sized links (#494), else 1.
+ * zoom). `bake = 1` (world mode) leaves world sizes untouched.
  */
 export function emitHalfLinks(
   g: GroupBuilder,
@@ -2884,7 +2882,6 @@ export function emitHalfLinks(
   widthOf: (weight: number) => number,
   bend: number,
   bake = 1,
-  radiusScale = 1,
 ): void {
   const opposite = reciprocalEdges(graph);
   for (let e = 0; e < graph.edgeCount; e++) {
@@ -2900,10 +2897,10 @@ export function emitHalfLinks(
     const geom = halfLinkGeometry({
       x0,
       y0,
-      r0: nodeRadii[s]! * radiusScale,
+      r0: nodeRadii[s]!,
       x1,
       y1,
-      r1: nodeRadii[t]! * radiusScale,
+      r1: nodeRadii[t]!,
       width: widthOf(graph.weight[e]!),
       oppositeWidth: widthOf(o < 0 ? graph.weight[e]! : (graph.weight[o] ?? 0)),
       bend: chordBend(x0, y0, x1, y1, bend),

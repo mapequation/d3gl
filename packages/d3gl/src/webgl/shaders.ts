@@ -369,7 +369,6 @@ precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
 uniform vec2 u_viewport;  // device px, for screen sizeMode
-uniform float u_radiusWorld; // 1.0 = a_radius is world units on a screen layer (#494): scaled to px by the zoom
 layout(location = 0) in vec2 a_tri; // per-vertex (back, across); location 0 stays buffer-backed (OffsetColumn, instanced.ts)
 in vec2 a_source;     // per-instance source centre (orientation)
 in vec2 a_target;     // per-instance target centre (tip set back by a_radius)
@@ -398,8 +397,7 @@ void main() {
   vec2 dir = normalize(endTan);
   vec2 perp = vec2(-dir.y, dir.x);
   // World-sized nodes under px-sized arrows (#494): the setback is the node's radius at this zoom, in px.
-  float rk = screen && u_radiusWorld > 0.5 ? 0.5 * u_viewport.x * abs(u_transform[0].x) : 1.0;
-  vec2 tip = tgt - dir * (a_radius * rk); // set back to the target node's boundary
+  vec2 tip = tgt - dir * a_radius; // set back to the target node's boundary
   vec2 pos = tip - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
   vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
   gl_Position = vec4(clip, 0.0, 1.0);
@@ -428,7 +426,6 @@ precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
 uniform vec2 u_viewport;  // device px, for screen sizeMode
-uniform float u_radiusWorld; // 1.0 = a_radii are world units on a screen layer (#494): scaled to px by the zoom
 layout(location = 0) in vec2 a_kind; // per-vertex (code, t); location 0 stays buffer-backed (OffsetColumn, instanced.ts)
 in vec2 a_p0;         // per-instance source centre
 in vec2 a_p1;         // per-instance target centre
@@ -459,9 +456,8 @@ void main() {
   vec2 p0 = screen ? worldToPx(a_p0) + a_sourceOffset : a_p0 + a_sourceOffset;
   vec2 p1 = screen ? worldToPx(a_p1) + a_targetOffset : a_p1 + a_targetOffset;
   // World-sized nodes under px-sized links (#494): the radii at this zoom, in px.
-  float rk = screen && u_radiusWorld > 0.5 ? 0.5 * u_viewport.x * abs(u_transform[0].x) : 1.0;
-  float r0 = a_radii.x * rk;
-  float r1 = a_radii.y * rk;
+  float r0 = a_radii.x;
+  float r1 = a_radii.y;
   float width = a_widths.x;
   float oppositeWidth = a_widths.y;
 

@@ -190,13 +190,11 @@ export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): Drawab
  * Instanced arrowheads → one filled triangle per arrow, tip set back to the target node's boundary.
  * `bake` mirrors the Scene twin's screen-sizeMode trick: solve in pixel space (×k) and emit ÷k, so
  * the world-coordinate output reproduces the constant-pixel GPU render under the view's ×k transform.
- * World `radii` ({@link InstancedArrowsData.radiiWorld}) are scaled to px by the same `bake`, as the shader does.
  * The end offsets (#509) are in size units, so they add unscaled in the solve space: px at `bake = k` (screen),
  * world units at `bake = 1` (world).
  */
 export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVector[] {
   const inv = 1 / bake;
-  const radiusScale = a.radiiWorld ? bake : 1; // world setbacks in the px solve (#494)
   const half = a.half === true;
   const { sourceOffsets: so, targetOffsets: to } = a;
   const out: DrawableVector[] = [];
@@ -210,7 +208,7 @@ export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVec
     const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
-    const setback = (a.radii[r] ?? 0) * radiusScale;
+    const setback = a.radii[r] ?? 0;
     const size = a.sizes[r] ?? 0;
     const tipX = tx - ux * setback;
     const tipY = ty - uy * setback;
@@ -235,7 +233,6 @@ export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVec
  *  {@link halfLinkGeometry} reference path. Same `bake` trick, and end offsets, as {@link arrowsToDrawables}. */
 export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): DrawableVector[] {
   const inv = 1 / bake;
-  const radiusScale = h.radiiWorld ? bake : 1; // world radii in the px solve (#494)
   const { sourceOffsets: so, targetOffsets: to } = h;
   const out: DrawableVector[] = [];
   for (let e = 0; e < h.count; e++) {
@@ -247,10 +244,10 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
     const geom = halfLinkGeometry({
       x0,
       y0,
-      r0: (h.radii[r * 2] ?? 0) * radiusScale,
+      r0: h.radii[r * 2] ?? 0,
       x1,
       y1,
-      r1: (h.radii[r * 2 + 1] ?? 0) * radiusScale,
+      r1: h.radii[r * 2 + 1] ?? 0,
       width: h.widths[r * 2] ?? 0,
       oppositeWidth: h.widths[r * 2 + 1] ?? 0,
       bend: chordBend(x0, y0, x1, y1, h.bends[r] ?? 0),
