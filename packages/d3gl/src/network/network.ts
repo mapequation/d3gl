@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, linkSizeModeOf, linkRadiiWorld, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -12,7 +12,8 @@ import { NestedDrag, NestedDragCache } from "./nested-drag.js";
 import { easeCubicOut, positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, nodeModules, moduleAggregateColors, type ModulePathNode, type ModuleColorOptions, type NodeModules } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
-import { rosetteOffsets, rosettePositions } from "./rosette.js";
+import { rosettePositions } from "./rosette.js";
+import { packStateNodes } from "./both-layout.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type LayoutContinuation, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
@@ -799,13 +800,12 @@ const LAYER_NAMES = ["leaf-links", "links", "leaf-arrows", "arrows", "module-bou
 const HL_LAYERS = ["phys-container", "nodes", "leaf-links", "links", "leaf-arrows", "arrows", "pie"] as const;
 /** The empty `hoverInstances` run (#476), shared: pushed after every base emit, so it must not allocate. */
 const NO_INSTANCES: [number, number] = [0, 0];
-/** The share of a `both`-view container's radius its state rosette fills ({@link rosettePositions}). */
-const ROSETTE_FILL = 0.72;
-/** A `both`-view state dot's radius as a share of the radius of its equal share of the rosette's area (#494). */
-const DOT_SHARE = 0.6;
-/** Steps per doubling the `both`-view sizing scale is rounded to (#495): the containers and dots are re-sized
- *  only when the physical layout's spacing has moved a step, ~9%, not on every streamed frame. */
-const SIZING_STEPS = 8;
+/** The padding between a `both`-view physical node's edge and its outermost state node in screen mode (#509), in
+ *  px: twice the physical node's {@link CONTAINER_RING_PX} ring, so the state nodes clear it. To be settled by
+ *  visual review (T2). */
+const BOTH_PADDING_PX = 2;
+/** The same padding in world mode (#509), as a share of the largest state node's radius (T2). */
+const BOTH_PADDING_SHARE = 0.25;
 /** Darkening of a `both`-view container's ring: a darker shade of its own fill, as module glyphs are ringed (#495). */
 const CONTAINER_RING_DARKEN = 0.62;
 /** A `both`-view container ring's width in screen px at every zoom (#495), as thin as a module boundary ring. */
@@ -864,9 +864,13 @@ function warmLayout(opts: NetworkLayoutOptions): NetworkLayoutOptions {
   return { ...opts, warm: true };
 }
 
-/** The `both`-view sizing scale for a layout `spacing` (#495): rounded to {@link SIZING_STEPS} steps per doubling. */
-function sizingScale(spacing: number): number {
-  return 2 ** (Math.round(SIZING_STEPS * Math.log2(spacing)) / SIZING_STEPS);
+/** The both view's packing (#509) for one `nodeRadius` spec and `sizeMode`: each state node's radius as the state
+ *  view resolves it, its offset from its physical node and each physical node's radius, all in size units. */
+interface BothPack {
+  readonly spec: NodeRadiusSpec;
+  readonly sizeMode: "world" | "screen";
+  readonly nodeRadii: Float32Array;
+  readonly offsets: Float32Array;
 }
 
 /** Characteristic node spacing of a laid-out graph (bounding-box diagonal ÷ √count) — the scale the
@@ -1282,11 +1286,12 @@ export class Network extends BaseEngine {
    *  view's own. The active one's state is in the engine's fields; the other's is parked here. */
   private viewLayouts: { physical: ViewLayout; state: ViewLayout } | null = null;
   /** The `both` view's graph (#495): the state graph's topology with positions of its own, derived from the
-   *  physical layout and each state node's place in its container ({@link bothPlaces}). */
+   *  physical layout and each state node's place in its physical node ({@link bothPack}). In screen mode each
+   *  position is its physical node's (the anchor) and the offset is drawn on the GPU (#509). */
   private bothGraph: NetworkGraph | null = null;
-  /** Each state node's place in its `both`-view container (#495): its offset from its physical node, in container
-   *  radii. Seeded from the rosette; a drag in the both view moves it. Kept for the state network. */
-  private bothPlaces: Float32Array | null = null;
+  /** The both view's packing (#509), built once per `nodeRadius` spec and `sizeMode` ({@link ensureBothPack}):
+   *  never per zoom or layout frame. Its physical radii are {@link containerRadii}. */
+  private bothPack: BothPack | null = null;
   /** The app's last {@link layout} options in state-network mode (#495): what a view never laid out runs with
    *  when it is first shown, and a view whose run a switch interrupted when it is shown again. */
   private lastStateLayout: NetworkLayoutOptions | null = null;
@@ -1320,17 +1325,9 @@ export class Network extends BaseEngine {
   /** The module colours of a module tree's aggregates (#494) under a `{ by: "module" }` fill, per (tree, style):
    *  built when the style is applied to the tree, never per frame. */
   private moduleAggregateFill: { tree: LODTree; palette: ModulePalette; fill: FillAggregate | undefined } | null = null;
-  /** `both`-view physical **container** radii (world units), sized so a physical node's confined state
-   *  dots fit inside it. Computed from the physical positions, relative to {@link stateSpacing}. */
+  /** `both`-view physical node radii in size units (#509): each encloses its packed state nodes, plus a padding
+   *  ({@link ensureBothPack}). */
   private containerRadii: Float32Array | null = null;
-  /** Characteristic physical-node spacing of the layout, rounded to {@link sizingScale}'s steps — the scale container
-   *  radii are sized against, so they track the layout instead of a fixed constant (#171). 0 until sized. */
-  private stateSpacing = 0;
-  /** `both`-view state-node dot radii (world units), each sized to its container's rosette so the dots
-   *  fill it without overlapping (#494). Engine-owned: never written into the app's style. */
-  private bothDotRadii: Float32Array | null = null;
-  /** The largest of {@link bothDotRadii} (what the fit pads by). */
-  private bothDotMax = 0;
   /** The `both` view's container layer columns (#494): built once per (radii, fill) and reused by every
    *  emit, so a drag or layout frame re-emits the same arrays (and the renderer skips their upload). */
   private containerColumns: { radii: Float32Array; fill: Uint8Array | null; colors: Uint8Array; borders: Float32Array; borderColors: Uint8Array; groups: Float32Array } | null = null;
@@ -1394,7 +1391,7 @@ export class Network extends BaseEngine {
     this.stopParkedLayouts();
     this.viewLayouts = null;
     this.bothGraph = null;
-    this.bothPlaces = null;
+    this.bothPack = null;
     this.lastStateLayout = null;
     this.stateData = null;
     this.pieWedges = null;
@@ -1404,10 +1401,7 @@ export class Network extends BaseEngine {
     this.containerRadii = null;
     this.containerColumns = null;
     this.containerSelected = null;
-    this.bothDotRadii = null;
-    this.bothDotMax = 0;
     this.bothNodeGroups2 = null;
-    this.stateSpacing = 0;
     this.pieColumns.clear(); // the previous network's wedges
   }
 
@@ -1519,10 +1513,9 @@ export class Network extends BaseEngine {
     this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: newViewLayout(graph.state, hierarchy) };
     // The both view draws the state graph at positions of its own: each state node at its place in its container.
     this.bothGraph = { ...graph.state, positions: new Float32Array(2 * graph.state.nodeCount) };
-    this.bothPlaces = rosetteOffsets(graph, ROSETTE_FILL);
-    // Container radii follow the layout scale: sized now from whatever positions the physical graph holds, so a
-    // `both` view has its containers from the first frame (#494), and again whenever that scale moves a step.
-    this.computeStateSizing();
+    // Packed when the both view is first shown ({@link syncBoth}), and again on a style change of its radii (#509).
+    this.bothPack = null;
+    this.containerRadii = null;
     this.applyView(null);
     return this;
   }
@@ -1750,75 +1743,50 @@ export class Network extends BaseEngine {
     return !this.stateData || this.activeView === "state" ? options : null;
   }
 
-  /** Size the container radii against the current physical layout, so they track the layout scale instead of a
-   *  fixed constant: O(physical nodes) to measure the scale, on a frame that moved the physical nodes in the both
-   *  view, and O(physical nodes) more only when it moved a step ({@link sizingScale}, #495). The both view's dot
-   *  radii follow lazily ({@link bothDots}). */
-  private computeStateSizing(): void {
+  /**
+   * The both view's packing for the current style (#509): each state node at the radius the state view gives it
+   * (the app's `nodeRadius` spec, in its `sizeMode`'s units), packed inside its physical node ({@link
+   * packStateNodes}), and each physical node's radius ({@link containerRadii}). Kept while the spec and the
+   * sizeMode are: built on a style or data change, never on a zoom or layout frame. O(S log s) to build (S state
+   * nodes, s the most in one physical node), O(1) when kept.
+   */
+  private ensureBothPack(): BothPack | null {
     const sg = this.stateData;
-    if (!sg) return;
-    const spacing = sizingScale(physicalSpacing(sg.physical.positions, sg.physicalCount));
-    if (spacing === this.stateSpacing && this.containerRadii) return;
-    this.stateSpacing = spacing;
-    const { offsets } = sg.physicalToState;
-    const container = new Float32Array(sg.physicalCount);
-    for (let p = 0; p < sg.physicalCount; p++) {
-      const count = offsets[p + 1]! - offsets[p]!;
-      // Grows with the state-node count but capped so neighbouring containers (≈`spacing` apart) don't overlap.
-      container[p] = Math.min(0.46 * spacing, spacing * (0.12 + 0.045 * Math.sqrt(count)));
-    }
-    this.containerRadii = container;
-    this.bothDotRadii = null; // sized from these containers when the both view next resolves its style
-  }
-
-  /** The both view's state-dot radii for the current containers (#494), built on first use after a sizing:
-   *  O(state nodes). The rosette fills ROSETTE_FILL·R of a container with its `count` dots
-   *  ({@link rosettePositions}): each gets an equal share of that disc's area, and a dot of DOT_SHARE of its
-   *  share's radius keeps clear of its neighbours (the golden-angle spiral's nearest pair is ~1.8 share radii
-   *  apart) and inside the container. */
-  private bothDots(): Float32Array | null {
-    const sg = this.stateData;
-    const container = this.containerRadii;
-    if (!sg || !container) return null;
-    if (this.bothDotRadii) return this.bothDotRadii;
-    const { offsets, states } = sg.physicalToState;
-    const dots = new Float32Array(sg.state.nodeCount);
-    let dotMax = 0;
-    for (let p = 0; p < sg.physicalCount; p++) {
-      const count = offsets[p + 1]! - offsets[p]!;
-      const dot = (DOT_SHARE * ROSETTE_FILL * container[p]!) / Math.sqrt(Math.max(1, count));
-      for (let i = offsets[p]!; i < offsets[p + 1]!; i++) dots[states[i]!] = dot;
-      if (count > 0 && dot > dotMax) dotMax = dot;
-    }
-    this.bothDotRadii = dots;
-    this.bothDotMax = dotMax;
-    return dots;
+    const both = this.bothGraph;
+    if (!sg || !both) return null;
+    const spec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
+    const sizeMode = this.styleOpts.sizeMode ?? "world";
+    const kept = this.bothPack;
+    if (kept && kept.spec === spec && kept.sizeMode === sizeMode && this.containerRadii) return kept;
+    // Resolved as the state view resolves them: the same graph topology and flows, the same spec.
+    const nodeRadii = resolveNodeRadii(both, spec);
+    let max = 0;
+    for (const r of nodeRadii) if (r > max) max = r;
+    const padding = sizeMode === "screen" ? BOTH_PADDING_PX : BOTH_PADDING_SHARE * max;
+    const { offsets, radii } = packStateNodes(nodeRadii, sg.physicalToState, { padding });
+    this.containerRadii = radii;
+    return (this.bothPack = { spec, sizeMode, nodeRadii, offsets });
   }
 
   /**
-   * The both view's state-dot positions (#495): each state node at its place in its container ({@link bothPlaces}),
-   * which sits at its physical node. O(state nodes), in place, on a frame that moved the physical nodes (a layout
-   * frame, a container drag, a transition) in the both view. The containers are re-sized first when the layout's
-   * scale moved a step ({@link computeStateSizing}); only then does the style re-resolve, for the dots' radii.
+   * The both view's state-node positions (#495, #509), in place, on a frame that moved the physical nodes (a
+   * layout frame, a physical node drag, a transition) in the both view, and on a style change: O(state nodes),
+   * and no style re-resolve. In world mode each state node is at its physical node plus its packed offset (D4); in
+   * screen mode it is at its physical node, its anchor, and the GPU adds the offset in px.
    */
   private syncBoth(): void {
     const sg = this.stateData;
     const both = this.bothGraph;
-    const places = this.bothPlaces;
-    if (!sg || !both || !places) return;
-    const containers = this.containerRadii;
-    this.computeStateSizing();
-    const radii = this.containerRadii;
-    if (!radii) return;
-    if (radii !== containers && this.activeView === "both") this.resolvedCache = null; // the dots' radii follow the containers
+    const pack = this.ensureBothPack();
+    if (!sg || !both || !pack) return;
     const phys = sg.physical.positions;
     const pos = both.positions;
     const physicalOf = sg.stateToPhysical;
+    const off = pack.sizeMode === "world" ? pack.offsets : null;
     for (let s = 0; s < both.nodeCount; s++) {
       const p = physicalOf[s]!;
-      const r = radii[p]!;
-      pos[2 * s] = phys[2 * p]! + r * places[2 * s]!;
-      pos[2 * s + 1] = phys[2 * p + 1]! + r * places[2 * s + 1]!;
+      pos[2 * s] = phys[2 * p]! + (off ? off[2 * s]! : 0);
+      pos[2 * s + 1] = phys[2 * p + 1]! + (off ? off[2 * s + 1]! : 0);
     }
   }
 
@@ -1826,6 +1794,7 @@ export class Network extends BaseEngine {
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
     this.resolvedCache = null; // radii/colours/sizeMode changed
+    if (this.activeView === "both") this.syncBoth(); // #509: re-packed when the radii or the sizeMode changed
     this.stateFills = null; // a style() call is where a fill accessor's colours are captured again (#494)
     this.linkColors = null; // the link colour is captured once per style() call
     // Refresh the LOD tree's style geometry (radii/colours) only if a tree already exists. Don't
@@ -3176,7 +3145,8 @@ export class Network extends BaseEngine {
     return {
       name: this.CONTAINER_LAYER,
       primitive: "circles",
-      sizeMode: "world", // world-sized so state nodes stay inside their container at every zoom
+      // In the state nodes' units (#509): screen-sized physical nodes keep their px size at every zoom.
+      sizeMode: this.bothPack?.sizeMode ?? "world",
       circles: { centers: sg.physical.positions, radii, colors, borders, borderColors, bordersPx: true, groups, selected: this.noLodSelectedFor(this.CONTAINER_LAYER), count: n },
     };
   }
@@ -3303,11 +3273,9 @@ export class Network extends BaseEngine {
   }
 
   /** The largest leaf radius of `style` (resolved from the current style options), in its `sizeMode`'s
-   *  units. A constant `nodeRadius` is its own maximum: O(1). That covers the one style re-resolved on every
-   *  streamed frame, a state network's `both` view, whose dot radii track the layout scale, keeps their
-   *  maximum ({@link computeStateSizing}). Other per-node radii are scanned once per resolved style, O(nodes). */
+   *  units. A constant `nodeRadius` is its own maximum: O(1). Other per-node radii are scanned once per resolved
+   *  style, O(nodes). */
   private maxLeafRadius(style: ResolvedNetworkStyle): number {
-    if (this.bothDotRadii && style.nodeRadii === this.bothDotRadii) return this.bothDotMax; // O(1): sized with the dots
     const spec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
     if (typeof spec === "number") return Math.max(0, spec);
     let r = this.fitRadii.get(style);
@@ -4474,16 +4442,17 @@ export class Network extends BaseEngine {
     return leaves.filter((s) => !carried.has(sg.stateToPhysical[s]!));
   }
 
-  /** Move both-view state dots to `start + (dx, dy)`, kept inside their container's disc less their own radius,
-   *  and keep each there as its place in its container (#495): O(dots). The bound is a share of the container's
-   *  radius that does not change when the containers re-size (a dot's radius follows its container's). */
+  /** Move both-view state nodes to `start + (dx, dy)`, kept inside their physical node less their own radius, and
+   *  keep each there as its offset in the packing (#495): O(state nodes moved). World mode only for now: in screen
+   *  mode the offsets are px columns on the GPU, which a drag must replace, not mutate (#509). */
   private placeDots(ids: Uint32Array, start: Float32Array, dx: number, dy: number): void {
     const sg = this.stateData;
     const pos = this.bothGraph?.positions;
-    const places = this.bothPlaces;
+    const pack = this.bothPack;
     const radii = this.containerRadii;
-    const dots = this.bothDots();
-    if (!sg || !pos || !places || !radii || !dots) return;
+    if (!sg || !pos || !pack || !radii || pack.sizeMode !== "world") return;
+    const places = pack.offsets;
+    const dots = pack.nodeRadii;
     const phys = sg.physical.positions;
     for (let k = 0; k < ids.length; k++) {
       const s = ids[k]!;
@@ -4499,8 +4468,8 @@ export class Network extends BaseEngine {
       }
       pos[2 * s] = phys[2 * p]! + ox;
       pos[2 * s + 1] = phys[2 * p + 1]! + oy;
-      places[2 * s] = ox / r;
-      places[2 * s + 1] = oy / r;
+      places[2 * s] = ox;
+      places[2 * s + 1] = oy;
     }
   }
 
@@ -5342,13 +5311,11 @@ export class Network extends BaseEngine {
     // constant-px render — including the non-linear tip/bend terms a naive per-size ÷k would distort
     // (the gap would grow with zoom). Refreshed on backend switch (here), at interaction-end
     // (setInteracting) and on demand (syncScreenGeometry).
-    // The links' own units (#494: the both view's px links over world-sized dots, whose radii then bake ×k too).
-    const linkMode = linkSizeModeOf(style);
+    const linkMode = style.sizeMode;
     const bake = halfArrow && linkMode === "screen" ? this.transform.k || 1 : 1;
     // The plain line-style arrowhead bakes the same way (its tip + node-boundary setback are px in
     // screen mode); baked geometry is world-coord, so the layer renders "world" and re-bakes on zoom-end.
     const arrowBake = !halfArrow && style.directed && linkMode === "screen" ? this.transform.k || 1 : 1;
-    const radiiWorld = linkRadiiWorld(style);
     this.registerLayer({
       name: "links",
       data: edgeIds,
@@ -5357,7 +5324,7 @@ export class Network extends BaseEngine {
       ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit || !drawLinks) return;
-        if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend, bake, radiiWorld ? bake : 1);
+        if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend, bake);
         else emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
     });
@@ -5369,7 +5336,7 @@ export class Network extends BaseEngine {
       sizeMode: arrowBake !== 1 ? "world" : linkMode,
       fill: (e) => linkColorAt(e as number),
       build: (g) => {
-        if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake, radiiWorld ? arrowBake : 1);
+        if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
       },
     });
     // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the
@@ -5619,8 +5586,8 @@ export class Network extends BaseEngine {
     // nodeFill: a single colour, a per-node accessor, { by, scale } or { by: "module" } → packed RGBA (+ how
     // aggregates fill). In a state network, per level and kept across radius-only re-resolutions (#494).
     const { nodeFill, nodeColors, fillAggregate: nodeFillAggregate, modulePalette: nodeModulePalette } = this.resolvedFill(graph);
-    // The both view draws its state dots at the engine's world-unit radii, sized to their containers (#494).
-    const bothDots = this.stateData && this.activeView === "both" && graph === this.bothGraph ? this.bothDots() : null;
+    // The both view draws its state nodes at the state view's radii, packed inside their physical nodes (#509).
+    const pack = this.stateData && this.activeView === "both" && graph === this.bothGraph ? this.ensureBothPack() : null;
     // Constant border (px). flowBorder wins if both are set.
     const nb = this.styleOpts.nodeBorder;
     const constBorder: ConstBorder | null =
@@ -5628,8 +5595,8 @@ export class Network extends BaseEngine {
     const nodeRadiusSpec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
     const appSizeMode = this.styleOpts.sizeMode ?? "world";
     return {
-      nodeRadii: bothDots ?? resolveNodeRadii(graph, nodeRadiusSpec),
-      nodeRadiusAggregate: bothDots ? null : resolveNodeRadiusAggregate(graph, nodeRadiusSpec),
+      nodeRadii: pack ? pack.nodeRadii : resolveNodeRadii(graph, nodeRadiusSpec),
+      nodeRadiusAggregate: pack ? null : resolveNodeRadiusAggregate(graph, nodeRadiusSpec),
       importance: resolveImportance(graph, this.styleOpts.importance, nodeRadiusSpec),
       nodeFill,
       nodeColors,
@@ -5646,10 +5613,9 @@ export class Network extends BaseEngine {
       // visible for thin links (sublinear) without ballooning for thick ones.
       arrowSize: this.styleOpts.arrowSize ?? 5 * Math.cbrt(linkWidth),
       directed: this.styleOpts.directed ?? graph.directed,
-      // The both view's nodes are a world-unit picture (dots confined to world-sized containers), whatever the
-      // app's sizeMode; its links and arrowheads keep the app's sizeMode (#494), px-wide over world-sized dots.
-      sizeMode: bothDots ? "world" : appSizeMode,
-      ...(bothDots && appSizeMode !== "world" ? { linkSizeMode: appSizeMode } : {}),
+      sizeMode: appSizeMode,
+      // Screen mode draws each state node at its anchor plus its px offset on the GPU (#509); world mode bakes it.
+      ...(pack && pack.sizeMode === "screen" ? { nodeOffsets: pack.offsets } : {}),
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
       constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,

@@ -9,8 +9,8 @@ import type { ModulePathNode } from "../module-colors.js";
  * of the internal `scaleToViewport` position-remap. This guards the two things that could regress:
  *   1. framing — the rendered (derived rosette / physical) positions must open INSIDE the viewport, not
  *      piled at the origin and not over-zoomed to "all white" (an over-zoom maps ~0% on-screen);
- *   2. sizing — container/rosette radii are scale-relative (computeStateSizing sizes against
- *      physicalSpacing), so leaving positions in force scale must still yield finite, sane radii.
+ *   2. sizing — the both view's physical node radii enclose their packed state nodes (#509), in size units,
+ *      whatever scale the layout leaves the positions at: finite, and at least a state node's radius.
  * Runs on the GPU backend (the streaming path); asserts across the physical / state / both views.
  */
 
@@ -50,7 +50,6 @@ const internals = (net: unknown) =>
     transform: { k: number; x: number; y: number };
     graph: { positions: Float32Array; nodeCount: number } | null;
     containerRadii: Float32Array | null;
-    stateSpacing: number;
   };
 
 describe("state-network fit", () => {
@@ -80,14 +79,13 @@ describe("state-network fit", () => {
       }
       expect(onScreen / n).toBeGreaterThan(0.9);
 
-      // Sizing stays scale-relative + sane: container radii finite, positive, and a sensible fraction of
-      // the physical spacing (computeStateSizing caps them at 0.46·spacing), never NaN/0/absurd.
+      // Sizing is sane: each physical node's radius is finite and encloses at least one state node of radius 6.
       const radii = ns.containerRadii;
       if (radii && radii.length > 0) {
         for (const r of radii) {
           expect(Number.isFinite(r)).toBe(true);
           expect(r).toBeGreaterThan(0);
-          expect(r).toBeLessThanOrEqual(0.46 * ns.stateSpacing + 1e-3);
+          expect(r).toBeGreaterThanOrEqual(6);
         }
       }
       net.destroy();

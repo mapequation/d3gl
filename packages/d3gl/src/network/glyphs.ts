@@ -2512,11 +2512,12 @@ export interface ResolvedNetworkStyle {
    */
   sizeMode: "world" | "screen";
   /**
-   * The links' and arrowheads' units when they differ from {@link sizeMode} (#494): a state network's both
-   * view draws its nodes in world units (dots inside world-sized containers) and its links in the app's
-   * own sizeMode. Absent: {@link sizeMode}. See {@link linkSizeModeOf}.
+   * Each node's offset from its position, interleaved `[dx, dy, …]` in size units (#509): a state network's
+   * both view in screen mode draws each state node at its physical node (the graph's positions) plus its place
+   * in the packing, in px, so a zoom moves nothing on the CPU. Links and arrowheads take their nodes' offsets at
+   * both ends. Absent everywhere else (world mode bakes the offsets into the positions).
    */
-  linkSizeMode?: "world" | "screen";
+  nodeOffsets?: Float32Array;
   /** Optional per-node RGBA fill (categorical module colours, #104 rework); overrides `nodeFill` when set. */
   nodeColors?: Uint8Array;
   /** `nodeFill: { by, scale }` (#445): the per-leaf metric + scale that fill LOD aggregates by their summed metric. */
@@ -2566,9 +2567,9 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   const layers: InstancedLayer[] = [];
   const bend = style.linkBend;
   const halfArrow = style.linkStyle === "half-arrow" && style.directed;
-  const linkMode = linkSizeModeOf(style); // #494: px links over world nodes keep their own units
-  const radiiWorld = linkRadiiWorld(style) || undefined;
+  const sizeMode = style.sizeMode;
   if (drawsLinks(graph, style)) {
+    const ends = style.nodeOffsets ? edgeOffsets(graph, style.nodeOffsets) : null; // #509: the links' end offsets
     if (halfArrow) {
       // One fused filled glyph per directed link (the map-of-networks look): the arrowhead is part of
       // the shape, so there's no separate arrows layer. The WebGL lane honours sizeMode — in "screen"
@@ -2576,25 +2577,25 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       layers.push({
         name: "links",
         primitive: "half-arrows",
-        halfArrows: { ...halfArrowLinks(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }), radiiWorld },
-        sizeMode: linkMode,
+        halfArrows: { ...halfArrowLinks(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }), ...ends },
+        sizeMode,
       });
     } else {
       layers.push({
         name: "links",
         primitive: "lines",
-        lines: linkLines(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
-        sizeMode: linkMode,
+        lines: { ...linkLines(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }), ...ends },
+        sizeMode,
       });
       if (style.directed) {
         layers.push({
           name: "arrows",
           primitive: "arrows",
           // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
-          arrows: { ...linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }), radiiWorld },
+          arrows: { ...linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }), ...ends },
           // The arrowhead shader honours sizeMode in-shader (tip projected + set back in the working
           // space), so screen mode keeps a constant pixel head on the node boundary.
-          sizeMode: linkMode,
+          sizeMode,
         });
       }
     }
@@ -2602,13 +2603,16 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   layers.push({
     name: "nodes",
     primitive: "circles",
-    circles: nodeCircles(graph, {
-      radii: style.nodeRadii,
-      fill: style.nodeFill,
-      colors: style.nodeColors,
-      border: style.flowBorder,
-      constBorder: style.constBorder,
-    }),
+    circles: withNodeOffsets(
+      nodeCircles(graph, {
+        radii: style.nodeRadii,
+        fill: style.nodeFill,
+        colors: style.nodeColors,
+        border: style.flowBorder,
+        constBorder: style.constBorder,
+      }),
+      style.nodeOffsets,
+    ),
     sizeMode: style.sizeMode,
   });
   return layers;
@@ -2644,6 +2648,38 @@ export interface NoLodStyleCache {
   groupTarget?: Float32Array;
   /** `[0, 1, …, nodeCount-1]` — the `nodes` circles layer's `groups` (instance i is node i). */
   nodeGroups: Float32Array;
+  /** Each link's end offsets (#509), from the style's {@link ResolvedNetworkStyle.nodeOffsets}: built once per
+   *  style version, so the link layers hand the renderer the same arrays every frame. Absent without offsets. */
+  ends?: EdgeOffsets;
+}
+
+/** Each link's two end offsets (#509), interleaved `[dx, dy, …]` per link in size units: its source's and its
+ *  target's {@link ResolvedNetworkStyle.nodeOffsets}. */
+export interface EdgeOffsets {
+  sourceOffsets: Float32Array;
+  targetOffsets: Float32Array;
+}
+
+/** The end offsets of `graph`'s links from its nodes' `offsets` (#509): O(edges), once per style version. */
+export function edgeOffsets(graph: NetworkGraph, offsets: Float32Array): EdgeOffsets {
+  const m = graph.edgeCount;
+  const sourceOffsets = new Float32Array(2 * m);
+  const targetOffsets = new Float32Array(2 * m);
+  const { source, target } = graph;
+  for (let e = 0; e < m; e++) {
+    const s = 2 * source[e]!;
+    const t = 2 * target[e]!;
+    sourceOffsets[2 * e] = offsets[s]!;
+    sourceOffsets[2 * e + 1] = offsets[s + 1]!;
+    targetOffsets[2 * e] = offsets[t]!;
+    targetOffsets[2 * e + 1] = offsets[t + 1]!;
+  }
+  return { sourceOffsets, targetOffsets };
+}
+
+/** `circles` with the nodes' offsets attached (#509), or `circles` itself without any. */
+function withNodeOffsets(circles: InstancedCirclesData, offsets: Float32Array | undefined): InstancedCirclesData {
+  return offsets ? { ...circles, offsets } : circles;
 }
 
 /** Compute the {@link NoLodStyleCache} for the current resolved style (runs the scale accessors ONCE). */
@@ -2660,6 +2696,8 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   // #162/#214 highlight group columns — one O(edges + nodes) copy per (graph, style) version, not per frame.
   const groupSource = Float32Array.from(graph.source);
   const groupTarget = style.directed ? undefined : Float32Array.from(graph.target);
+  // The links' end offsets (#509): one O(edges) pass per style version, never per frame.
+  const ends = style.nodeOffsets ? edgeOffsets(graph, style.nodeOffsets) : undefined;
   if (halfArrow) {
     return {
       kind: "half-arrows",
@@ -2668,14 +2706,15 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
       groupSource,
       groupTarget,
       nodeGroups,
+      ends,
     };
   }
   const lines = linkLinesStyleAttrs(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend });
   if (style.directed) {
     const arrows = linkArrowsStyleAttrs(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 });
-    return { kind: "lines+arrows", sizeMode, lines, arrows, groupSource, groupTarget, nodeGroups };
+    return { kind: "lines+arrows", sizeMode, lines, arrows, groupSource, groupTarget, nodeGroups, ends };
   }
-  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups };
+  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups, ends };
 }
 
 /**
@@ -2685,47 +2724,37 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
  * centers alias `graph.positions`, colours/radii come from the cached `style`; only a border layer does
  * an O(node) position pass). Must be called with the SAME `style` version the cache was built from.
  */
-/** The units of `style`'s links and arrowheads ({@link ResolvedNetworkStyle.linkSizeMode}). */
-export function linkSizeModeOf(style: ResolvedNetworkStyle): "world" | "screen" {
-  return style.linkSizeMode ?? style.sizeMode;
-}
-
-/** Whether `style`'s links are px-sized over world-sized nodes (#494): their endpoint radii are world units
- *  on a screen layer, scaled to px by the zoom ({@link InstancedArrowsData.radiiWorld}). */
-export function linkRadiiWorld(style: ResolvedNetworkStyle): boolean {
-  return linkSizeModeOf(style) === "screen" && style.sizeMode === "world";
-}
-
 export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetworkStyle, cache: NoLodStyleCache): InstancedLayer[] {
   const layers: InstancedLayer[] = [];
   const sizeMode = style.sizeMode;
   if (drawsLinks(graph, style)) {
-    // Links keep their own units (#494: px links over the both view's world nodes), radii flagged to match.
-    const linkMode = linkSizeModeOf(style);
-    const radiiWorld = linkRadiiWorld(style) || undefined;
+    // The ends' offsets (#509), cached once per style version: the same arrays every frame, so never re-uploaded.
+    const ends = cache.ends;
     if (cache.kind === "half-arrows" && cache.halfArrows) {
       const halfArrows = halfArrowLinksFromCache(graph, cache.halfArrows);
-      if (radiiWorld) halfArrows.radiiWorld = true;
-      layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: linkMode });
+      layers.push({ name: "links", primitive: "half-arrows", halfArrows: ends ? { ...halfArrows, ...ends } : halfArrows, sizeMode });
     } else if (cache.lines) {
-      layers.push({ name: "links", primitive: "lines", lines: linkLinesFromCache(graph, cache.lines), sizeMode: linkMode });
+      const lines = linkLinesFromCache(graph, cache.lines);
+      layers.push({ name: "links", primitive: "lines", lines: ends ? { ...lines, ...ends } : lines, sizeMode });
       if (cache.arrows) {
         const arrows = linkArrowsFromCache(graph, cache.arrows);
-        if (radiiWorld) arrows.radiiWorld = true;
-        layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: linkMode });
+        layers.push({ name: "arrows", primitive: "arrows", arrows: ends ? { ...arrows, ...ends } : arrows, sizeMode });
       }
     }
   }
   layers.push({
     name: "nodes",
     primitive: "circles",
-    circles: nodeCircles(graph, {
-      radii: style.nodeRadii,
-      fill: style.nodeFill,
-      colors: style.nodeColors,
-      border: style.flowBorder,
-      constBorder: style.constBorder,
-    }),
+    circles: withNodeOffsets(
+      nodeCircles(graph, {
+        radii: style.nodeRadii,
+        fill: style.nodeFill,
+        colors: style.nodeColors,
+        border: style.flowBorder,
+        constBorder: style.constBorder,
+      }),
+      style.nodeOffsets,
+    ),
     sizeMode,
   });
   return layers;

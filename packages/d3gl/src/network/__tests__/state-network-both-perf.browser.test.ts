@@ -26,9 +26,9 @@ import { GlBufferSpy, perfHost, sweepFrames, zoomSteps, type GlBufferUsage } fro
  *     (the pre-existing no-LOD drag cost, #314) with the SAME container columns (colours, rings, groups) and
  *     the SAME `selected` flags — nothing O(physical) is rebuilt per move — and no colour accessor runs.
  *   - **streamed layout frame** (`scheduleLayoutRepaint`, what a worker/GPU layout calls per frame, with the
- *     physical positions spreading out as a converging layout does): the dot and container radii follow the
- *     scale, re-resolving the style's radii (the pre-existing per-frame restyle of this view), but the
- *     module colours are kept: zero colour-accessor calls per frame.
+ *     physical positions spreading out as a converging layout does): the state nodes' anchors are copied in
+ *     place, and nothing style-derived changes (#509: the radii are the app's spec, packed once per style), so
+ *     no style re-resolve and zero colour-accessor calls per frame.
  *
  * **Reductions:** the both view draws every container with its state nodes (LOD applies to the state view,
  * #495), so the "LOD on" state here is an app that asked for LOD while in this view — the Navigator's order.
@@ -38,8 +38,8 @@ import { GlBufferSpy, perfHost, sweepFrames, zoomSteps, type GlBufferUsage } fro
  * module's colour — a zoom sweep with that cut (reductions ON) and without it (OFF) asks the colour accessor
  * zero times, and over the whole run every module path is asked exactly once.
  *
- * The app's style is the Navigator's `sizeMode: "screen"`: the both view's nodes stay world-sized and its links
- * keep px widths (#494 review), so every both-view leg runs the px-link-over-world-node path.
+ * The app's style is the Navigator's `sizeMode: "screen"`: the both view draws its state nodes, physical nodes and
+ * links in px (#509), each state node at its physical node plus a px offset column.
  *
  * ONE ENGINE for every leg — never a second WebGL engine after a large one (#287).
  */
@@ -69,8 +69,8 @@ const SELECT_SLACK_BYTES = 16 * 1024;
 //   writes: 0.3 / 0.7 ms → 1.5 / 3.5 ms ceilings (~5x);
 // - a drag move re-emits the whole no-LOD lane (O(state nodes + links + containers), #314): 0.5 / 3.9 ms →
 //   6 / 22 ms (5.6x at 100k, where the linear term carries it);
-// - a streamed frame re-derives the rosette, re-sizes the radii, re-resolves the style's radii and re-emits the
-//   lane: 2.2 / 12.9 ms → 16 / 64 ms (~5-7x). A colour re-resolution per frame is the deterministic check's job.
+// - a streamed frame copies the state nodes' anchors and re-emits the lane (#509: no re-sizing, no style re-resolve
+//   since): 2.2 / 12.9 ms → 16 / 64 ms (~5-7x), calibrated before #509, which only removed work. A colour re-resolution per frame is the deterministic check's job.
 const HOVER_MS = perfBudget(1 + (0.5 * N) / 20_000);
 const DRAG_MOVE_MS = perfBudget(2 + (4 * N) / 20_000);
 const STREAM_FRAME_MS = perfBudget(4 + (12 * N) / 20_000);
@@ -269,7 +269,7 @@ beforeAll(async () => {
     const net = new StreamProbe(h, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
     net
-      // The Navigator's screen sizeMode: the both view's nodes stay world-sized, its links px-sized (#494 review).
+      // The Navigator's screen sizeMode: the both view's state and physical nodes are px-sized too (#509).
       .style({ nodeFill: { by: "module", color }, linkStroke: "rgba(90,110,150,0.5)", sizeMode: "screen" })
       .stateNetwork(fx.graph, { modules: fx.modules, view: "both" })
       .layout({ backend: "positions", positions: fx.positions });
@@ -484,7 +484,7 @@ beforeAll(async () => {
         const last = lane.containerEmits[lane.containerEmits.length - 1];
         if (radii && last && last.radii !== radii) radiiChanged = true;
         radii = last?.radii;
-        // A re-resolved style hands the dots a new radii column: count them (#495: on a sizing step only).
+        // A re-resolved style hands the state nodes a new radii column: count them (#509: never on a streamed frame).
         const dots = lane.nodeEmits[lane.nodeEmits.length - 1];
         if (dotRadii && dots && dots.radii !== dotRadii) restyles++;
         dotRadii = dots?.radii;
@@ -763,14 +763,14 @@ describe(`state-network both view — per-interaction cost at N=${N.toLocaleStri
     expect(dotDrag.medianMs, `dot drag move median ${dotDrag.medianMs.toFixed(2)}ms (worst ${dotDrag.worstMs.toFixed(2)}ms)`).toBeLessThan(DRAG_MOVE_MS);
   });
 
-  it("streamed layout frame: radii follow the scale, the module colours are kept (no accessor per frame)", () => {
+  it("streamed layout frame: no style re-resolve, the radii and module colours are kept (no accessor per frame)", () => {
     expect(streamOff.containerEmits, "the stream did not repaint once per frame").toBeGreaterThanOrEqual(streamOff.frames);
-    expect(streamOff.radiiChanged, "the radii did not follow the spreading layout — the leg is vacuous").toBe(true);
+    // #509: the radii are the app's spec, packed once per style: the layout spreading 13% changes none of them.
+    expect(streamOff.radiiChanged, "a streamed frame re-sized the physical nodes").toBe(false);
     expect(streamOff.colorCalls, "a streamed frame resolved the module colours again").toBe(0);
-    // #495: the dots' positions are derived in place, and the style re-resolves only when the layout's scale moved a
-    // sizing step (~9%: the leg spreads the layout 2% a frame, 13% in all) — the replaced path re-resolved every frame.
-    expect(streamOff.sameCenters, "a streamed frame reallocated the dots' positions").toBe(true);
-    expect(streamOff.restyles, `${streamOff.restyles} style re-resolutions over ${streamOff.frames} streamed frames`).toBeLessThanOrEqual(2);
+    // The state nodes' anchors are copied in place, and the style never re-resolves on a streamed frame.
+    expect(streamOff.sameCenters, "a streamed frame reallocated the state nodes' positions").toBe(true);
+    expect(streamOff.restyles, `${streamOff.restyles} style re-resolutions over ${streamOff.frames} streamed frames`).toBe(0);
     expect(streamOff.medianMs, `stream frame median ${streamOff.medianMs.toFixed(2)}ms (worst ${streamOff.worstMs.toFixed(2)}ms)`).toBeLessThan(STREAM_FRAME_MS);
   });
 

@@ -1,0 +1,203 @@
+import { describe, it, expect, afterEach } from "vitest";
+import { Network } from "../network.js";
+import { buildStateGraph } from "../state-graph.js";
+import type { NodeRadiusSpec } from "../glyphs.js";
+import { WebGLBackend } from "../../webgl/webgl-backend.js";
+import { offsetColumnStats } from "../../webgl/instanced.js";
+import type { InstancedLayer, InstancedCirclesData, ViewTransform } from "../../core/index.js";
+
+/**
+ * The state network's both view sizes its state nodes as the state view does (#509): the app's `nodeRadius` spec
+ * in the app's `sizeMode`, each packed inside its physical node, which is drawn at the packing's radius in the same
+ * units. In screen mode each state node is drawn at its physical node (the anchor) plus a px offset column, so a
+ * zoom frame re-emits nothing and uploads no offset bytes.
+ *
+ * Small N, WebGL lane: the emitted layers are read where they reach the backend.
+ */
+
+const W = 400;
+const H = 300;
+const hosts: HTMLElement[] = [];
+afterEach(() => {
+  for (const h of hosts) h.remove();
+  hosts.length = 0;
+});
+
+/** 5 physical nodes holding 1, 2, 3, 5 and 1 state nodes; directed state links (lines + arrows), unequal flows. */
+function fixture() {
+  const stateToPhysical = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 4];
+  const n = stateToPhysical.length;
+  const source: number[] = [];
+  const target: number[] = [];
+  for (let s = 0; s + 1 < n; s++) {
+    source.push(s);
+    target.push(s + 1);
+  }
+  source.push(7, 3, 10);
+  target.push(2, 9, 0);
+  const nodeFlow = Array.from({ length: n }, (_, s) => (s + 1) / ((n * (n + 1)) / 2));
+  const graph = buildStateGraph({ stateCount: n, stateToPhysical, source, target, nodeFlow, directed: true });
+  const positions = new Float32Array([0, 0, 100, 0, 200, 0, 0, 100, 100, 100]);
+  return { graph, positions };
+}
+
+/** The last layer of each name the WebGL backend was handed, and how many emits reached it. */
+class LayerSpy {
+  readonly last = new Map<string, InstancedLayer>();
+  emits = 0;
+  private readonly origSet = WebGLBackend.prototype.setInstancedLayer;
+  private readonly origUpdate = WebGLBackend.prototype.updateInstancedLayer;
+  constructor() {
+    const { origSet, origUpdate } = this;
+    const record = (layer: InstancedLayer): void => {
+      this.last.set(layer.name, layer);
+      this.emits++;
+    };
+    WebGLBackend.prototype.setInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+      record(layer);
+      origSet.call(this, layer);
+    };
+    WebGLBackend.prototype.updateInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+      record(layer);
+      origUpdate.call(this, layer);
+    };
+  }
+  circles(name: string): InstancedCirclesData {
+    const layer = this.last.get(name);
+    if (!layer || layer.primitive !== "circles") throw new Error(`no circles layer "${name}"`);
+    return layer.circles;
+  }
+  sizeMode(name: string): "world" | "screen" | undefined {
+    return this.last.get(name)?.sizeMode;
+  }
+  restore(): void {
+    WebGLBackend.prototype.setInstancedLayer = this.origSet;
+    WebGLBackend.prototype.updateInstancedLayer = this.origUpdate;
+  }
+}
+
+function zoomAbout(k: number): ViewTransform {
+  return { k, x: (W / 2) * (1 - k), y: (H / 2) * (1 - k) };
+}
+
+const SPECS: { name: string; spec: NodeRadiusSpec }[] = [
+  { name: "constant", spec: 5 },
+  { name: "by flow", spec: { by: "flow", scale: (v: number) => 3 + 120 * v } },
+];
+const MODES = ["world", "screen"] as const;
+
+describe("state network both view: state nodes at the state view's size, inside their physical nodes (#509)", () => {
+  for (const sizeMode of MODES) {
+    for (const { name, spec } of SPECS) {
+      it(`${sizeMode} mode, nodeRadius ${name}`, async () => {
+        const host = document.createElement("div");
+        host.style.width = `${W}px`;
+        host.style.height = `${H}px`;
+        document.body.appendChild(host);
+        hosts.push(host);
+        const spy = new LayerSpy();
+        try {
+          const net = new Network(host, { width: W, height: H, backend: "webgl" });
+          await net.whenReady();
+          const { graph, positions } = fixture();
+          net.style({ nodeRadius: spec, sizeMode }).stateNetwork(graph, { view: "state" });
+          net.render();
+          const stateRadii = Float32Array.from(spy.circles("nodes").radii);
+          expect(spy.sizeMode("nodes")).toBe(sizeMode);
+
+          net.view("both").layout({ backend: "positions", positions });
+          net.setTransform(zoomAbout(1));
+          net.render();
+          const nodes = spy.circles("nodes");
+          const phys = spy.circles("phys-container");
+          expect(spy.sizeMode("nodes"), "the both view's state nodes take the app's sizeMode").toBe(sizeMode);
+          expect(spy.sizeMode("phys-container"), "the physical nodes take the state nodes' units").toBe(sizeMode);
+          // The drawn radius of each state node is the state view's, for the same node.
+          expect(Array.from(nodes.radii)).toEqual(Array.from(stateRadii));
+
+          // D4: offset columns only in screen mode, on the state nodes and both ends of every link.
+          const links = spy.last.get("links");
+          const arrows = spy.last.get("arrows");
+          const lineEnds = links?.primitive === "lines" ? links.lines : null;
+          const arrowEnds = arrows?.primitive === "arrows" ? arrows.arrows : null;
+          if (sizeMode === "screen") {
+            expect(nodes.offsets?.length).toBe(2 * graph.state.nodeCount);
+            expect(lineEnds?.sourceOffsets?.length).toBe(2 * graph.state.edgeCount);
+            expect(lineEnds?.targetOffsets?.length).toBe(2 * graph.state.edgeCount);
+            expect(arrowEnds?.sourceOffsets?.length).toBe(2 * graph.state.edgeCount);
+            expect(arrowEnds?.targetOffsets?.length).toBe(2 * graph.state.edgeCount);
+          } else {
+            expect(nodes.offsets).toBeUndefined();
+            expect(lineEnds?.sourceOffsets).toBeUndefined();
+            expect(arrowEnds?.targetOffsets).toBeUndefined();
+          }
+
+          // Each state node's position: its physical node (the anchor) in screen mode, plus its offset in world mode.
+          const s2p = graph.stateToPhysical;
+          let baked = 0;
+          for (let s = 0; s < graph.state.nodeCount; s++) {
+            const p = s2p[s] ?? 0;
+            const d = Math.hypot((nodes.centers[2 * s] ?? 0) - (phys.centers[2 * p] ?? 0), (nodes.centers[2 * s + 1] ?? 0) - (phys.centers[2 * p + 1] ?? 0));
+            if (d > 1e-3) baked++;
+          }
+          if (sizeMode === "screen") expect(baked, "a screen-mode state node is not at its anchor").toBe(0);
+          else expect(baked, "no world-mode state node is offset from its physical node").toBeGreaterThan(0);
+
+          // Every state node lies inside its physical node, as drawn in px, at two zooms.
+          for (const k of [0.5, 3]) {
+            net.setTransform(zoomAbout(k));
+            net.render();
+            const n = spy.circles("nodes");
+            const c = spy.circles("phys-container");
+            const scale = sizeMode === "screen" ? 1 : k; // size units → px
+            for (let s = 0; s < graph.state.nodeCount; s++) {
+              const p = s2p[s] ?? 0;
+              const dx = k * ((n.centers[2 * s] ?? 0) - (c.centers[2 * p] ?? 0)) + scale * (n.offsets?.[2 * s] ?? 0);
+              const dy = k * ((n.centers[2 * s + 1] ?? 0) - (c.centers[2 * p + 1] ?? 0)) + scale * (n.offsets?.[2 * s + 1] ?? 0);
+              const reach = Math.hypot(dx, dy) + scale * (n.radii[s] ?? 0);
+              expect(reach, `state node ${s} reaches past its physical node ${p} at k=${k}`).toBeLessThanOrEqual(scale * (c.radii[p] ?? 0) + 1e-3);
+            }
+          }
+          // Packed: the physical node of five state nodes encloses more than its largest state node.
+          expect(phys.radii[3] ?? 0).toBeGreaterThan(Math.max(...Array.from(nodes.radii.subarray(6, 11))));
+          net.destroy();
+        } finally {
+          spy.restore();
+        }
+      });
+    }
+  }
+
+  it("screen mode: a zoom sweep emits nothing and uploads no offset bytes; the offset columns are kept", async () => {
+    const host = document.createElement("div");
+    host.style.width = `${W}px`;
+    host.style.height = `${H}px`;
+    document.body.appendChild(host);
+    hosts.push(host);
+    const spy = new LayerSpy();
+    try {
+      const net = new Network(host, { width: W, height: H, backend: "webgl" });
+      await net.whenReady();
+      const { graph, positions } = fixture();
+      net.style({ nodeRadius: { by: "flow", scale: (v: number) => 3 + 120 * v }, sizeMode: "screen" }).stateNetwork(graph, { view: "both" });
+      net.layout({ backend: "positions", positions });
+      net.setTransform(zoomAbout(1));
+      net.render();
+      const offsets = spy.circles("nodes").offsets;
+      expect(offsets, "no offset column: the sweep would be vacuous").toBeDefined();
+      const before = { ...offsetColumnStats };
+      const emitsBefore = spy.emits;
+      for (const k of [0.25, 0.5, 1, 2, 4, 8, 16]) {
+        net.setTransform(zoomAbout(k));
+        net.render();
+      }
+      expect(spy.emits - emitsBefore, "a zoom frame re-emitted a layer").toBe(0);
+      expect(offsetColumnStats.bytes - before.bytes, "a zoom frame uploaded offset bytes").toBe(0);
+      expect(offsetColumnStats.buffers - before.buffers).toBe(0);
+      expect(spy.circles("nodes").offsets).toBe(offsets);
+      net.destroy();
+    } finally {
+      spy.restore();
+    }
+  });
+});

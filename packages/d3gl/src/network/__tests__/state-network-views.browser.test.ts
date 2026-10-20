@@ -332,16 +332,12 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     ev("pointerup", x + 20, y + 12);
     expect(graph.physical.positions[2]! - p0[0]!).toBeCloseTo(20, 3);
     expect(graph.physical.positions[3]! - p0[1]!).toBeCloseTo(12, 3);
-    // Each state dot keeps its place in its container (#495): the same direction from the container's centre, at
-    // the same share of its radius — the container may have re-sized as the layout's scale moved a step.
+    // Each state node keeps its offset from its physical node (#495, #509: the packing does not follow the layout).
     for (const [k, s] of [2, 4].entries()) {
       const [sx, sy] = statePos(net, s);
       const before = [s0[k]![0] - p0[0]!, s0[k]![1] - p0[1]!];
       const after = [sx - graph.physical.positions[2]!, sy - graph.physical.positions[3]!];
-      const f = Math.hypot(after[0]!, after[1]!) / Math.hypot(before[0]!, before[1]!);
-      expect(f, `state ${s} did not follow its container`).toBeGreaterThan(0.8);
-      expect(f).toBeLessThan(1.25);
-      expect(Math.abs(after[0]! * before[1]! - after[1]! * before[0]!) / Math.hypot(before[0]!, before[1]!) ** 2, "it turned").toBeLessThan(1e-3);
+      expect(Math.hypot(after[0]! - before[0]!, after[1]! - before[1]!), `state ${s} did not follow its physical node`).toBeLessThan(1e-3);
     }
     expect(statePos(net, 3), "another physical node's state moved").toEqual(other);
     // The container is drawn where its physical node went.
@@ -525,23 +521,21 @@ const isLink = (c: readonly number[]): boolean => (c[1] ?? 0) > 120 && (c[0] ?? 
 /** A view at zoom `k` that keeps world point (100, 100), the link's middle, at the canvas centre. */
 const centred = (k: number) => ({ k, x: W / 2 - 100 * k, y: H / 2 - 100 * k });
 
-describe("the both view draws its links in the app's sizeMode (#494 review, 1)", () => {
+describe("the both view draws its links in the app's sizeMode (#494 review, 1; #509)", () => {
   for (const linkStyle of ["line", "half-arrow"] as const) {
-    it(`${linkStyle}: px-wide links and a tip on the dot's boundary at two zoom levels (sizeMode "screen")`, async () => {
+    it(`${linkStyle}: px-wide links and a tip on the px-sized state node's boundary at two zoom levels (sizeMode "screen")`, async () => {
       const { graph, positions } = pairFixture();
       const net = await engine(host());
       // Transparent dots, so the tip the dot would cover stays visible.
       net
-        .style({ sizeMode: "screen", linkStyle, linkWidth: 6, arrowSize: 6, linkStroke: `rgb(${LINK_RGB.join(",")})`, directed: true, nodeFill: "rgba(0,0,0,0)" })
+        .style({ sizeMode: "screen", nodeRadius: 8, linkStyle, linkWidth: 6, arrowSize: 6, linkStroke: `rgb(${LINK_RGB.join(",")})`, directed: true, nodeFill: "rgba(0,0,0,0)" })
         .stateNetwork(graph, { view: "both" });
       net.layout({ backend: "positions", positions });
-      // The target dot's world radius, from the export (the both view's dots are world-sized).
+      // The target state node: alone in its physical node, so at its centre, and 8 px in radius at every zoom (#509).
       const [tx, ty] = statePos(net, 1);
-      const dot = circlesOf(net.toSVG()).find((c) => !c.stroked && Math.abs(c.cx - tx) < 0.01 && Math.abs(c.cy - ty) < 0.01);
-      expect(dot, "no state dot drawn at the link's target").toBeDefined();
-      const r = dot?.r ?? 0;
-      expect(r, "the dot is too small for the setback to tell the units apart").toBeGreaterThan(3);
-      for (const k of [0.5, 2]) {
+      const r = 8;
+      // k = 1.5, not 2: the 8 px tip of the target at world x = 160 must stay on the 200 px canvas.
+      for (const k of [0.5, 1.5]) {
         const t = centred(k);
         net.setTransform(t);
         const img = await frame(net);
@@ -551,14 +545,14 @@ describe("the both view draws its links in the app's sizeMode (#494 review, 1)",
           for (let y = 0; y < H; y++) if (isLink(rgbaAt(img, W / 2, y))) rows++;
           expect(Math.abs(rows - 6), `k=${k}: link drawn ${rows} px wide, the app asked for 6 px`).toBeLessThanOrEqual(1.5);
         }
-        // Tip: the rightmost link pixel on the target's row sits on the dot's boundary, r·k px short of its centre.
+        // Tip: the rightmost link pixel on the target's row sits on the state node's boundary, r px short of its centre.
         const cx = tx * k + t.x;
         const cy = Math.round(ty * k + t.y);
         // The tip is a sharp point (a line also runs on to the transparent dot's centre), so it is read off the
         // head's slanted edge, clear of the line's band: on a row d px off the centre line the edge is at
         // tip − slope·d (a line's head: 2·size long, ±size wide; a half-arrow's: tipLength long, width + 2√width
         // wide), so each such row estimates the tip; their median is the drawn tip.
-        const head = linkStyle === "line" ? { slope: 2, rows: [4, 5] } : { slope: Math.min((120 * k - 2 * r * k) / 3, 10 * Math.cbrt(6)) / (6 + 2 * Math.sqrt(6)), rows: [6, 7, 8] };
+        const head = linkStyle === "line" ? { slope: 2, rows: [4, 5] } : { slope: Math.min((120 * k - 2 * r) / 3, 10 * Math.cbrt(6)) / (6 + 2 * Math.sqrt(6)), rows: [6, 7, 8] };
         const estimates: number[] = [];
         for (const d of head.rows) {
           for (const y of [cy - d, cy + d]) {
@@ -569,8 +563,8 @@ describe("the both view draws its links in the app's sizeMode (#494 review, 1)",
         }
         estimates.sort((a, b) => a - b);
         const tip = estimates[Math.floor(estimates.length / 2)] ?? NaN;
-        // Within 2 px (anti-aliasing reads the edge a little short); a setback in the wrong units is off by r·|k − 1| ≥ 3 px.
-        expect(Math.abs(tip - (cx - r * k)), `k=${k}: tip at ${tip.toFixed(1)} (${estimates.map((e) => e.toFixed(1)).join(" ")}), the boundary at ${(cx - r * k).toFixed(1)}`).toBeLessThanOrEqual(2);
+        // Within 2 px (anti-aliasing reads the edge a little short); a setback in the wrong units is off by r·|k − 1| ≥ 4 px.
+        expect(Math.abs(tip - (cx - r)), `k=${k}: tip at ${tip.toFixed(1)} (${estimates.map((e) => e.toFixed(1)).join(" ")}), the boundary at ${(cx - r).toFixed(1)}`).toBeLessThanOrEqual(2);
       }
       net.destroy();
     });
