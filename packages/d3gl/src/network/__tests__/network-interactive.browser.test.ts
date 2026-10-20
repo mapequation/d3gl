@@ -290,6 +290,27 @@ describe("network interactive lane (#105 N7c-2)", () => {
     expect(net.selection()).toEqual([]); // pick-only again
     net.destroy();
   });
+
+  // Canvas/SVG register no instanced lane, so neither the click listeners nor the `selectable` option reach the node
+  // layer through one: `interactive()` must attach the listeners and hand the option to the Scene's node layer, or a
+  // click there selects nothing.
+  for (const backend of ["canvas", "svg"] as const) {
+    it(`${backend}: interactive({ selectable }) alone makes a click select a node (#509)`, async () => {
+      const h = host();
+      const net = network(h, { width: 200, height: 200, backend });
+      await net.whenReady();
+      const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+      net.data(g).style({ nodeRadius: 8 }).layout({ backend: "positions", positions: new Float32Array([40, 40, 100, 100, 160, 60]) });
+      net.interactive({ selectable: true });
+      const r = h.getBoundingClientRect();
+      const at = { clientX: r.left + 100, clientY: r.top + 100, bubbles: true, button: 0, pointerId: 1 };
+      h.dispatchEvent(new PointerEvent("pointerdown", at));
+      h.dispatchEvent(new PointerEvent("pointerup", at));
+      expect(net.selection().map((s) => s.id)).toEqual([1]);
+      net.destroy();
+      h.remove();
+    });
+  }
 });
 
 // #162: shader-driven selection.others dim + outgoing-link emphasis on the instanced node lane. The

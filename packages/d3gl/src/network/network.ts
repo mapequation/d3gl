@@ -1,4 +1,4 @@
-import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
+import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type LayerSpec, type NodeDragSession } from "../map/base-engine.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
@@ -2027,10 +2027,12 @@ export class Network extends BaseEngine {
       this.invalidateNoLodSelected(); // #240: bypasses onLaneSelectionChanged, so drop the flag cache here
     }
     this.syncLane(); // re-register the lane with the interactive block + companion highlight lane
-    // A node-drag starts on pointerdown. On WebGL the lane attaches the listeners; Canvas/SVG register no lane, so
-    // `draggable` attaches them here (idempotent), or a drag there never starts (#509).
-    if (this.interactiveOpts?.draggable) this.attachSelectPointer();
-    this.render();
+    // A click selects and a node-drag starts on pointerdown/up. On WebGL the lane attaches the listeners; Canvas/SVG
+    // register no lane, so attach them here by the lane's rule (idempotent), or neither works there (#509).
+    if (this.interactiveOpts?.selectable || this.interactiveOpts?.draggable) this.attachSelectPointer();
+    // Canvas/SVG: re-register the Scene, whose node layer carries the selection options (`sceneNodeSelection`).
+    if (this.sceneActive) this.rebuild();
+    else this.render();
     return this;
   }
 
@@ -5551,6 +5553,7 @@ export class Network extends BaseEngine {
       data: nodeIds,
       ids: nodeIds,
       sizeMode: style.sizeMode,
+      ...this.sceneNodeSelection(),
       fill: (i) => fillOf(i as number),
       stroke: (i) => borderColorAt(i as number),
       build: (g) => {
@@ -5713,12 +5716,20 @@ export class Network extends BaseEngine {
       data: circleIds,
       ids: circleIds,
       sizeMode: style.sizeMode,
+      ...this.sceneNodeSelection(),
       fill: (_d, i) => (circles ? rgbaCss(circles.colors, i) : ""),
       stroke: (_d, i) => (circles?.borderColors ? rgbaCss(circles.borderColors, i) : ""),
       build: (g) => {
         if (circles) traceFrontierGlyphs(g, circles, frontier);
       },
     });
+  }
+
+  /** The `interactive()` selection options for the Canvas/SVG Scene's node layer, where no lane carries them: a
+   *  click selects there, and a selection dims the others as on WebGL (#509). */
+  private sceneNodeSelection(): Partial<Pick<LayerSpec, "selectable" | "selection">> {
+    const opts = this.interactiveOpts;
+    return opts ? { selectable: opts.selectable, selection: opts.selection } : {};
   }
 
   /** Resolved style, memoised until style()/data() invalidates it (radii resolution is O(n)). */
