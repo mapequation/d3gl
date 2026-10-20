@@ -804,8 +804,9 @@ const NO_INSTANCES: [number, number] = [0, 0];
  *  px: twice the physical node's {@link CONTAINER_RING_PX} ring, so the state nodes clear it. To be settled by
  *  visual review (T2). */
 const BOTH_PADDING_PX = 2;
-/** The same padding in world mode (#509), as a share of the largest state node's radius (T2). */
-const BOTH_PADDING_SHARE = 0.25;
+/** The padding in world mode (#509, D5), as a share of the physical node's radius: applied after its state nodes
+ *  are scaled to fit, so the gap is the same share of every physical node whatever its state nodes' sizes (T2). */
+const BOTH_PADDING_SHARE = 0.1;
 /** Darkening of a `both`-view container's ring: a darker shade of its own fill, as module glyphs are ringed (#495). */
 const CONTAINER_RING_DARKEN = 0.62;
 /** A `both`-view container ring's width in screen px at every zoom (#495), as thin as a module boundary ring. */
@@ -864,8 +865,6 @@ function warmLayout(opts: NetworkLayoutOptions): NetworkLayoutOptions {
   return { ...opts, warm: true };
 }
 
-/** The both view's packing (#509) for one `nodeRadius` spec and `sizeMode`: each state node's radius as the state
- *  view resolves it, its offset from its physical node and each physical node's radius, all in size units. */
 /** What a screen-mode drag of both-view state nodes rewrites in place (#509): the held state nodes' instance runs,
  *  the ids of their links, and those links' runs ({@link instanceRuns}). */
 interface DotDragColumns {
@@ -874,10 +873,17 @@ interface DotDragColumns {
   readonly linkRuns: Uint32Array;
 }
 
+/** The both view's packing (#509) for one `nodeRadius` spec and `sizeMode`: each state node's drawn radius, its
+ *  offset from its physical node (its physical node's radius is {@link NetworkChart.containerRadii}), all in size
+ *  units. Screen mode draws the state nodes at the state view's radii; world mode scales each physical node's state
+ *  nodes to fit the radius the physical view draws it at (D5). */
 interface BothPack {
   /** The spec the radii were resolved from: a new but equal spec keeps the packing (and its dragged state nodes). */
   spec: NodeRadiusSpec;
   readonly sizeMode: "world" | "screen";
+  /** Each state node's radius as the state view resolves it: what an equal `style()` is compared against. */
+  readonly resolvedRadii: Float32Array;
+  /** Each state node's drawn radius: `resolvedRadii` in screen mode, scaled by its physical node's factor in world mode. */
   readonly nodeRadii: Float32Array;
   readonly offsets: Float32Array;
 }
@@ -1782,11 +1788,15 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The both view's packing for the current style (#509): each state node at the radius the state view gives it
-   * (the app's `nodeRadius` spec, in its `sizeMode`'s units), packed inside its physical node ({@link
-   * packStateNodes}), and each physical node's radius ({@link containerRadii}). Kept while the spec and the
-   * sizeMode are: built on a style or data change, never on a zoom or layout frame. O(S log s) to build (S state
-   * nodes, s the most in one physical node), O(1) when kept.
+   * The both view's packing for the current style (#509): each state node resolved as the state view resolves it
+   * (the app's `nodeRadius` spec, in its `sizeMode`'s units) and packed inside its physical node ({@link
+   * packStateNodes}). Screen mode draws them at those radii, and each physical node encloses its state nodes ({@link
+   * containerRadii}). World mode (D5) draws each physical node at the radius the physical view draws it at, and
+   * scales its state nodes (radii and offsets) by one factor per physical node to fit inside it with a padding of
+   * {@link BOTH_PADDING_SHARE} of its radius: a switch between the physical and both views keeps every physical
+   * node's size and place. Kept while the spec and the sizeMode are: built on a style or data change, never on a
+   * zoom or layout frame. O(S log s + P) to build (S state nodes, s the most in one physical node, P physical
+   * nodes), O(1) when kept.
    */
   private ensureBothPack(): BothPack | null {
     const sg = this.stateData;
@@ -1798,19 +1808,45 @@ export class Network extends BaseEngine {
     const keep = kept && kept.sizeMode === sizeMode && this.containerRadii ? kept : null;
     if (keep && keep.spec === spec) return keep;
     // Resolved as the state view resolves them: the same graph topology and flows, the same spec.
-    const nodeRadii = resolveNodeRadii(both, spec);
+    const resolvedRadii = resolveNodeRadii(both, spec);
+    // World mode: each physical node's radius as the physical view resolves it. A per-node array sized for the state
+    // nodes has no physical-view radius (the physical view cannot draw it): its physical nodes enclose their state nodes.
+    const world = sizeMode === "world";
+    const physicalRadii = world && !(spec instanceof Float32Array && spec.length !== sg.physicalCount) ? resolveNodeRadii(sg.physical, spec) : null;
     // A new spec object that resolves to the same radii (an app passing an equal spec on every style() call) keeps
-    // the packing, and with it the state nodes the user dragged: O(state nodes), once per style() call.
-    if (keep && sameValues(nodeRadii, keep.nodeRadii)) {
+    // the packing, and with it the state nodes the user dragged: O(S + P), once per style() call.
+    if (keep && sameValues(resolvedRadii, keep.resolvedRadii) && (!physicalRadii || (this.containerRadii && sameValues(physicalRadii, this.containerRadii)))) {
       keep.spec = spec;
       return keep;
     }
-    let max = 0;
-    for (const r of nodeRadii) if (r > max) max = r;
-    const padding = sizeMode === "screen" ? BOTH_PADDING_PX : BOTH_PADDING_SHARE * max;
-    const { offsets, radii } = packStateNodes(nodeRadii, sg.physicalToState, { padding });
-    this.containerRadii = radii;
-    return (this.bothPack = { spec, sizeMode, nodeRadii, offsets });
+    if (!world) {
+      const { offsets, radii } = packStateNodes(resolvedRadii, sg.physicalToState, { padding: BOTH_PADDING_PX });
+      this.containerRadii = radii;
+      return (this.bothPack = { spec, sizeMode, resolvedRadii, nodeRadii: resolvedRadii, offsets });
+    }
+    // World mode packs without padding, then scales: `packed` (P, reused as the physical radii) holds each physical
+    // node's packed radius, and its state nodes are scaled by `(1 - share) · target / packed`.
+    const { offsets, radii: packed } = packStateNodes(resolvedRadii, sg.physicalToState);
+    const nodeRadii = new Float32Array(resolvedRadii.length);
+    const { offsets: starts, states } = sg.physicalToState;
+    const fit = 1 - BOTH_PADDING_SHARE;
+    for (let p = 0; p < sg.physicalCount; p++) {
+      const r = packed[p] ?? 0;
+      // A physical-view radius of 0 (or negative or NaN) draws the physical node and its state nodes at 0; a packed
+      // radius of 0 (no state nodes, or all of radius 0 at offset 0) leaves its state nodes at 0.
+      const v = physicalRadii ? (physicalRadii[p] ?? 0) : r / fit;
+      const target = v > 0 && Number.isFinite(v) ? v : 0;
+      const f = r > 0 ? (fit * target) / r : 0;
+      for (let i = starts[p] ?? 0, end = starts[p + 1] ?? 0; i < end; i++) {
+        const s = states[i] ?? 0;
+        nodeRadii[s] = (resolvedRadii[s] ?? 0) * f;
+        offsets[2 * s] = (offsets[2 * s] ?? 0) * f;
+        offsets[2 * s + 1] = (offsets[2 * s + 1] ?? 0) * f;
+      }
+      packed[p] = target;
+    }
+    this.containerRadii = packed;
+    return (this.bothPack = { spec, sizeMode, resolvedRadii, nodeRadii, offsets });
   }
 
   /**

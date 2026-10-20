@@ -7,10 +7,11 @@ import { offsetColumnStats } from "../../webgl/instanced.js";
 import type { InstancedLayer, InstancedCirclesData, ViewTransform } from "../../core/index.js";
 
 /**
- * The state network's both view sizes its state nodes as the state view does (#509): the app's `nodeRadius` spec
- * in the app's `sizeMode`, each packed inside its physical node, which is drawn at the packing's radius in the same
- * units. In screen mode each state node is drawn at its physical node (the anchor) plus a px offset column, so a
- * zoom frame re-emits nothing and uploads no offset bytes.
+ * The state network's both view sizes its nodes from the app's `nodeRadius` spec in the app's `sizeMode` (#509), each
+ * state node packed inside its physical node. Screen mode draws the state nodes at the state view's radii and each
+ * physical node at the packing's radius; each state node is drawn at its physical node (the anchor) plus a px offset
+ * column, so a zoom frame re-emits nothing and uploads no offset bytes. World mode (D5) draws each physical node at
+ * the physical view's radius and scales its state nodes to fit, keeping the state view's ratios.
  *
  * Small N, WebGL lane: the emitted layers are read where they reach the backend.
  */
@@ -86,7 +87,7 @@ const SPECS: { name: string; spec: NodeRadiusSpec }[] = [
 ];
 const MODES = ["world", "screen"] as const;
 
-describe("state network both view: state nodes at the state view's size, inside their physical nodes (#509)", () => {
+describe("state network both view: state nodes sized by the state view's spec, inside their physical nodes (#509)", () => {
   for (const sizeMode of MODES) {
     for (const { name, spec } of SPECS) {
       it(`${sizeMode} mode, nodeRadius ${name}`, async () => {
@@ -104,6 +105,10 @@ describe("state network both view: state nodes at the state view's size, inside 
           net.render();
           const stateRadii = Float32Array.from(spy.circles("nodes").radii);
           expect(spy.sizeMode("nodes")).toBe(sizeMode);
+          const P = graph.physical.nodeCount;
+          net.view("physical").layout({ backend: "positions", positions });
+          net.render();
+          const physicalRadii = Float32Array.from(spy.circles("nodes").radii.subarray(0, P));
 
           net.view("both").layout({ backend: "positions", positions });
           net.setTransform(zoomAbout(1));
@@ -112,8 +117,23 @@ describe("state network both view: state nodes at the state view's size, inside 
           const phys = spy.circles("phys-container");
           expect(spy.sizeMode("nodes"), "the both view's state nodes take the app's sizeMode").toBe(sizeMode);
           expect(spy.sizeMode("phys-container"), "the physical nodes take the state nodes' units").toBe(sizeMode);
-          // The drawn radius of each state node is the state view's, for the same node.
-          expect(Array.from(nodes.radii)).toEqual(Array.from(stateRadii));
+          const s2p = graph.stateToPhysical;
+          if (sizeMode === "screen") {
+            // The drawn radius of each state node is the state view's, for the same node.
+            expect(Array.from(nodes.radii)).toEqual(Array.from(stateRadii));
+          } else {
+            // D5: each physical node at the physical view's radius; its state nodes scaled by one factor, so they keep
+            // the state view's ratios within it.
+            expect(Array.from(phys.radii.subarray(0, P)), "a physical node's radius is not the physical view's").toEqual(Array.from(physicalRadii));
+            const factor: number[] = [];
+            for (let s = 0; s < graph.state.nodeCount; s++) {
+              const p = s2p[s] ?? 0;
+              const f = (nodes.radii[s] ?? 0) / (stateRadii[s] ?? 1);
+              expect(f, `state node ${s} is not drawn`).toBeGreaterThan(0);
+              if (factor[p] === undefined) factor[p] = f;
+              else expect(f, `state node ${s} breaks the state view's ratios in physical node ${p}`).toBeCloseTo(factor[p] ?? NaN, 5);
+            }
+          }
 
           // D4: offset columns only in screen mode, on the state nodes and both ends of every link.
           const links = spy.last.get("links");
@@ -133,7 +153,6 @@ describe("state network both view: state nodes at the state view's size, inside 
           }
 
           // Each state node's position: its physical node (the anchor) in screen mode, plus its offset in world mode.
-          const s2p = graph.stateToPhysical;
           let baked = 0;
           for (let s = 0; s < graph.state.nodeCount; s++) {
             const p = s2p[s] ?? 0;
@@ -143,7 +162,8 @@ describe("state network both view: state nodes at the state view's size, inside 
           if (sizeMode === "screen") expect(baked, "a screen-mode state node is not at its anchor").toBe(0);
           else expect(baked, "no world-mode state node is offset from its physical node").toBeGreaterThan(0);
 
-          // Every state node lies inside its physical node, as drawn in px, at two zooms.
+          // Every state node lies inside its physical node, as drawn in px, at two zooms, and no two of a physical node
+          // overlap.
           for (const k of [0.5, 3]) {
             net.setTransform(zoomAbout(k));
             net.render();
@@ -156,6 +176,15 @@ describe("state network both view: state nodes at the state view's size, inside 
               const dy = k * ((n.centers[2 * s + 1] ?? 0) - (c.centers[2 * p + 1] ?? 0)) + scale * (n.offsets?.[2 * s + 1] ?? 0);
               const reach = Math.hypot(dx, dy) + scale * (n.radii[s] ?? 0);
               expect(reach, `state node ${s} reaches past its physical node ${p} at k=${k}`).toBeLessThanOrEqual(scale * (c.radii[p] ?? 0) + 1e-3);
+              if (sizeMode === "world") expect(scale * (c.radii[p] ?? 0), `physical node ${p} is not at the physical view's size at k=${k}`).toBeCloseTo(k * (physicalRadii[p] ?? NaN), 4);
+              for (let t = s + 1; t < graph.state.nodeCount; t++) {
+                if ((s2p[t] ?? -1) !== p) continue;
+                // The drawn centres in px: the world-mode offsets are in the centres, the screen-mode ones in the offsets.
+                const ex = k * ((n.centers[2 * s] ?? 0) - (n.centers[2 * t] ?? 0)) + scale * ((n.offsets?.[2 * s] ?? 0) - (n.offsets?.[2 * t] ?? 0));
+                const ey = k * ((n.centers[2 * s + 1] ?? 0) - (n.centers[2 * t + 1] ?? 0)) + scale * ((n.offsets?.[2 * s + 1] ?? 0) - (n.offsets?.[2 * t + 1] ?? 0));
+                const dist = Math.hypot(ex, ey);
+                expect(dist, `state nodes ${s} and ${t} overlap at k=${k}`).toBeGreaterThanOrEqual(scale * ((n.radii[s] ?? 0) + (n.radii[t] ?? 0)) - 1e-3);
+              }
             }
           }
           // Packed: the physical node of five state nodes encloses more than its largest state node.

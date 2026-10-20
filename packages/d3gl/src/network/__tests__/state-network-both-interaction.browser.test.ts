@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { network, type Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
+import type { NodeRadiusSpec } from "../glyphs.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedCirclesData, InstancedLayer } from "../../core/backend.js";
 import { decodeImage, rasterizeSVG, type PixelBuffer } from "../../map/__tests__/backend-equivalence-harness.js";
@@ -22,6 +23,10 @@ const POS = new Float32Array([40, 40, 110, 40, 75, 100]);
 const STATE_TO_PHYSICAL = [0, 0, 0, 1, 1, 2];
 const S = STATE_TO_PHYSICAL.length;
 const P = 3;
+
+/** A new spec object on every call, resolving to the same radii: each state node 6, each physical node 24 (the
+ *  physical view's size, which world mode draws the physical nodes at, D5). */
+const sizes = (): NodeRadiusSpec => (_value, _index, graph) => (graph.nodeCount === P ? 24 : 6);
 
 function fixture() {
   return buildStateGraph({ stateCount: S, stateToPhysical: STATE_TO_PHYSICAL, source: [0, 1, 3, 2], target: [3, 5, 5, 4], directed: false });
@@ -90,7 +95,7 @@ async function setup(sizeMode: "world" | "screen", k: number) {
     spy.restore();
   });
   const graph = fixture();
-  net.style({ sizeMode, nodeRadius: 6 }).stateNetwork(graph, { view: "both" });
+  net.style({ sizeMode, nodeRadius: sizes() }).stateNetwork(graph, { view: "both" });
   net.layout({ backend: "positions", positions: POS });
   net.setTransform({ k, x: 0, y: 0 });
   net.interactive({ selectable: { multi: true }, draggable: true, hover: {} });
@@ -226,13 +231,13 @@ describe("state network both view: interaction hits what is drawn (#509)", () =>
 
   it("a style() call with a new but equal nodeRadius spec keeps a dragged state node where it was dropped", async () => {
     const { h, net, state } = await setup("world", 1);
-    net.style({ nodeRadius: () => 6 }); // the same radii from a new spec: the packing is kept
+    net.style({ nodeRadius: sizes() }); // the same radii from a new spec: the packing is kept
     net.toPNG();
     const before = state(1);
     await drag(h, [[before.x, before.y], [before.x + 6, before.y], [before.x + 6, before.y]]);
     const dropped = state(1);
     expect(Math.hypot(dropped.x - before.x, dropped.y - before.y), "the drag did not move the state node").toBeGreaterThan(1);
-    net.style({ nodeRadius: () => 6 }); // a new spec object, resolving to the same radii
+    net.style({ nodeRadius: sizes() }); // a new spec object, resolving to the same radii
     net.toPNG();
     const kept = state(1);
     expect([kept.x, kept.y]).toEqual([dropped.x, dropped.y]);
@@ -321,7 +326,7 @@ describe("state network both view: a state node drag draws where it was dropped,
           h.remove();
         });
         net
-          .style({ sizeMode, nodeRadius: 6, nodeFill: NODE_FILL, linkStroke: LINK, linkWidth: LINK_WIDTH })
+          .style({ sizeMode, nodeRadius: sizes(), nodeFill: NODE_FILL, linkStroke: LINK, linkWidth: LINK_WIDTH })
           .stateNetwork(fixture(), { view: "both" })
           .layout({ backend: "positions", positions: POS });
         net.setTransform({ k: DRAG_K, x: 0, y: 0 });

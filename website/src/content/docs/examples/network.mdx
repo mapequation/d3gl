@@ -862,12 +862,14 @@ derives the physical network) plus a per-**state-node** module assignment, and `
   state-view feature; the physical/both views draw full detail.)
 - **Both** — a hybrid: each physical node is drawn faintly, outlined by a thin ring in a darker shade of its
   colour, around its state nodes, with **state-level** links — the memory structure in its physical context.
-  Each state node is drawn at the size the state view gives it (your `nodeRadius` and `sizeMode`), and its
-  physical node packs its state nodes by area, largest first, and is sized to enclose them. In
-  `sizeMode: "screen"` both keep their pixel size at every zoom, so neighbouring physical nodes can overlap when
-  zoomed out, as screen-sized nodes do; in `"world"` they scale with the zoom. Each state node keeps its place
-  in its physical node as the physical layout moves, and a state node dragged there stays inside its physical
-  node, where you put it.
+  Each physical node packs its state nodes by area, largest first, without overlaps. In `sizeMode: "world"` each
+  physical node is drawn at the size the physical view gives it (your `nodeRadius`), and its state nodes are
+  scaled to fit inside it, keeping the sizes the state view gives them relative to each other: switching between
+  the physical and both views keeps every physical node's size and place. In `sizeMode: "screen"` each state node
+  is drawn at the state view's pixel size and its physical node is sized to enclose them; both keep their pixel
+  size at every zoom, so neighbouring physical nodes can overlap when zoomed out, as screen-sized nodes do. Each
+  state node keeps its place in its physical node as the physical layout moves, and a state node dragged there
+  stays inside its physical node, where you put it.
 
 The **Nodes** slider scales the physical network from 10 to 10,000. The cap comes from the demo's
 synthetic data, not from the layout (the Worker and GPU backends lay out far larger graphs, as in the

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { network, type Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
 import { buildGraph } from "../graph.js";
+import type { NodeRadiusSpec } from "../glyphs.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedHighlight, InstancedLayer } from "../../core/backend.js";
@@ -600,6 +601,10 @@ function offsetFixture() {
 }
 const STATE_RGB: [number, number, number][] = [[255, 0, 0], [0, 200, 0], [0, 0, 255], [255, 0, 255], [0, 200, 200], [200, 200, 0]];
 const BOTH_RADIUS = 5;
+/** The physical view's radius of each physical node: world mode draws the physical nodes at it and scales their state
+ *  nodes to fit (D5). */
+const PHYSICAL_RADIUS = 18;
+const OFFSET_SIZES: NodeRadiusSpec = (_value, _index, g) => (g.nodeCount === 3 ? PHYSICAL_RADIUS : BOTH_RADIUS);
 const ARROW = 4;
 
 interface PxCircle { x: number; y: number; r: number; outer: number; stroked: boolean; rgb: number[] }
@@ -648,7 +653,7 @@ async function offsetNet(backend: "webgl" | "canvas" | "svg", sizeMode: "world" 
   net
     .style({
       sizeMode,
-      nodeRadius: BOTH_RADIUS,
+      nodeRadius: OFFSET_SIZES,
       linkStyle: "line",
       linkWidth: 1,
       arrowSize: ARROW,
@@ -677,18 +682,30 @@ describe("the both view draws the same on WebGL, Canvas and SVG, state nodes off
           (exports[backend] ??= []).push(svg);
           const geo = exportGeometry(svg);
           const at = `${backend} k=${k}`;
-          // Each state node at the state view's radius: px in screen mode, world units × k in world mode.
-          const rPx = sizeMode === "screen" ? BOTH_RADIUS : BOTH_RADIUS * k;
+          // Screen mode: each state node at the state view's radius in px. World mode (D5): each physical node at the
+          // physical view's radius × k, its state nodes scaled to fit, all by one factor (the state view's radii are equal).
+          const rPx = sizeMode === "screen" ? BOTH_RADIUS : NaN;
+          const scaled: number[] = [];
           for (let s = 0; s < graph.state.nodeCount; s++) {
             const c = geo.states[s];
             expect(c, `${at}: state node ${s} is not drawn`).toBeDefined();
             if (!c) continue;
-            expect(c.r, `${at}: state node ${s}'s radius`).toBeCloseTo(rPx, 2);
             // Inside its physical node: the stroked circle centred on the physical node's projection.
             const p = graph.stateToPhysical[s] ?? -1;
             const px = (physical[2 * p] ?? NaN) * k + t.x, py = (physical[2 * p + 1] ?? NaN) * k + t.y;
             const own = geo.containers.find((d) => Math.hypot(d.x - px, d.y - py) < 0.01);
             expect(own, `${at}: physical node ${p} is not drawn`).toBeDefined();
+            if (sizeMode === "screen") expect(c.r, `${at}: state node ${s}'s radius`).toBeCloseTo(rPx, 2);
+            else {
+              expect(own?.outer ?? NaN, `${at}: physical node ${p} is not at the physical view's radius`).toBeCloseTo(PHYSICAL_RADIUS * k, 0);
+              expect(c.r, `${at}: state node ${s} is not drawn`).toBeGreaterThan(0);
+              if (scaled[p] === undefined) scaled[p] = c.r;
+              else expect(c.r, `${at}: state node ${s} breaks the state view's ratios in physical node ${p}`).toBeCloseTo(scaled[p] ?? NaN, 2);
+              for (let o = 0; o < s; o++) {
+                const d = geo.states[o];
+                if (d && graph.stateToPhysical[o] === p) expect(Math.hypot(c.x - d.x, c.y - d.y), `${at}: state nodes ${o} and ${s} overlap`).toBeGreaterThanOrEqual(c.r + d.r - 0.01);
+              }
+            }
             expect(Math.hypot(c.x - px, c.y - py) + c.r, `${at}: state node ${s} leaves physical node ${p}`).toBeLessThanOrEqual((own?.outer ?? 0) + 0.01);
             (centres[backend] ??= []).push(c.x, c.y);
             if (backend === "webgl") (offsets[s] ??= []).push(Math.hypot(c.x - px, c.y - py));
