@@ -114,8 +114,17 @@ function containerPoint(net: Network, g: ReturnType<typeof fixture>["graph"], p:
   const containers = circlesOf(net.toSVG()).filter((c) => c.stroked);
   const own = containers.find((c) => Math.abs(c.cx - cx) < 0.01 && Math.abs(c.cy - cy) < 0.01);
   expect(own, `no container drawn at physical ${p}`).toBeDefined();
-  // The exported ring's centreline radius r·(1 − b/2): 85% of it is inside the disc, past every dot.
-  return [cx, cy - 0.85 * (own?.r ?? 0)];
+  // The exported ring's centreline radius r·(1 − b/2): 85% of it is inside the disc. The state nodes are packed
+  // around their enclosing circle's centre (#509), so look around that rim for a point clear of every state node
+  // and its highlight ring.
+  const dots = circlesOf(net.toSVG()).filter((c) => !c.stroked);
+  const rim = 0.85 * (own?.r ?? 0);
+  for (let a = 0; a < 32; a++) {
+    const t = -Math.PI / 2 + (a / 32) * 2 * Math.PI;
+    const x = cx + rim * Math.cos(t), y = cy + rim * Math.sin(t);
+    if (dots.every((d) => Math.hypot(x - d.cx, y - d.cy) > 1.5 * d.r + 1)) return [x, y];
+  }
+  return [cx, cy - rim];
 }
 
 function laneSpy() {
@@ -185,17 +194,20 @@ describe("the both view (#494, 2-3)", () => {
     const containers = circles.filter((c) => c.stroked);
     const dots = circles.filter((c) => !c.stroked);
     expect(dots.length).toBe(S);
-    for (let s = 0; s < S; s++) {
-      const p = graph.stateToPhysical[s]!;
-      const [x, y] = statePos(net, s);
-      const dot = dots.find((c) => Math.abs(c.cx - x) < 0.01 && Math.abs(c.cy - y) < 0.01);
-      const box = containers.find((c) => Math.abs(c.cx - POS[2 * p]!) < 0.01 && Math.abs(c.cy - POS[2 * p + 1]!) < 0.01);
-      expect(dot && box, `state ${s} or its container is not drawn`).toBeTruthy();
-      if (!dot || !box) continue;
-      const k = graph.physicalToState.offsets[p + 1]! - graph.physicalToState.offsets[p]!;
+    // In screen mode a state node is drawn at its physical node plus a px offset (#509), so each physical node's
+    // state nodes are found where they are drawn: the dots whose centre lies in its container.
+    for (let p = 0; p < graph.physicalCount; p++) {
+      const box = containers.find((c) => Math.abs(c.cx - (POS[2 * p] ?? 0)) < 0.01 && Math.abs(c.cy - (POS[2 * p + 1] ?? 0)) < 0.01);
+      expect(box, `physical ${p}'s container is not drawn`).toBeDefined();
+      if (!box) continue;
+      const k = (graph.physicalToState.offsets[p + 1] ?? 0) - (graph.physicalToState.offsets[p] ?? 0);
       const R = box.outer;
-      expect(Math.hypot(x - box.cx, y - box.cy) + dot.r, `state ${s} pokes out of its container`).toBeLessThanOrEqual(R + 1e-3);
-      expect(dot.r, `state ${s}'s dot is too small to see`).toBeGreaterThanOrEqual((0.2 * R) / Math.sqrt(k));
+      const inner = dots.filter((c) => Math.hypot(c.cx - box.cx, c.cy - box.cy) < R);
+      expect(inner.length, `physical ${p} does not draw its ${k} state nodes`).toBe(k);
+      for (const dot of inner) {
+        expect(Math.hypot(dot.cx - box.cx, dot.cy - box.cy) + dot.r, `a state node pokes out of physical ${p}`).toBeLessThanOrEqual(R + 1e-3);
+        expect(dot.r, `a state node of physical ${p} is too small to see`).toBeGreaterThanOrEqual((0.2 * R) / Math.sqrt(k));
+      }
     }
     net.destroy();
   });

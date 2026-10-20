@@ -29,6 +29,8 @@
  * Deterministic (the shuffle is a fixed-seed LCG per physical node): identical inputs → identical output.
  */
 import type { PhysicalToState } from "./state-graph.js";
+import type { LODTransform } from "./lod.js";
+import type { ScreenRect } from "../core/instanced-lane.js";
 
 /** The golden angle, π(3 − √5) ≈ 2.39996 rad, as {@link rosettePositions} uses. */
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
@@ -680,3 +682,95 @@ function enclose3(placed: Float64Array, ia: number, ib: number, ic: number, out:
   out[2] = r;
 }
 
+
+/** The both view's state nodes as drawn (#509): each at `positions` (its physical node's anchor in screen mode, the
+ *  anchor plus its offset in world mode), moved by `offsets` px in screen mode, at `radii` in size units. */
+export interface BothStateNodes {
+  positions: Float32Array;
+  radii: Float32Array | readonly number[];
+  /** Screen mode: each state node's px offset from its anchor. Null in world mode, where `positions` hold it. */
+  offsets: Float32Array | null;
+}
+
+/** The both view's physical nodes as drawn (#509): at `positions`, at `radii` in size units. */
+export interface BothPhysicalNodes {
+  positions: Float32Array;
+  radii: Float32Array;
+  count: number;
+}
+
+/**
+ * Hit-test the both view at host CSS px (x, y) (#509), against what is drawn: a state node first, then the physical
+ * node under it. Two levels, since a state node lies inside its physical node: the physical nodes whose disc holds
+ * the point, and then only their state nodes. O(physical nodes + the state nodes of the hit physical nodes) per
+ * call, instead of a scan over every state node. Topmost wins, as drawn: the highest state node id, else the
+ * highest physical id. Returns the state node id, `stateCount + p` for a physical node `p`, or −1.
+ */
+export function pickBothNodes(
+  state: BothStateNodes,
+  physical: BothPhysicalNodes,
+  members: PhysicalToState,
+  stateCount: number,
+  x: number,
+  y: number,
+  t: LODTransform,
+  screen: boolean,
+): number {
+  const scale = screen ? 1 : t.k;
+  const { positions: pp, radii: pr } = physical;
+  const { positions: sp, radii: sr, offsets: so } = state;
+  let hitState = -1;
+  let hitPhysical = -1;
+  for (let p = 0; p < physical.count; p++) {
+    const r = (pr[p] ?? 0) * scale;
+    const dx = x - ((pp[2 * p] ?? 0) * t.k + t.x);
+    const dy = y - ((pp[2 * p + 1] ?? 0) * t.k + t.y);
+    if (dx * dx + dy * dy > r * r) continue;
+    hitPhysical = p;
+    const end = members.offsets[p + 1] ?? 0;
+    for (let i = members.offsets[p] ?? 0; i < end; i++) {
+      const s = members.states[i] ?? 0;
+      if (s <= hitState) continue;
+      const rs = (sr[s] ?? 0) * scale;
+      const ex = x - ((sp[2 * s] ?? 0) * t.k + t.x + (so ? (so[2 * s] ?? 0) : 0));
+      const ey = y - ((sp[2 * s + 1] ?? 0) * t.k + t.y + (so ? (so[2 * s + 1] ?? 0) : 0));
+      if (ex * ex + ey * ey <= rs * rs) hitState = s;
+    }
+  }
+  if (hitState >= 0) return hitState;
+  return hitPhysical >= 0 ? stateCount + hitPhysical : -1;
+}
+
+/**
+ * The marquee's state nodes in the both view (#509): the ids whose drawn centre lies inside `rect` (CSS px), each at
+ * its anchor projected plus its px offset in screen mode, or at its position in world mode. O(state nodes), as the
+ * plain network's centre-in-rect query.
+ */
+export function regionBothNodes(state: BothStateNodes, count: number, rect: ScreenRect, t: LODTransform): number[] {
+  const out: number[] = [];
+  const { positions: sp, offsets: so } = state;
+  for (let s = 0; s < count; s++) {
+    const sx = (sp[2 * s] ?? 0) * t.k + t.x + (so ? (so[2 * s] ?? 0) : 0);
+    const sy = (sp[2 * s + 1] ?? 0) * t.k + t.y + (so ? (so[2 * s + 1] ?? 0) : 0);
+    if (sx >= rect.x0 && sx <= rect.x1 && sy >= rect.y0 && sy <= rect.y1) out.push(s);
+  }
+  return out;
+}
+
+/**
+ * Sorted instance ids as flat `[start, end)` runs (#509), what a layer's `offsetsChanged` takes: one upload per
+ * run. Past `maxRuns` runs it is one span from the first id to the last, so a scattered set costs one upload, at
+ * most the whole column. O(ids).
+ */
+export function instanceRuns(sortedIds: ArrayLike<number>, maxRuns = 64): Uint32Array {
+  const runs: number[] = [];
+  for (let k = 0; k < sortedIds.length; k++) {
+    const id = sortedIds[k] ?? 0;
+    const last = runs.length - 1;
+    if (last > 0 && runs[last] === id) runs[last] = id + 1;
+    else if (last > 0 && (runs[last] ?? 0) > id) continue; // a duplicate
+    else runs.push(id, id + 1);
+  }
+  if (runs.length > 2 * maxRuns) return Uint32Array.of(runs[0] ?? 0, runs[runs.length - 1] ?? 0);
+  return Uint32Array.from(runs);
+}

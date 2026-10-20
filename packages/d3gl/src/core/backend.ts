@@ -140,6 +140,12 @@ export interface InstancedCirclesData {
    * array to change it; a reference-stable column costs nothing per frame.
    */
   offsets?: Float32Array;
+  /**
+   * The instances whose {@link offsets} were rewritten in place since the last emit of this layer (#509), as flat
+   * `[start, end)` instance ranges: only those are uploaded, when `offsets` is the array the layer already holds
+   * (a state node drag moves one state node, not the column). Ignored with a new array, which uploads whole.
+   */
+  offsetsChanged?: Uint32Array;
   count: number;
 }
 
@@ -190,6 +196,9 @@ export interface InstancedLinesData {
    */
   sourceOffsets?: Float32Array;
   targetOffsets?: Float32Array;
+  /** The instances whose end offsets were rewritten in place since the last emit (#509), as flat `[start, end)`
+   *  ranges, uploaded alone while the arrays are the ones the layer holds (see `InstancedCirclesData.offsetsChanged`). */
+  endOffsetsChanged?: Uint32Array;
   count: number;
 }
 
@@ -239,6 +248,9 @@ export interface InstancedArrowsData {
    */
   sourceOffsets?: Float32Array;
   targetOffsets?: Float32Array;
+  /** The instances whose end offsets were rewritten in place since the last emit (#509), as flat `[start, end)`
+   *  ranges, uploaded alone while the arrays are the ones the layer holds (see `InstancedCirclesData.offsetsChanged`). */
+  endOffsetsChanged?: Uint32Array;
   count: number;
 }
 
@@ -289,6 +301,9 @@ export interface InstancedHalfArrowsData {
    */
   sourceOffsets?: Float32Array;
   targetOffsets?: Float32Array;
+  /** The instances whose end offsets were rewritten in place since the last emit (#509), as flat `[start, end)`
+   *  ranges, uploaded alone while the arrays are the ones the layer holds (see `InstancedCirclesData.offsetsChanged`). */
+  endOffsetsChanged?: Uint32Array;
   count: number;
 }
 

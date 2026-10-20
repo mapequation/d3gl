@@ -216,7 +216,8 @@ export function offsetLayout(name: string): { name: string; format: "float32x2";
  * reads the context's constant, so a layer without offsets allocates no buffer and uploads nothing, and a draw
  * costs one `vertexAttrib2fv` more (luma.gl re-applies constants per draw). With data it is an instance buffer
  * written only when the array is a new object, like the style columns (#179): reference-stable offsets upload
- * once, never on a zoom frame. The template attribute is pinned at location 0 in each shader, because luma.gl
+ * once, never on a zoom frame. An array rewritten in place uploads only the instance ranges the emit names as
+ * changed (a state node drag: the held state nodes and their links' ends, not the whole column). The template attribute is pinned at location 0 in each shader, because luma.gl
  * disables location 0 only on Chrome, so an offset never lands there.
  */
 class OffsetColumn {
@@ -228,7 +229,7 @@ class OffsetColumn {
 
   /** Bind `data` on `models`, or the constant zero when it is absent, uploading only a new array. A new buffer
    *  takes the layer's `capacity`, so it grows with the other columns. */
-  sync(device: Device, models: readonly Model[], data: Float32Array | undefined, count: number, capacity: number): void {
+  sync(device: Device, models: readonly Model[], data: Float32Array | undefined, count: number, capacity: number, changed?: Uint32Array): void {
     if (!data) {
       if (!this.buffer) return;
       this.buffer.destroy();
@@ -237,8 +238,20 @@ class OffsetColumn {
       for (const m of models) zeroOffsets(m, [this.name]);
       return;
     }
-    if (data === this.last && this.room >= count) return;
+    if (data === this.last && this.room >= count) {
+      // Rewritten in place (#509): only the changed instance ranges, 8 B per instance.
+      if (changed && this.buffer) {
+        for (let k = 0; k + 1 < changed.length; k += 2) {
+          const start = changed[k] ?? 0, end = Math.min(changed[k + 1] ?? 0, count);
+          if (end <= start) continue;
+          this.buffer.write(data.subarray(2 * start, 2 * end), 8 * start);
+          offsetColumnStats.bytes += 8 * (end - start);
+        }
+      }
+      return;
+    }
     if (this.buffer && this.room >= count) this.buffer.write(data);
+    else if (!this.buffer && count === 0) return; // nothing to draw yet: the constant zero until there is
     else {
       this.buffer?.destroy();
       this.room = Math.max(count, capacity);
@@ -271,8 +284,8 @@ class EndOffsets {
     this.sync(device, models, data, capacity);
   }
   sync(device: Device, models: readonly Model[], data: EndOffsetData, capacity: number): void {
-    this.source.sync(device, models, data.sourceOffsets, data.count, capacity);
-    this.target.sync(device, models, data.targetOffsets, data.count, capacity);
+    this.source.sync(device, models, data.sourceOffsets, data.count, capacity, data.endOffsetsChanged);
+    this.target.sync(device, models, data.targetOffsets, data.count, capacity, data.endOffsetsChanged);
   }
   destroy(): void {
     this.source.destroy();
@@ -283,6 +296,7 @@ class EndOffsets {
 interface EndOffsetData {
   sourceOffsets?: Float32Array;
   targetOffsets?: Float32Array;
+  endOffsetsChanged?: Uint32Array;
   count: number;
 }
 
@@ -357,7 +371,7 @@ export class InstancedCircles {
       instanceCount: this.count,
     });
     zeroOffsets(this.model, ["a_offset"]);
-    this.offset.sync(device, [this.model], data.offsets, data.count, this._capacity);
+    this.offset.sync(device, [this.model], data.offsets, data.count, this._capacity, data.offsetsChanged);
   }
 
   /** Set shader-highlight uniforms (#162) — a hover/selection restyle with no geometry touch. */
@@ -427,7 +441,7 @@ export class InstancedCircles {
       }
       this.hl.write(data); // #162 refresh group/selected for the new frame's instances
     }
-    this.offset.sync(device, [this.model], data.offsets, data.count, this._capacity);
+    this.offset.sync(device, [this.model], data.offsets, data.count, this._capacity, data.offsetsChanged);
     this.count = data.count;
     this.model.setInstanceCount(data.count);
   }

@@ -4,6 +4,7 @@ import { buildStateGraph } from "../state-graph.js";
 import { DRAG_HEAT, ForceLayout } from "../force.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
+import { offsetColumnStats } from "../../webgl/instanced.js";
 import type { InstancedLayer, InstancedHighlight, InstancedCirclesData } from "../../core/backend.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost, sweepFrames, zoomSteps, type GlBufferUsage } from "../../__tests__/engine-sweep.js";
@@ -63,6 +64,9 @@ const BASE_LANE = ["nodes", "links", "arrows", "node-halos", "phys-container", "
 // N-independent: a container re-upload alone is ~36 B × N physical, ~720 kB at the local default.
 const RING_BYTES_PER_EVENT = 4 * 1024;
 const SELECT_SLACK_BYTES = 16 * 1024;
+/** Offset bytes per state node drag move (#509): the held state node (8 B) and its few links' two ends per link layer
+ *  (16 B each), with the run coalescing's slack. ABSOLUTE: a whole column is 8 B per state node, ~290 kB here. */
+const OFFSET_BYTES_PER_MOVE = 1024;
 // Wall-clock ceilings, split constant + linear (docs/agents/performance.md §Scaling a guard), calibrated on local
 // headless Chromium (SwiftShader, M1 Max), medians at 20k / 100k physical nodes:
 // - a hover move is two CPU picks (state nodes, then containers: the linear term) + a ring emit + uniform
@@ -223,7 +227,8 @@ let streamOff: { frames: number; colorCalls: number; containerEmits: number; rad
 interface ReheatLeg { moves: number; renders: number; othersMoved: number; dotsFollow: boolean; sameColumns: boolean; colorCalls: number; worstMs: number; medianMs: number }
 let containerReheat: ReheatLeg;
 /** A both-view drag of one state dot (#495 review): it moves inside its container, clamped to its disc. */
-let dotDrag: { moves: number; moved: boolean; colorCalls: number; sameContainerColumns: boolean; sameCenters: boolean; inside: boolean; physicalMoved: boolean; worstMs: number; medianMs: number };
+interface DotDragLeg { moves: number; grabbed: boolean; moved: boolean; colorCalls: number; sameContainerColumns: boolean; sameCenters: boolean; inside: boolean; physicalMoved: boolean; uploadPerMove: number; offsetBytesPerMove: number; created: number; worstMs: number; medianMs: number }
+let dotDrag: DotDragLeg & { world: DotDragLeg };
 let physicalReheat: ReheatLeg;
 /** The state view's drag (#495): the plain network's, over the state graph — with its module LOD on and off. */
 let stateDrag: { off: ReheatLeg; lod: ReheatLeg };
@@ -241,6 +246,8 @@ let stateView: {
   off: { calls: number; baseEmits: number; worstMs: number; gpu: GlBufferUsage };
 };
 let colorCallsTotal = 0;
+/** Colour-accessor calls of the state node drag leg's two sizeMode switches (#509), each a style() call. */
+let restyleCalls = 0;
 let modulesAsked = 0;
 
 const median = (xs: number[]): number => {
@@ -421,46 +428,81 @@ beforeAll(async () => {
       flush();
     }
     {
-      // One state dot of a container, dragged far out of it (#495 review): O(held) per move, clamped to its disc.
+      // One state node of a physical node, dragged far out of it (#495 review, #509): O(held) per move, clamped to
+      // its disc. Screen mode first, where the drag rewrites the offset columns in place, then the same drag in world
+      // mode, the baseline (#509: a screen-mode move uploads no more than a world-mode one).
       const p = targetIds[60]!;
       const s = fx.graph.physicalToState.states[fx.graph.physicalToState.offsets[p]!]!;
-      const dots = net.positions ?? new Float32Array(0);
       const physBefore = Float32Array.from(fx.graph.physical.positions);
-      const gx = dots[2 * s]! * K, gy = dots[2 * s + 1]! * K;
-      const sx0 = dots[2 * s]!, sy0 = dots[2 * s + 1]!;
-      lane.reset();
-      const colorBefore = colorCalls;
-      const times: number[] = [];
       const ev = (type: string, x: number, y: number) =>
         h.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
-      ev("pointerdown", gx, gy);
-      for (let m = 1; m <= DRAG_MOVES; m++) {
-        const t0 = performance.now();
-        ev("pointermove", gx + 6 * m, gy + 4 * m);
-        flush();
-        times.push(performance.now() - t0);
-      }
-      ev("pointerup", gx + 6 * DRAG_MOVES, gy + 4 * DRAG_MOVES);
-      flush();
-      const emits = lane.containerEmits;
-      const nodes = lane.nodeEmits;
-      const pos = net.positions ?? new Float32Array(0);
-      const phys = fx.graph.physical.positions;
-      // Inside its container: the container's radius from its emitted column (the dots' radii are smaller).
-      const radius = emits[emits.length - 1]?.radii[p] ?? 0;
-      let physicalMoved = false;
-      for (let i = 0; i < physBefore.length; i++) if (physBefore[i] !== phys[i]) physicalMoved = true;
-      dotDrag = {
-        moves: DRAG_MOVES,
-        moved: Math.hypot(pos[2 * s]! - sx0, pos[2 * s + 1]! - sy0) > 0.1,
-        colorCalls: colorCalls - colorBefore,
-        sameContainerColumns: emits.length > 0 && emits.every((c) => c.colors === emits[0]!.colors && c.borders === emits[0]!.borders && c.radii === emits[0]!.radii),
-        sameCenters: nodes.length > 0 && nodes.every((c) => c.centers === nodes[0]!.centers),
-        inside: radius > 0 && Math.hypot(pos[2 * s]! - phys[2 * p]!, pos[2 * s + 1]! - phys[2 * p + 1]!) < radius,
-        physicalMoved,
-        worstMs: Math.max(...times),
-        medianMs: median(times),
+      /** The state node's drawn centre in px: its anchor (world mode: its position) projected, plus its px offset. */
+      const drawnAt = (offsets: Float32Array | undefined): [number, number] => {
+        const pos = net.positions ?? new Float32Array(0);
+        return [pos[2 * s]! * K + (offsets?.[2 * s] ?? 0), pos[2 * s + 1]! * K + (offsets?.[2 * s + 1] ?? 0)];
       };
+      const dragLeg = () => {
+        // Each leg from no selection: a drag's first move selects the held state node, once, in both legs alike.
+        net.select("nodes", null);
+        flush();
+        const offsets = lane.nodeEmits[lane.nodeEmits.length - 1]?.offsets;
+        const [gx, gy] = drawnAt(offsets);
+        const picked = net.pick(gx, gy)?.id;
+        lane.reset();
+        const colorBefore = colorCalls;
+        const times: number[] = [];
+        ev("pointerdown", gx, gy);
+        flush();
+        // The moves alone: a grab's own hover or selection change is not a move's cost.
+        const offsetBefore = offsetColumnStats.bytes;
+        const before = gl.mark();
+        for (let m = 1; m <= DRAG_MOVES; m++) {
+          const t0 = performance.now();
+          ev("pointermove", gx + 6 * m, gy + 4 * m);
+          flush();
+          times.push(performance.now() - t0);
+        }
+        const gpu = gl.since(before);
+        const offsetBytes = offsetColumnStats.bytes - offsetBefore;
+        ev("pointerup", gx + 6 * DRAG_MOVES, gy + 4 * DRAG_MOVES);
+        flush();
+        const emits = lane.containerEmits;
+        const nodes = lane.nodeEmits;
+        const [x1, y1] = drawnAt(nodes[nodes.length - 1]?.offsets);
+        // Inside its physical node, in px: the physical node's radius from its emitted column, in the leg's units.
+        const scale = offsets ? 1 : K;
+        const radius = (emits[emits.length - 1]?.radii[p] ?? 0) * scale;
+        const phys = fx.graph.physical.positions;
+        let physicalMoved = false;
+        for (let i = 0; i < physBefore.length; i++) if (physBefore[i] !== phys[i]) physicalMoved = true;
+        return {
+          moves: DRAG_MOVES,
+          grabbed: picked === s,
+          moved: Math.hypot(x1 - gx, y1 - gy) > 0.1,
+          colorCalls: colorCalls - colorBefore,
+          sameContainerColumns: emits.length > 0 && emits.every((c) => c.colors === emits[0]!.colors && c.borders === emits[0]!.borders && c.radii === emits[0]!.radii),
+          sameCenters: nodes.length > 0 && nodes.every((c) => c.centers === nodes[0]!.centers),
+          inside: radius > 0 && Math.hypot(x1 - phys[2 * p]! * K, y1 - phys[2 * p + 1]! * K) < radius,
+          physicalMoved,
+          uploadPerMove: gpu.uploadedBytes / DRAG_MOVES,
+          offsetBytesPerMove: offsetBytes / DRAG_MOVES,
+          created: gpu.created,
+          worstMs: Math.max(...times),
+          medianMs: median(times),
+        };
+      };
+      const screen = dragLeg();
+      // A style() call captures the fill's colours again, by design: not counted against "once per module" below.
+      const restyleBefore = colorCalls;
+      net.style({ sizeMode: "world" });
+      flush();
+      restyleCalls += colorCalls - restyleBefore;
+      const world = dragLeg();
+      const backBefore = colorCalls;
+      net.style({ sizeMode: "screen" });
+      flush();
+      restyleCalls += colorCalls - backBefore;
+      dotDrag = { ...screen, world };
     }
     {
       // A converging layout spreads out frame by frame: scale the physical positions up a little per frame,
@@ -666,7 +708,7 @@ beforeAll(async () => {
       dragParts = { tickMs: median(ticks), translateOffMs, translateLodMs };
     }
     // The run's module colours are counted up to here: the plain network below resolves its own.
-    colorCallsTotal = colorCalls;
+    colorCallsTotal = colorCalls - restyleCalls;
     modulesAsked = seen.size;
     // ── The baseline (#495 review): the plain network over the same state graph and modules, on this engine, the
     //    same drag from the same positions ──
@@ -753,14 +795,23 @@ describe(`state-network both view — per-interaction cost at N=${N.toLocaleStri
     expect(dragOff.medianMs, `drag move median ${dragOff.medianMs.toFixed(2)}ms (worst ${dragOff.worstMs.toFixed(2)}ms)`).toBeLessThan(DRAG_MOVE_MS);
   });
 
-  it("dot drag (#495 review): O(held) per move, the dot clamped to its container, nothing else rebuilt", () => {
-    expect(dotDrag.moved, "the dot did not move: the leg is vacuous").toBe(true);
-    expect(dotDrag.inside, "the dragged dot left its container").toBe(true);
-    expect(dotDrag.physicalMoved, "a dot drag moved the physical layout").toBe(false);
-    expect(dotDrag.sameContainerColumns, "a dot drag rebuilt the container columns").toBe(true);
-    expect(dotDrag.sameCenters, "a dot drag reallocated the dots' positions").toBe(true);
-    expect(dotDrag.colorCalls, "a dot drag resolved the module colours again").toBe(0);
-    expect(dotDrag.medianMs, `dot drag move median ${dotDrag.medianMs.toFixed(2)}ms (worst ${dotDrag.worstMs.toFixed(2)}ms)`).toBeLessThan(DRAG_MOVE_MS);
+  it("state node drag (#495 review, #509): O(held) per move, clamped inside its physical node, nothing else rebuilt", () => {
+    for (const [name, leg] of [["screen", dotDrag], ["world", dotDrag.world]] as const) {
+      expect(leg.grabbed, `${name}: the grab did not hit the state node as drawn`).toBe(true);
+      expect(leg.moved, `${name}: the state node did not move: the leg is vacuous`).toBe(true);
+      expect(leg.inside, `${name}: the dragged state node left its physical node`).toBe(true);
+      expect(leg.physicalMoved, `${name}: a state node drag moved the physical layout`).toBe(false);
+      expect(leg.sameContainerColumns, `${name}: a state node drag rebuilt the physical node columns`).toBe(true);
+      expect(leg.sameCenters, `${name}: a state node drag reallocated the state nodes' positions`).toBe(true);
+      expect(leg.colorCalls, `${name}: a state node drag resolved the module colours again`).toBe(0);
+      expect(leg.created, `${name}: a state node drag created GPU buffers`).toBe(0);
+      expect(leg.medianMs, `${name}: drag move median ${leg.medianMs.toFixed(2)}ms (worst ${leg.worstMs.toFixed(2)}ms)`).toBeLessThan(DRAG_MOVE_MS);
+    }
+    // #509: screen mode rewrites the offset columns in place and uploads only the held state node's and its links'
+    // ranges, an N-independent few bytes, so a move costs no more than the world-mode baseline.
+    expect(dotDrag.offsetBytesPerMove, "a screen-mode move re-uploaded an offset column").toBeLessThan(OFFSET_BYTES_PER_MOVE);
+    expect(dotDrag.offsetBytesPerMove, "the screen-mode drag wrote no offsets: the leg is vacuous").toBeGreaterThan(0);
+    expect(dotDrag.uploadPerMove, `screen ${dotDrag.uploadPerMove} B vs world ${dotDrag.world.uploadPerMove} B per move`).toBeLessThanOrEqual(dotDrag.world.uploadPerMove + OFFSET_BYTES_PER_MOVE);
   });
 
   it("streamed layout frame: no style re-resolve, the radii and module colours are kept (no accessor per frame)", () => {
