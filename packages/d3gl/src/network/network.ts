@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type LayerSpec, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue, resolveNodeBorder, darkenedCss } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -11,7 +11,7 @@ import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./ne
 import { NestedDrag, NestedDragCache } from "./nested-drag.js";
 import { easeCubicOut, positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, nodeModules, moduleAggregateColors, type ModulePathNode, type ModuleColorOptions, type NodeModules } from "./module-colors.js";
-import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
+import { dominantWedges, physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
 import { packStateNodes, pickBothNodes, regionBothNodes, instanceRuns, type BothStateNodes } from "./both-layout.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
@@ -233,15 +233,17 @@ export interface NetworkStyle {
    * `@mapequation/c3`'s `hierarchy().colorOf`. Whatever {@link nodeFill} is, a state network's **pie wedges** and
    * both-view **containers** take it (else they keep the engine's own colours); a `nodeFill: { by: "module" }`
    * without its own `color` takes it; and a state network with no `nodeFill` colours its nodes and discs by it
-   * instead of the engine's palette. So nodes can be filled by flow or metadata while the pies and containers
-   * keep the app's module colours. Asked once per module per `style()` call — a later `style({ moduleColor })` recolours — never per
+   * instead of the engine's palette. A container, like a physical disc, takes its physical node's dominant module:
+   * the pie wedge holding most of its flow (a tie goes to the lower module). So nodes can be filled by flow or
+   * metadata while the pies and containers keep the app's module colours. Asked once per module per `style()` call — a later `style({ moduleColor })` recolours — never per
    * frame; `undefined` (no colour for a module) takes the default fill.
    */
   moduleColor?: ModuleColor;
   /**
-   * Constant border ring (#104 rework): a fixed **pixel** outline on every node/module (e.g.
-   * `{ width: 1, color: "#fff" }`). Independent of {@link flowBorder} (which encodes flow);
-   * `flowBorder` wins if both are set.
+   * Node border (#104 rework): a ring of a fixed **pixel** `width` on every node and module. Without a
+   * `color`, each ring is a darker shade of its own node's fill (a module's of its module colour), as a
+   * {@link flowBorder} is (#506); with one (e.g. `{ width: 1, color: "#fff" }`), every ring is that
+   * colour. Independent of {@link flowBorder} (which encodes flow); `flowBorder` wins if both are set.
    */
   nodeBorder?: { width: number; color?: string };
   /**
@@ -1355,7 +1357,7 @@ export class Network extends BaseEngine {
   private stateColorOpts: ModuleColorOptions | undefined = undefined;
   /** The module each node of a view's graph is coloured by (#494): a state node's enclosing module, a
    *  physical node's (first) module at the pie level. Built once per state network, on first use. */
-  private stateNodeModules: { state: NodeModules; physical: NodeModules; wedge: Int32Array } | null = null;
+  private stateNodeModules: { state: NodeModules; physical: NodeModules; wedge: Int32Array; dominant: Int32Array } | null = null;
   /** A plain network's {@link NodeModules} for `nodeFill: { by: "module" }` (#494), per hierarchy. */
   private hierarchyNodeModules: { hierarchy: object; modules: NodeModules } | null = null;
   /** The resolved module fills of a state network (#494), kept across the both view's radius-only
@@ -3253,7 +3255,7 @@ export class Network extends BaseEngine {
     const moduleColor = this.styleOpts.moduleColor;
     if (sg && moduleColor && this.stateModules && this.pieWedges) {
       // The app's module palette whatever the node fill (#494): each container its physical node's colour, by
-      // the plain physical disc's rule (its first wedge's module), from the levels' palette, once per style.
+      // the plain physical disc's rule (its dominant wedge's module), from the levels' palette, once per style.
       const fills = this.stateFillsFor(this.fillSpec());
       fills.container ??= moduleFillColors(this.levelModules().physical, moduleColor, DEFAULT_NODE_FILL, this.statePalette(moduleColor));
       return { rgba: fills.container, css: DEFAULT_NODE_FILL };
@@ -5566,16 +5568,18 @@ export class Network extends BaseEngine {
       : cb
         ? `rgba(${cb.color[0]},${cb.color[1]},${cb.color[2]},${cb.color[3] / 255})`
         : style.nodeFill;
-    // Per-node ring colour: a darker shade of each node's own fill (no explicit colour given), an
-    // accessor's per-node colours (ring ∝ a metric), else the single representative colour.
+    // Per-node ring colour: a darker shade of each node's own fill (a flow or node border with no colour
+    // given, #506), an accessor's per-node colours (ring ∝ a metric), else the single representative colour.
     const flowColors = flow?.colors;
-    const darken = flow?.darken;
+    const darken = flow ? flow.darken : cb?.darken;
+    // The darkened ring reads the fill bytes the instanced lane darkens (`nodeColors`, or the one fill),
+    // alpha kept: no colour parse per node, and the same ring as WebGL's.
+    const singleDarkCss = darken !== undefined && !nodeColors ? darkenedCss(rgbaBytes(style.nodeFill), 0, darken) : "";
     const borderColorAt =
       darken !== undefined
-        ? (i: number) => {
-            const c = rgb(fillOf(i));
-            return `rgb(${Math.round(c.r * darken)},${Math.round(c.g * darken)},${Math.round(c.b * darken)})`;
-          }
+        ? nodeColors
+          ? (i: number) => darkenedCss(nodeColors, i, darken)
+          : () => singleDarkCss
         : flowColors
           ? (i: number) => `rgba(${flowColors[i * 4]},${flowColors[i * 4 + 1]},${flowColors[i * 4 + 2]},${flowColors[i * 4 + 3]! / 255})`
           : () => borderColorCss;
@@ -5796,8 +5800,7 @@ export class Network extends BaseEngine {
     const pack = this.stateData && this.activeView === "both" && graph === this.bothGraph ? this.ensureBothPack() : null;
     // Constant border (px). flowBorder wins if both are set.
     const nb = this.styleOpts.nodeBorder;
-    const constBorder: ConstBorder | null =
-      nb && !this.styleOpts.flowBorder ? { width: nb.width, color: rgbaBytes(nb.color ?? "#ffffff") } : null;
+    const constBorder: ConstBorder | null = nb && !this.styleOpts.flowBorder ? resolveNodeBorder(nb, nodeFill) : null;
     const nodeRadiusSpec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
     const appSizeMode = this.styleOpts.sizeMode ?? "world";
     return {
@@ -5911,8 +5914,9 @@ export class Network extends BaseEngine {
       const palette = this.statePalette(spec.color);
       return { nodeFill: DEFAULT_NODE_FILL, nodeColors: moduleFillColors(this.levelModules()[level], spec.color, DEFAULT_NODE_FILL, palette), modulePalette: palette };
     }
-    // No fill: the engine's own module colours — a state node its module's, a physical disc its first wedge's.
-    const css = level === "state" ? moduleColors(modules, this.stateColorOpts) : Array.from({ length: graph.nodeCount }, (_, p) => (wedges.wedgeCount[p]! > 0 ? wedges.color[wedges.offset[p]!]! : DEFAULT_NODE_FILL));
+    // No fill: the engine's own module colours — a state node its module's, a physical disc its dominant wedge's.
+    const dominant = level === "state" ? null : this.levelModules().dominant;
+    const css = !dominant ? moduleColors(modules, this.stateColorOpts) : Array.from({ length: graph.nodeCount }, (_, p) => wedges.color[dominant[p] ?? -1] ?? DEFAULT_NODE_FILL);
     return { nodeFill: DEFAULT_NODE_FILL, nodeColors: resolveNodeColors(graph, (i) => css[i] ?? DEFAULT_NODE_FILL) };
   }
 
@@ -5944,15 +5948,16 @@ export class Network extends BaseEngine {
 
   /** The module each node of the state and the physical graph is coloured by, and each pie wedge's (#494), as
    *  indices into the state graph's interned modules, so one palette colours them all. Built once per state
-   *  network: a state node's enclosing module; a physical node's first wedge's module (its only one, for a disc).
-   *  O(state nodes + wedges + modules · depth); the path index is dropped when it returns. */
-  private levelModules(): { state: NodeModules; physical: NodeModules; wedge: Int32Array } {
+   *  network: a state node's enclosing module; a physical node's dominant wedge's module, the one holding most of
+   *  its flow (its only one, for a disc), and that wedge's index ({@link dominantWedges}; a tie goes to the lower
+   *  module). O(state nodes + wedges + modules · depth); the path index is dropped when it returns. */
+  private levelModules(): { state: NodeModules; physical: NodeModules; wedge: Int32Array; dominant: Int32Array } {
     if (this.stateNodeModules) return this.stateNodeModules;
     const sg = this.stateData;
     const records = this.stateModules;
     const wedges = this.pieWedges;
     const empty: NodeModules = { moduleOf: new Int32Array(0), paths: [] };
-    if (!sg || !records || !wedges) return { state: empty, physical: empty, wedge: new Int32Array(0) };
+    if (!sg || !records || !wedges) return { state: empty, physical: empty, wedge: new Int32Array(0), dominant: new Int32Array(0) };
     const state = nodeModules(sg.state.nodeCount, records);
     const index = new Map<string, number>();
     for (let m = 0; m < state.paths.length; m++) index.set((state.paths[m] ?? []).join(","), m);
@@ -5965,9 +5970,13 @@ export class Network extends BaseEngine {
       if (m === undefined) byPath.set(path, (m = index.get(path.join(",")) ?? -1));
       wedge[w] = m;
     }
+    const dominant = dominantWedges(wedges);
     const moduleOf = new Int32Array(sg.physicalCount).fill(-1);
-    for (let p = 0; p < sg.physicalCount; p++) if (wedges.wedgeCount[p]! > 0) moduleOf[p] = wedge[wedges.offset[p]!]!;
-    this.stateNodeModules = { state, physical: { moduleOf, paths: state.paths }, wedge };
+    for (let p = 0; p < sg.physicalCount; p++) {
+      const k = dominant[p] ?? -1;
+      if (k >= 0) moduleOf[p] = wedge[k] ?? -1;
+    }
+    this.stateNodeModules = { state, physical: { moduleOf, paths: state.paths }, wedge, dominant };
     return this.stateNodeModules;
   }
 
