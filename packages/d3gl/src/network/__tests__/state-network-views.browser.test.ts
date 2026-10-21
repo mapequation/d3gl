@@ -557,7 +557,7 @@ describe("hits and labels name their level in state mode (#494)", () => {
 
     hoverAt(5, 195); // empty space: ends the hover
     net.view("state");
-    const [x, y] = statePos(graph, 3);
+    const [x, y] = statePos(net, 3);
     infos.length = 0;
     hoverAt(x, y); // state node 3
     const state = infos.filter((i) => i.id === 3);
