@@ -5,7 +5,7 @@
  * plain edge-list parser.
  */
 
-/** Pajek `.net`: two friend groups bridged by a few links, with quoted vertex labels. */
+/** Pajek `.net`: two friend groups bridged by a few links, with quoted vertex labels (two long ones, to show `labels({ maxWidth })` trimming). */
 export const SAMPLE_PAJEK = `*Vertices 12
 1 "Alice"
 2 "Bob"
@@ -17,8 +17,8 @@ export const SAMPLE_PAJEK = `*Vertices 12
 8 "Heidi"
 9 "Ivan"
 10 "Judy"
-11 "Mallory"
-12 "Niaj"
+11 "Mallory, who bridges the two friend groups"
+12 "Niaj, a long name to show the trimming"
 *Edges
 1 2
 1 3

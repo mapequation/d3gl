@@ -1429,11 +1429,21 @@ export interface RadiusAggregate {
  * its summed metric (a module coloured by its total flow), as {@link RadiusAggregate} does for size.
  * Omitted ⇒ an aggregate takes the chroma-weighted hue mean of its children's colours.
  */
-export interface FillAggregate {
+export type FillAggregate = MetricFillAggregate | OwnFillAggregate;
+
+/** {@link FillAggregate} of a `{ by, scale }` fill (#445): the scale on each aggregate's summed metric. */
+export interface MetricFillAggregate {
   /** Per-leaf metric value (length `leafCount`); summed up the tree onto each aggregate. */
   leafValue: ArrayLike<number>;
   /** Maps a (summed) value → RGBA bytes — the same scale the leaves are filled with. */
   rgbaOf: (value: number) => readonly [number, number, number, number];
+}
+
+/** {@link FillAggregate} of a `{ by: "module" }` fill on a module tree (#494): each aggregate is a module and
+ *  takes that module's own colour, resolved once per (tree, style), not its members' mean. */
+export interface OwnFillAggregate {
+  /** RGBA per aggregate, `4·(size − leafCount)`: aggregate `g` at `4·(g − leafCount)`. */
+  aggregateRGBA: Uint8Array;
 }
 
 // CIE Lab constants (D50), exactly as d3-color's lab.js — see rgbToHcl / hclToRgb.
@@ -1557,10 +1567,10 @@ function hclToRgb(h: number, c: number, l: number, out: Float64Array): void {
  * `graph.strength`) driving super-edge weight and declutter priority. `leafBorder` (optional) is the
  * per-leaf flow-border metric (e.g. enter/exit flow); each aggregate gets the **sum** of its
  * descendants' (so a module's border reflects its members' total). Omitted ⇒ `border` stays zero.
- * `fillAggregate` (with `leafColors`) fills each aggregate with the fill scale on its summed metric
- * instead of its children's hue mean — see {@link FillAggregate}. `leafBorderFlow` (a share-mode flow
- * border, #510) is each leaf's flow, summed the same way into {@link LODTree.borderFlow} (allocated once
- * per tree, reused by later passes); omitted ⇒ the tree holds no `borderFlow`.
+ * `fillAggregate` (with `leafColors`) fills each aggregate with the fill scale on its summed metric, or
+ * with its module's own colour, instead of its children's hue mean — see {@link FillAggregate}. `leafBorderFlow`
+ * (a share-mode flow border, #510) is each leaf's flow, summed the same way into {@link LODTree.borderFlow}
+ * (allocated once per tree, reused by later passes); omitted ⇒ the tree holds no `borderFlow`.
  */
 export function computeLODStyle(
   tree: LODTree,
@@ -1585,8 +1595,10 @@ export function computeLODStyle(
   // area-additive √Σr² fallback). One temp array per style recompute, never per frame.
   const value = radiusAggregate ? new Float64Array(tree.size) : null;
   // The same for the fill (#445): an aggregate's colour is the fill scale on its summed metric, in place
-  // of the hue mean. Needs per-leaf colours to fill the leaves.
-  const fill = fillAggregate && leafColors ? fillAggregate : null;
+  // of the hue mean. Needs per-leaf colours to fill the leaves. A module tree under a module fill (#494)
+  // gives each aggregate its own module's colour instead (copied, no mean).
+  const fill = fillAggregate && leafColors && "leafValue" in fillAggregate ? fillAggregate : null;
+  const own = fillAggregate && leafColors && "aggregateRGBA" in fillAggregate ? fillAggregate.aggregateRGBA : null;
   const fillValue = fill ? new Float64Array(tree.size) : null;
 
   for (let i = 0; i < leafCount; i++) {
@@ -1623,7 +1635,7 @@ export function computeLODStyle(
         sb += border[c]!;
         if (borderFlow) sbf += borderFlow[c]!;
         if (fillValue) sf += fillValue[c]!;
-        else if (leafColors) {
+        else if (leafColors && !own) {
           hueTerms(color[c * 4] ?? 0, color[c * 4 + 1] ?? 0, color[c * 4 + 2] ?? 0, hclOut);
           hx += hclOut[0] ?? 0;
           hy += hclOut[1] ?? 0;
@@ -1649,6 +1661,12 @@ export function computeLODStyle(
         color[g * 4 + 1] = c[1];
         color[g * 4 + 2] = c[2];
         color[g * 4 + 3] = c[3];
+      } else if (own) {
+        const o = 4 * (g - leafCount);
+        color[g * 4] = own[o]!;
+        color[g * 4 + 1] = own[o + 1]!;
+        color[g * 4 + 2] = own[o + 2]!;
+        color[g * 4 + 3] = own[o + 3]!;
       } else if (leafColors && nc > 0) {
         const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
         hclToRgb(hue, sumC / nc, sumL / nc, hclOut);

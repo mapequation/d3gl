@@ -362,6 +362,9 @@ export class InstancedPie {
   private radius: Buffer;
   private angles: Buffer;
   private color: Buffer;
+  /** The columns last uploaded (#494): an update re-uploads only a column that is a new array, so a restyle
+   *  that keeps the geometry (a palette change) uploads the colours alone. */
+  private last: { centers: Float32Array; radii: Float32Array; angles: Float32Array; colors: Uint8Array };
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -373,6 +376,7 @@ export class InstancedPie {
     this.radius = device.createBuffer({ data: data.radii });
     this.angles = device.createBuffer({ data: data.angles });
     this.color = device.createBuffer({ data: data.colors });
+    this.last = { centers: data.centers, radii: data.radii, angles: data.angles, colors: data.colors };
     this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
@@ -441,11 +445,15 @@ export class InstancedPie {
         a_color: this.color,
         ...this.hl.recreate(data, this._capacity),
       });
+      this.last = { centers: data.centers, radii: data.radii, angles: data.angles, colors: data.colors };
     } else {
-      this.center.write(data.centers);
-      this.radius.write(data.radii);
-      this.angles.write(data.angles);
-      this.color.write(data.colors);
+      const last = this.last;
+      this.last = {
+        centers: writeIfChanged(this.center, data.centers, last.centers),
+        radii: writeIfChanged(this.radius, data.radii, last.radii),
+        angles: writeIfChanged(this.angles, data.angles, last.angles),
+        colors: writeIfChanged(this.color, data.colors, last.colors),
+      };
       this.hl.write(data);
     }
     this.count = data.count;
@@ -737,6 +745,7 @@ export class InstancedArrows {
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
       u_pickBase: 0,
+      u_radiusWorld: data.radiiWorld ? 1 : 0, // #494: world setbacks on a screen layer
       ...highlightUniforms(1), // arrows recolour with their link
     };
     const bufferLayout = [
@@ -812,6 +821,7 @@ export class InstancedArrows {
   update(device: Device, data: InstancedArrowsData): boolean {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     if (!!data.half !== this._half) return false; // vertex template changed — caller must recreate
+    this.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
@@ -969,6 +979,7 @@ export class InstancedHalfArrows {
       u_screen: 0,
       u_viewport: [width, height],
       u_pickBase: 0,
+      u_radiusWorld: data.radiiWorld ? 1 : 0, // #494: world radii on a screen layer
       ...highlightUniforms(1), // half-arrows recolour toward the highlight hue
     };
     const bufferLayout = [
@@ -1045,6 +1056,7 @@ export class InstancedHalfArrows {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
+    this.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();

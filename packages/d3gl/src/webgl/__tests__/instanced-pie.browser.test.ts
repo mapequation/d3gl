@@ -132,6 +132,7 @@ describe("pie backend equivalence (#171)", () => {
       end: new Float32Array([0.3, 0.65, 1]),
       color: ["#e41a1c", "#377eb8", "#4daf4a"],
       moduleKey: ["1", "2", "3"],
+      modulePath: [[1], [2], [3]],
       wedgeCount: new Uint32Array([3]),
     };
     const positions = new Float32Array([48, 48]);

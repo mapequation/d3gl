@@ -700,11 +700,99 @@ function constBorderArrays(
  *   is filled with `scale` of its **aggregated** metric, summed like {@link NodeRadiusSpec}'s `{ by }`
  *   (so a module reads as its total flow). A spatial-tree cell is a region, not a unit of the metric, so
  *   it keeps its members' colour mean — as its radius stays area-additive.
+ * - `{ by: "module", color? }` — a colour per **module**, from the hierarchy the engine holds (#494); without
+ *   `color`, the style's `moduleColor`:
+ *   `data(graph, { modules })`, or a state network's `modules` (`stateNetwork()`). A node takes its
+ *   enclosing module's colour, `color(path)` with `path` the node's module path minus its own rank (the
+ *   1-based chain, `[]` for a node in no module), as {@link moduleColors} colours. In a state network, a
+ *   physical node (its disc, or its both-view container) takes its dominant module at the pie level, the one
+ *   holding most of its flow (a tie goes to the lower module), and each pie wedge its own module (see
+ *   {@link PieWedgeOptions.level}). `color` is asked once per module, not per node; `undefined` (a module
+ *   the palette has no colour for), and every node of a network without a hierarchy, take the default fill.
+ *   An LOD aggregate that is a module (a module tree's) takes that module's own colour, `color(its path)`;
+ *   one that is not (a spatial or structural tree's) takes its members' colour mean, as with an accessor.
  */
 export type NodeFillSpec =
   | string
   | ((index: number, graph: NetworkGraph) => string)
-  | { by: NodeMetric; scale: (value: number) => string };
+  | { by: NodeMetric; scale: (value: number) => string }
+  | ModuleFillSpec;
+
+/** {@link NodeFillSpec}'s module form (#494): the app's colour for a module path, e.g. a palette keyed by module.
+ *  Without `color` it takes the style's {@link ModuleColor} (`style({ moduleColor })`). */
+export interface ModuleFillSpec {
+  by: "module";
+  color?: ModuleColor;
+}
+
+/** The app's colour for a module (#494), by its module path (`[]` the root); `undefined`: the default fill. */
+export type ModuleColor = (modulePath: readonly number[]) => string | undefined;
+
+/** Whether a {@link NodeFillSpec} is the {@link ModuleFillSpec} form. */
+export function isModuleFill(spec: NodeFillSpec | undefined): spec is ModuleFillSpec {
+  return typeof spec === "object" && spec.by === "module";
+}
+
+/**
+ * A {@link ModuleColor} over one interned hierarchy's modules (#494): module `m` (with path `paths[m]`) is asked
+ * of `color` once, on first use, and its RGBA kept packed — 4 B per module. One palette serves everything a
+ * style colours by module over that hierarchy (nodes, LOD module aggregates, a state network's levels and pie
+ * wedges), so `color` is asked once per module in all, and never per frame.
+ */
+export interface ModulePalette {
+  readonly color: ModuleColor;
+  readonly paths: readonly (readonly number[])[];
+  readonly rgba: Uint8Array;
+  readonly done: Uint8Array;
+  readonly base: readonly [number, number, number, number];
+}
+
+/** A {@link ModulePalette} of `color` over the modules `paths`, `fallback` where `color` gives none. O(modules). */
+export function modulePalette(paths: readonly (readonly number[])[], color: ModuleColor, fallback: string): ModulePalette {
+  return { color, paths, rgba: new Uint8Array(4 * paths.length), done: new Uint8Array(paths.length), base: toRGBA(fallback) };
+}
+
+/** Module `m`'s RGBA in `palette` (a view), asked of its `color` the first time only. */
+export function paletteRGBA(palette: ModulePalette, m: number): Uint8Array {
+  const { rgba, done } = palette;
+  if (!done[m]) {
+    done[m] = 1;
+    const css = palette.color(palette.paths[m] ?? []);
+    rgba.set(css === undefined ? palette.base : toRGBA(css), 4 * m);
+  }
+  return rgba.subarray(4 * m, 4 * m + 4);
+}
+
+/** The RGBA of a module `path` outside `palette`'s hierarchy: asked of its `color` on every call. */
+export function pathRGBA(palette: ModulePalette, path: readonly number[]): readonly [number, number, number, number] {
+  const css = palette.color(path);
+  return css === undefined ? palette.base : toRGBA(css);
+}
+
+/**
+ * Per-node RGBA (length `4·nodeCount`) for a module colour over `modules` (#494): each module that holds a node
+ * is asked once (through `palette`, which the rest of a style may share), and a module it gives no colour (or a
+ * node in none) takes `fallback`. O(nodes + modules); called once per style, never per frame.
+ */
+export function moduleFillColors(
+  modules: { moduleOf: Int32Array; paths: readonly (readonly number[])[] },
+  color: ModuleColor,
+  fallback: string,
+  palette: ModulePalette = modulePalette(modules.paths, color, fallback),
+): Uint8Array {
+  const { moduleOf } = modules;
+  const n = moduleOf.length;
+  const out = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const m = moduleOf[i]!;
+    const c: ArrayLike<number> = m >= 0 ? paletteRGBA(palette, m) : palette.base;
+    out[4 * i] = c[0]!;
+    out[4 * i + 1] = c[1]!;
+    out[4 * i + 2] = c[2]!;
+    out[4 * i + 3] = c[3]!;
+  }
+  return out;
+}
 
 /** A resolved {@link NodeFillSpec}: one colour, or per-node RGBA plus (for `{ by, scale }`) the aggregate rule. */
 export interface ResolvedNodeFill {
@@ -714,13 +802,26 @@ export interface ResolvedNodeFill {
   nodeColors?: Uint8Array;
   /** `{ by, scale }` only: how an LOD aggregate is filled from its aggregated metric. */
   fillAggregate?: FillAggregate;
+  /** `{ by: "module" }` with per-node colours (#494): the palette they came from, for an LOD tree's module aggregates. */
+  modulePalette?: ModulePalette;
 }
 
-/** Resolve a {@link NodeFillSpec} once per `style()`: O(nodeCount) scale/accessor calls, never per frame. */
-export function resolveNodeFill(graph: NetworkGraph, spec: NodeFillSpec | undefined, fallback: string): ResolvedNodeFill {
+/** Resolve a {@link NodeFillSpec} once per `style()`: O(nodeCount) scale/accessor calls, never per frame.
+ *  `modules` is the hierarchy a {@link ModuleFillSpec} resolves through (null: none, the default fill). */
+export function resolveNodeFill(
+  graph: NetworkGraph,
+  spec: NodeFillSpec | undefined,
+  fallback: string,
+  modules: { moduleOf: Int32Array; paths: readonly (readonly number[])[] } | null = null,
+): ResolvedNodeFill {
   if (spec === undefined) return { nodeFill: fallback };
   if (typeof spec === "string") return { nodeFill: spec };
   if (typeof spec === "function") return { nodeFill: fallback, nodeColors: resolveNodeColors(graph, spec) };
+  if (isModuleFill(spec)) {
+    if (!modules || !spec.color) return { nodeFill: fallback };
+    const palette = modulePalette(modules.paths, spec.color, fallback);
+    return { nodeFill: fallback, nodeColors: moduleFillColors(modules, spec.color, fallback, palette), modulePalette: palette };
+  }
   const value = metricAccessor(graph, spec.by);
   const { scale } = spec;
   const n = graph.nodeCount;
@@ -2538,10 +2639,18 @@ export interface ResolvedNetworkStyle {
    * out). Nodes, links and arrowheads all honour it in-shader.
    */
   sizeMode: "world" | "screen";
+  /**
+   * The links' and arrowheads' units when they differ from {@link sizeMode} (#494): a state network's both
+   * view draws its nodes in world units (dots inside world-sized containers) and its links in the app's
+   * own sizeMode. Absent: {@link sizeMode}. See {@link linkSizeModeOf}.
+   */
+  linkSizeMode?: "world" | "screen";
   /** Optional per-node RGBA fill (categorical module colours, #104 rework); overrides `nodeFill` when set. */
   nodeColors?: Uint8Array;
   /** `nodeFill: { by, scale }` (#445): the per-leaf metric + scale that fill LOD aggregates by their summed metric. */
   nodeFillAggregate?: FillAggregate;
+  /** `nodeFill: { by: "module" }` (#494): the module palette, whose colours a module tree's aggregates take. */
+  nodeModulePalette?: ModulePalette;
   /** Flow-border ring (#104 N6), or `null` when disabled (plain filled nodes). */
   flowBorder: ResolvedFlowBorder | null;
   /** Constant border ring (#104 rework), or `null`; used when no flow border is set. */
@@ -2585,6 +2694,8 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   const layers: InstancedLayer[] = [];
   const bend = style.linkBend;
   const halfArrow = style.linkStyle === "half-arrow" && style.directed;
+  const linkMode = linkSizeModeOf(style); // #494: px links over world nodes keep their own units
+  const radiiWorld = linkRadiiWorld(style) || undefined;
   if (drawsLinks(graph, style)) {
     if (halfArrow) {
       // One fused filled glyph per directed link (the map-of-networks look): the arrowhead is part of
@@ -2593,25 +2704,25 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       layers.push({
         name: "links",
         primitive: "half-arrows",
-        halfArrows: halfArrowLinks(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
-        sizeMode: style.sizeMode,
+        halfArrows: { ...halfArrowLinks(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }), radiiWorld },
+        sizeMode: linkMode,
       });
     } else {
       layers.push({
         name: "links",
         primitive: "lines",
         lines: linkLines(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
-        sizeMode: style.sizeMode,
+        sizeMode: linkMode,
       });
       if (style.directed) {
         layers.push({
           name: "arrows",
           primitive: "arrows",
           // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
-          arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }),
+          arrows: { ...linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }), radiiWorld },
           // The arrowhead shader honours sizeMode in-shader (tip projected + set back in the working
           // space), so screen mode keeps a constant pixel head on the node boundary.
-          sizeMode: style.sizeMode,
+          sizeMode: linkMode,
         });
       }
     }
@@ -2702,16 +2813,34 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
  * centers alias `graph.positions`, colours/radii come from the cached `style`; only a border layer does
  * an O(node) position pass). Must be called with the SAME `style` version the cache was built from.
  */
+/** The units of `style`'s links and arrowheads ({@link ResolvedNetworkStyle.linkSizeMode}). */
+export function linkSizeModeOf(style: ResolvedNetworkStyle): "world" | "screen" {
+  return style.linkSizeMode ?? style.sizeMode;
+}
+
+/** Whether `style`'s links are px-sized over world-sized nodes (#494): their endpoint radii are world units
+ *  on a screen layer, scaled to px by the zoom ({@link InstancedArrowsData.radiiWorld}). */
+export function linkRadiiWorld(style: ResolvedNetworkStyle): boolean {
+  return linkSizeModeOf(style) === "screen" && style.sizeMode === "world";
+}
+
 export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetworkStyle, cache: NoLodStyleCache): InstancedLayer[] {
   const layers: InstancedLayer[] = [];
   const sizeMode = style.sizeMode;
   if (drawsLinks(graph, style)) {
+    // Links keep their own units (#494: px links over the both view's world nodes), radii flagged to match.
+    const linkMode = linkSizeModeOf(style);
+    const radiiWorld = linkRadiiWorld(style) || undefined;
     if (cache.kind === "half-arrows" && cache.halfArrows) {
-      layers.push({ name: "links", primitive: "half-arrows", halfArrows: halfArrowLinksFromCache(graph, cache.halfArrows), sizeMode });
+      const halfArrows = halfArrowLinksFromCache(graph, cache.halfArrows);
+      if (radiiWorld) halfArrows.radiiWorld = true;
+      layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: linkMode });
     } else if (cache.lines) {
-      layers.push({ name: "links", primitive: "lines", lines: linkLinesFromCache(graph, cache.lines), sizeMode });
+      layers.push({ name: "links", primitive: "lines", lines: linkLinesFromCache(graph, cache.lines), sizeMode: linkMode });
       if (cache.arrows) {
-        layers.push({ name: "arrows", primitive: "arrows", arrows: linkArrowsFromCache(graph, cache.arrows), sizeMode });
+        const arrows = linkArrowsFromCache(graph, cache.arrows);
+        if (radiiWorld) arrows.radiiWorld = true;
+        layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: linkMode });
       }
     }
   }
@@ -2803,9 +2932,10 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
  * back by `1/bake`, so the Scene's ×k view transform reproduces the WebGL constant-px arrowhead — tip
  * size *and* the node-boundary setback. Without it, the world-unit setback grows with zoom and the head
  * drifts off the node. The end-tangent direction is invariant under the uniform ×bake, so only the
- * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched.
+ * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched. `radiusScale` turns
+ * `nodeRadii` into the solve's px: `bake` for world-sized nodes under px-sized arrows (#494), else 1.
  */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1): void {
+export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1, radiusScale = 1): void {
   const inv = 1 / bake;
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
@@ -2817,7 +2947,7 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
     const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
-    const setback = nodeRadii[t]!;
+    const setback = nodeRadii[t]! * radiusScale;
     const tipX = tx - ux * setback;
     const tipY = ty - uy * setback;
     const baseX = tipX - ux * 2 * size;
@@ -2843,7 +2973,8 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
  * centres × `bake`, with `nodeRadii`/`widthOf`/`bend` already in px) and the result scaled by `1/bake`,
  * so the Scene's ×k transform reproduces the WebGL constant-px render *exactly* — including the
  * non-linear tip/bend terms, which a naive per-size division would distort (and worse the deeper you
- * zoom). `bake = 1` (world mode) leaves world sizes untouched.
+ * zoom). `bake = 1` (world mode) leaves world sizes untouched. `radiusScale` turns `nodeRadii` into the
+ * solve's px: `bake` for world-sized nodes under px-sized links (#494), else 1.
  */
 export function emitHalfLinks(
   g: GroupBuilder,
@@ -2852,6 +2983,7 @@ export function emitHalfLinks(
   widthOf: (weight: number) => number,
   bend: number,
   bake = 1,
+  radiusScale = 1,
 ): void {
   const opposite = reciprocalEdges(graph);
   for (let e = 0; e < graph.edgeCount; e++) {
@@ -2867,10 +2999,10 @@ export function emitHalfLinks(
     const geom = halfLinkGeometry({
       x0,
       y0,
-      r0: nodeRadii[s]!,
+      r0: nodeRadii[s]! * radiusScale,
       x1,
       y1,
-      r1: nodeRadii[t]!,
+      r1: nodeRadii[t]! * radiusScale,
       width: widthOf(graph.weight[e]!),
       oppositeWidth: widthOf(o < 0 ? graph.weight[e]! : (graph.weight[o] ?? 0)),
       bend: chordBend(x0, y0, x1, y1, bend),
@@ -3062,7 +3194,14 @@ const TAU = Math.PI * 2;
  * each node-drag frame, not only a data/module change — and it rebuilds + re-parses every column each
  * time; caching the position-independent ones is #314. A zoom/pan never calls it (that lane is static).
  */
-export function physicalPieInstances(wedges: PhysicalPieWedges, positions: ArrayLike<number>, radius: PieRadius): InstancedPieData {
+export function physicalPieInstances(
+  wedges: PhysicalPieWedges,
+  positions: ArrayLike<number>,
+  radius: PieRadius,
+  /** Per-wedge RGBA (length `4·wedges`, wedge index order), resolved once per style (#494); default: each
+   *  wedge's `color`, parsed per call. */
+  rgba?: Uint8Array,
+): InstancedPieData {
   const { offset, end, color, wedgeCount } = wedges;
   const physicalCount = wedgeCount.length;
   const radiusAt = typeof radius === "number" ? () => radius : (p: number) => radius[p]!;
@@ -3088,11 +3227,14 @@ export function physicalPieInstances(wedges: PhysicalPieWedges, positions: Array
       radii[w] = r;
       angles[2 * w] = a0;
       angles[2 * w + 1] = a1;
-      const [rr, gg, bb, aa] = toRGBA(color[k]!);
-      colors[4 * w] = rr;
-      colors[4 * w + 1] = gg;
-      colors[4 * w + 2] = bb;
-      colors[4 * w + 3] = aa;
+      if (rgba) colors.set(rgba.subarray(4 * k, 4 * k + 4), 4 * w);
+      else {
+        const [rr, gg, bb, aa] = toRGBA(color[k]!);
+        colors[4 * w] = rr;
+        colors[4 * w + 1] = gg;
+        colors[4 * w + 2] = bb;
+        colors[4 * w + 3] = aa;
+      }
       groups[w] = p;
       a0 = a1;
       w++;
