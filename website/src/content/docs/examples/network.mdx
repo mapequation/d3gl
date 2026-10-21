@@ -579,6 +579,22 @@ with zero CSS. Pass `style` (an inline CSS-properties object, merged over the de
 `style: { color: "#1f2937" }` recolours and keeps the rest — or take full control with `className`,
 which skips the built-in default so your class's CSS decides everything.
 
+**Long labels.** Set `maxWidth` (screen px of text) to draw a long label trimmed with an ellipsis — a state
+network's names, say, like `{Allentown/Bethlehem/Easton,PA:LehighValleyInternational}_Albany,NY:AlbanyInternational`,
+would cover the map and push other labels out of placement. Placement culls on the **trimmed** box, and
+with `interactive({ hover: true })` the hovered glyph's label shows **in full** while the pointer is on it
+(even where collision dropped it), on every backend:
+
+```ts
+net.interactive({ hover: true }).labels({ labelOf: (id) => names[id], maxWidth: 120 });
+```
+
+It is px rather than characters because the collision box is measured in px, so the cap bounds the
+footprint whatever the font or the text. Unset (the default), labels are drawn in full. The text is
+measured and trimmed once per distinct string, so a frame costs a lookup per candidate, and a hover
+change costs O(1): one label rewritten, no re-placement. The [load-a-network example](#loading-a-network-from-a-file)
+trims two long names in its sample (hover one to read it in full).
+
 Set `max` to surface only the most important few on a **dense** map — the [directed map of modules](#a-directed-map-of-modules)
 below uses `max: 12`, where flow varies so the top-12 by importance (the tree's `weight` = summed flow)
 are the dominant modules/hubs.
@@ -912,9 +928,10 @@ the name: a **`.net`** file is read as **Pajek** (vertex labels and coordinates,
 and anything else as a plain **edge list** (`source target [weight]`, one edge per line, `#`
 comments). Pick your own file or load a built-in sample of each format. Nodes are **sized by degree**
 (`scaleSqrt`) so hubs stand out, and vertex **labels** are engine-managed
-[frontier labels](#frontier-labels) — one `net.labels({ labelOf, offset })` call, and they're culled
+[frontier labels](#frontier-labels) — one `net.labels({ labelOf, offset, maxWidth })` call, and they're culled
 against each other and re-placed on every pan/zoom **and every layout frame**, with the default label
-style (no CSS, no overlay bookkeeping, and no reaching into position arrays).
+style (no CSS, no overlay bookkeeping, and no reaching into position arrays). `maxWidth` trims the sample's
+two long names with an ellipsis; hover one to read it in full.
 
 <ExampleCard files={["load-network/draw.ts", "load-network/data.ts"]}>
   <LoadNetwork client:visible slot="demo" />
