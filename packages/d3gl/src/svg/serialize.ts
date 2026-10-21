@@ -1,4 +1,4 @@
-import type { VectorLayer, ViewTransform, DrawableVector, TextData } from "../core/index.js";
+import type { VectorLayer, ViewTransform, DrawableVector, TextData, HoverText } from "../core/index.js";
 import { SvgPathContext } from "./svg-context.js";
 
 function rgba([r, g, b, a]: readonly [number, number, number, number]): string {
@@ -21,6 +21,16 @@ export function serializeTexts(texts: readonly TextData[]): string {
     return `<text x="${td.x}" y="${td.y}" text-anchor="${anchor}" dominant-baseline="central" style="font:${td.font ?? "12px sans-serif"}" fill="${fill}"${halo}${op}>${escapeXml(td.text)}</text>`;
   });
   return `<g>${els.join("")}</g>`;
+}
+
+/** The hovered label (#496): a solid chip under the text, so it covers the trimmed label beneath. */
+export function serializeHoverText(h: HoverText | null): string {
+  if (!h) return "";
+  const { text: td, width, height } = h;
+  const pad = td.halo?.width ?? 2;
+  const left = td.align === "middle" ? td.x - width / 2 : td.align === "end" ? td.x - width : td.x;
+  const chip = `<rect x="${left - pad}" y="${td.y - height / 2 - 1}" width="${width + 2 * pad}" height="${height + 2}" fill="${td.halo?.color ?? "#fff"}"/>`;
+  return `<g>${chip}${serializeTexts([td]).replace(/^<g>|<\/g>$/g, "")}</g>`;
 }
 
 function pathD(d: DrawableVector): string {

@@ -1,4 +1,4 @@
-import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath, StyleTables, TextData } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath, StyleTables, TextData, HoverText } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
 import { paintTexts } from "./draw-texts.js";
 
@@ -182,16 +182,77 @@ export class CanvasBackend implements Backend {
     this.textData = texts;
   }
 
+  /** The one hovered label shown in full (#496), and the pixels it covers, kept to restore on clear. */
+  private hoverText: HoverText | null = null;
+  private snapCanvas: HTMLCanvasElement | null = null;
+  private hoverSnap: { cv: HTMLCanvasElement; x: number; y: number; w: number; h: number } | null = null;
+
+  /**
+   * The one-label hover slot (#496): paint a chip and the full text over the live canvas, keeping the small
+   * rectangle underneath so a clear puts it back. Costs one `drawImage` out and one back of a label-sized
+   * rectangle (a copy, not `getImageData`, which un-premultiplies and would not restore exactly) plus one text paint, whatever the scene or the placed labels, and repaints nothing else. A
+   * later `render()` repaints everything and paints the hover again from `hoverText`.
+   */
+  setHoverText(hover: HoverText | null): void {
+    this.restoreHover();
+    this.hoverText = hover;
+    if (hover) this.paintHover(hover);
+  }
+
+  private restoreHover(): void {
+    const snap = this.hoverSnap;
+    this.hoverSnap = null;
+    if (!snap) return;
+    const { ctx } = this;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.beginPath();
+    ctx.rect(snap.x, snap.y, snap.w, snap.h);
+    ctx.clip(); // "copy" would otherwise clear the whole canvas outside the rectangle
+    ctx.globalCompositeOperation = "copy";
+    ctx.drawImage(snap.cv, 0, 0, snap.w, snap.h, snap.x, snap.y, snap.w, snap.h);
+    ctx.restore();
+  }
+
+  private paintHover(h: HoverText): void {
+    const { ctx, dpr } = this;
+    const td = h.text;
+    const pad = td.halo?.width ?? 2;
+    const left = (td.align === "middle" ? td.x - h.width / 2 : td.align === "end" ? td.x - h.width : td.x) - pad;
+    const top = td.y - h.height / 2 - 1;
+    const w = h.width + 2 * pad, ht = h.height + 2;
+    // Device-px rectangle clamped to the canvas.
+    // Kept rectangle: the chip plus the halo's reach beyond it (the stroke is `pad` px on each side of the glyphs).
+    const m = pad + 1;
+    const x0 = Math.max(0, Math.floor((left - m) * dpr)), y0 = Math.max(0, Math.floor((top - m) * dpr));
+    const x1 = Math.min(this.canvas.width, Math.ceil((left + w + m) * dpr)), y1 = Math.min(this.canvas.height, Math.ceil((top + ht + m) * dpr));
+    if (x1 > x0 && y1 > y0) {
+      const cv = this.snapCanvas ?? (this.snapCanvas = document.createElement("canvas"));
+      cv.width = x1 - x0; cv.height = y1 - y0; // resizing clears it; one reusable canvas, no per-hover allocation of a new one
+      cv.getContext("2d")?.drawImage(this.canvas, x0, y0, cv.width, cv.height, 0, 0, cv.width, cv.height);
+      this.hoverSnap = { cv, x: x0, y: y0, w: cv.width, h: cv.height };
+    }
+    ctx.save();
+    this.setScreen();
+    ctx.fillStyle = td.halo?.color ?? "#fff";
+    ctx.fillRect(left, top, w, ht);
+    paintTexts(ctx, [td]);
+    ctx.restore();
+  }
+
   /** Draw the text labels in screen space (constant pixel font) via the shared painter
    *  ({@link paintTexts} — also used by the WebGL toPNG export composite, #219). Coords are
    *  CSS px; setScreen folds in the device-pixel ratio. */
   private drawTexts(): void {
-    if (this.textData.length === 0) return;
-    const { ctx } = this;
-    ctx.save();
-    this.setScreen();
-    paintTexts(ctx, this.textData);
-    ctx.restore();
+    this.hoverSnap = null; // a repaint drew over the pixels it kept; the hover below keeps fresh ones
+    if (this.textData.length > 0) {
+      const { ctx } = this;
+      ctx.save();
+      this.setScreen();
+      paintTexts(ctx, this.textData);
+      ctx.restore();
+    }
+    if (this.hoverText) this.paintHover(this.hoverText);
   }
 
   setPassThroughLayer(layer: PassThroughLayer): void {

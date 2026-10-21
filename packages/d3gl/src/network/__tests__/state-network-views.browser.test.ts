@@ -533,6 +533,38 @@ describe("hits and labels name their level in state mode (#494)", () => {
     expect((net.pick(60, 100)?.datum as NetworkHit).level).toBeUndefined();
     net.destroy();
   });
+
+  it("the hovered node's full label (#496) gets its view's level, as the drawn labels do", async () => {
+    const { graph, modules } = fixture();
+    const h = host();
+    const net = await engine(h);
+    const infos: { id: number; level?: string }[] = [];
+    const hoverAt = (x: number, y: number) => {
+      const r = h.getBoundingClientRect();
+      h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + x, clientY: r.top + y, bubbles: true }));
+    };
+    net.style({ nodeRadius: 8 }).stateNetwork(graph, { modules, view: "physical" });
+    place(net);
+    net.interactive({ hover: true });
+    // maxWidth turns on the full label on hover; labelOf records the info of every call.
+    net.labels({ labelOf: (id, info) => (infos.push({ id, level: info.level }), `node ${id}`), maxWidth: 20 });
+
+    infos.length = 0;
+    hoverAt(POS[2]!, POS[3]!); // physical node 1
+    const physical = infos.filter((i) => i.id === 1);
+    expect(physical.length, "the hover asked no label of physical node 1").toBeGreaterThan(0);
+    expect(physical.every((i) => i.level === "physical")).toBe(true);
+
+    hoverAt(5, 195); // empty space: ends the hover
+    net.view("state");
+    const [x, y] = statePos(graph, 3);
+    infos.length = 0;
+    hoverAt(x, y); // state node 3
+    const state = infos.filter((i) => i.id === 3);
+    expect(state.length, "the hover asked no label of state node 3").toBeGreaterThan(0);
+    expect(state.every((i) => i.level === "state")).toBe(true);
+    net.destroy(); h.remove();
+  });
 });
 
 // ── #494 review: link units in the both view, LOD across views, module aggregates ─────────────────────────
