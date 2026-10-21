@@ -1656,8 +1656,10 @@ export class Network extends BaseEngine {
   /**
    * The positions of the nodes the engine draws, interleaved `[x, y, …]` in world units, indexed by the ids its
    * hits carry: the graph's own `positions` for a plain network; in a state network the active view's (#495) —
-   * the physical graph's, the state graph's, or in the both view the state dots' at their places in their
-   * containers, which no graph holds. Live: read it when needed (a layout writes into it, and may replace it).
+   * the physical graph's, the state graph's, or in the both view the state nodes', which no graph holds: under
+   * `sizeMode: "world"` where they are drawn, their physical node's position plus their packed offset; under
+   * `"screen"` their physical node's position, since their offset is in px and the GPU adds it at every zoom
+   * (#509). Live: read it when needed (a layout writes into it, and may replace it).
    * Null without data.
    */
   get positions(): Float32Array | null {
