@@ -2005,13 +2005,6 @@ export class Network extends BaseEngine {
     return w !== undefined && Number.isFinite(w) && w > 0 ? w : undefined;
   }
 
-  /**
-   * Show the hovered glyph's label in full (#496), or clear it. Only with `maxWidth` set and
-   * `interactive({ hover })` on. Costs O(1): the hovered id (kept per hover change), one `labelOf`, one
-   * memoized measure and trim, and one node rewrite — never a re-placement of the other labels, so a hover
-   * sweep adds nothing that grows with the labels shown or the graph. Called on every hover change and at
-   * the end of {@link refreshLabels}.
-   */
   /** The node / aggregate under the pointer (#496), set per hover change in {@link onHoverTarget}. */
   private hoverLabelId: number | null = null;
 
@@ -2026,6 +2019,13 @@ export class Network extends BaseEngine {
     this.syncHoverLabel();
   }
 
+  /**
+   * Show the hovered glyph's label in full (#496), or clear it. Only with `maxWidth` set and
+   * `interactive({ hover })` on. Costs O(1): the hovered id (kept per hover change), one `labelOf`, one
+   * memoized measure and trim, and one node rewrite — never a re-placement of the other labels, so a hover
+   * sweep adds nothing that grows with the labels shown or the graph. Called on every hover change and at
+   * the end of {@link refreshLabels}.
+   */
   private syncHoverLabel(): void {
     const opts = this.labelOpts;
     if (!this.labelLayer || !opts || !this.graph) return;
