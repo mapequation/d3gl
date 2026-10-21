@@ -1,13 +1,13 @@
 /**
  * A small directed network with self-links: six nodes on a ring and a hub, linked around the ring and to the
- * hub, with a self-link on three ring nodes (each loop points away from the hub). Node 2 has two self-link edges, which d3gl sums into one loop.
+ * hub, with a self-link on three ring nodes (each loop points away from the hub).
  */
 
 export interface SelfLinkGraph {
   nodeCount: number;
   source: Uint32Array;
   target: Uint32Array;
-  /** Per-edge weight → link width (a loop's width is its node's summed self-link weight). */
+  /** Per-edge weight → link width (a loop's width is its self-link's weight). */
   weight: Float32Array;
   positions: Float32Array;
 }
@@ -20,8 +20,8 @@ const EDGES: [number, number, number][] = [
   // around the ring, and each ring node to the hub (node 6)
   [0, 1, 2], [1, 2, 1], [2, 3, 3], [3, 4, 1], [4, 5, 2], [5, 0, 1],
   [0, 6, 1], [6, 1, 2], [2, 6, 1], [6, 3, 1], [4, 6, 2], [6, 5, 1],
-  // self-links: node 2's two edges are summed into one loop of weight 4
-  [0, 0, 3], [2, 2, 1], [2, 2, 3], [4, 4, 1],
+  // self-links
+  [0, 0, 3], [2, 2, 4], [4, 4, 1],
 ];
 
 export function buildSelfLinkGraph(): SelfLinkGraph {

@@ -4,9 +4,8 @@ import type { ImperativeSetup } from "../types.js";
 import { buildSelfLinkGraph, BOUNDS } from "./data.js";
 
 /**
- * **Self-links** draw as a loop at their node, placed opposite the mean direction of the node's neighbours.
- * Several self-link edges on one node are summed into one loop, sized and coloured by the summed weight.
- * Switch the link **Style** and the **Sizing** mode, and the **backend** (WebGL / Canvas / SVG).
+ * **Self-links** draw as a loop at their node, placed opposite the mean direction of the node's neighbours,
+ * and styled like the other links. Switch the link **Style** and the **Sizing** mode, and the **backend** (WebGL / Canvas / SVG).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -31,7 +30,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         sizeMode: options.sizing === "Screen" ? "screen" : "world",
         nodeRadius: 18,
         nodeFill: "#f28e2b",
-        linkWidth, // ∝ weight; a loop takes its node's summed self-link weight
+        linkWidth, // ∝ weight, loops included
         linkStroke: linkColor,
       });
     },
