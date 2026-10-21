@@ -915,21 +915,46 @@ export function flowBorderInnerRadii(
  * per-instance GPU attribute, so degree/flow-scaled sizing costs nothing extra at draw time. With a
  * resolved {@link ResolvedFlowBorder} it also emits the per-node ring (#104 N6).
  */
-export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): InstancedCirclesData {
+export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved, cache?: NodeBorderCache): InstancedCirclesData {
   const count = graph.nodeCount;
   const colors = style.colors ?? fillColors(count, style.fill);
   const base = { centers: graph.positions, radii: style.radii, colors, count };
+  // With a cache (#513), the border columns are built once per style version and handed out again on every
+  // position frame: the same arrays, so the renderer skips their upload too.
+  const borders = cache ? (cache.nodeBorders ??= nodeBorderColumns(count, style, colors)) : nodeBorderColumns(count, style, colors);
+  return borders ? { ...base, ...borders } : base;
+}
+
+/** A node layer's border columns: each node's border width as a fraction of its radius, and its RGBA colour. */
+export interface NodeBorderColumns {
+  borders: Float32Array;
+  borderColors: Uint8Array;
+}
+
+/** Where {@link nodeCircles} keeps the node layer's {@link NodeBorderColumns} between position frames (#513).
+ *  Unset (or `null`, no border): built on the next call. Never mutated in place once set. */
+export interface NodeBorderCache {
+  nodeBorders?: NodeBorderColumns | null;
+}
+
+/** Border-column builds (#513), for the per-frame guards: with LOD off, one per style version, none per position frame. */
+export const nodeBorderColumnStats = { builds: 0 };
+
+/** The node layer's flow-border or node-border columns from the style and the node fill `colors`; `null` without a border. O(nodes). */
+function nodeBorderColumns(count: number, style: NodeStyleResolved, colors: ArrayLike<number>): NodeBorderColumns | null {
   if (style.border) {
+    nodeBorderColumnStats.builds++;
     const { metric, scale, flow, color, colors: explicit, darken } = style.border;
     // `darken` (no explicit ring colour) ⇒ each node's ring = its own fill darkened.
     const borderNodeColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
     const widths = flowBorderWidths(scale, style.radii, metric, flow);
-    return { ...base, ...buildBorders(count, style.radii, widths.valueOf, widths.scale, color, borderNodeColors) };
+    return buildBorders(count, style.radii, widths.valueOf, widths.scale, color, borderNodeColors);
   }
   if (style.constBorder) {
-    return { ...base, ...constBorderArrays(count, style.radii, style.constBorder, colors) };
+    nodeBorderColumnStats.builds++;
+    return constBorderArrays(count, style.radii, style.constBorder, colors);
   }
-  return base;
+  return null;
 }
 
 /**
@@ -2751,8 +2776,8 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
  * layout frame (#179): link/arrow colours, widths, per-edge radii/sizes/bends. Cached once per
  * resolved-style version so a layout frame reuses them (via {@link networkLayersFromCache}) instead
  * of re-running the colour/width scale accessors ~O(edgeCount) times per frame. The node circles'
- * style attributes (radii/fill colours/flow-border) are cached whole (positions alias `graph.positions`,
- * so only a border layer needs a fresh position-derived pass — handled by re-running {@link nodeCircles}).
+ * radii and fill colours come from the resolved style, their border columns from {@link NoLodStyleCache.nodeBorders}
+ * (#513), and their centres alias `graph.positions`, so a position frame rebuilds no border column.
  *
  * Also carries the #162 shader-highlight **group columns** (#214) — position-independent float copies
  * of the immutable edge list + the node-identity column. They never change between position frames, so
@@ -2779,6 +2804,10 @@ export interface NoLodStyleCache {
   /** Each link's end offsets (#509), from the style's {@link ResolvedNetworkStyle.nodeOffsets}: built once per
    *  style version, so the link layers hand the renderer the same arrays every frame. Absent without offsets. */
   ends?: EdgeOffsets;
+  /** The `nodes` layer's flow-border or node-border columns (#513): built by the first {@link networkLayersFromCache}
+   *  of a style version (not here, so an LOD view's leaf-link use of the cache never builds them), then the same
+   *  arrays every position frame. */
+  nodeBorders?: NodeBorderColumns | null;
 }
 
 /** Each link's two end offsets (#509), interleaved `[dx, dy, …]` per link in size units: its source's and its
@@ -2849,8 +2878,8 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
  * Assemble the no-LOD layers on a **position-only** frame (#179): rebuild ONLY the position-derived
  * endpoints/node-centres from `graph.positions`, reusing the cached style attributes in `cache`. Does
  * NOT run the colour/width scale accessors. The `nodes` layer re-runs {@link nodeCircles} (cheap:
- * centers alias `graph.positions`, colours/radii come from the cached `style`; only a border layer does
- * an O(node) position pass). Must be called with the SAME `style` version the cache was built from.
+ * centers alias `graph.positions`, colours/radii come from the cached `style`, and the border columns from
+ * `cache`, #513). Must be called with the SAME `style` version the cache was built from.
  */
 export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetworkStyle, cache: NoLodStyleCache): InstancedLayer[] {
   const layers: InstancedLayer[] = [];
@@ -2880,7 +2909,7 @@ export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetwo
         colors: style.nodeColors,
         border: style.flowBorder,
         constBorder: style.constBorder,
-      }),
+      }, cache),
       style.nodeOffsets,
     ),
     sizeMode,
