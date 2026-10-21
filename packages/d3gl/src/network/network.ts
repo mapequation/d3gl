@@ -31,7 +31,7 @@ import type { InstancedArrowsData, InstancedCirclesData, InstancedHalfArrowsData
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { StableColumns } from "../core/stable-columns.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
-import { hoverParts } from "../map/highlight.js";
+import { hoverParts, type HoverOption } from "../map/highlight.js";
 
 /**
  * The collapsed-module outline ring's resolved line (#329): an explicit `aggregateOutline`, else
@@ -5660,7 +5660,7 @@ export class Network extends BaseEngine {
       data: nodeIds,
       ids: nodeIds,
       sizeMode: style.sizeMode,
-      ...this.sceneNodeSelection(),
+      ...this.sceneNodeInteraction(this.leafDatumOf()),
       fill: (i) => fillOf(i as number),
       stroke: (i) => borderColorAt(i as number),
       build: (g) => {
@@ -5823,7 +5823,7 @@ export class Network extends BaseEngine {
       data: circleIds,
       ids: circleIds,
       sizeMode: style.sizeMode,
-      ...this.sceneNodeSelection(),
+      ...this.sceneNodeInteraction((g) => this.lodDatum(tree, g)),
       fill: (_d, i) => (circles ? rgbaCss(circles.colors, i) : ""),
       stroke: (_d, i) => (circles?.borderColors ? rgbaCss(circles.borderColors, i) : ""),
       build: (g) => {
@@ -5832,11 +5832,20 @@ export class Network extends BaseEngine {
     });
   }
 
-  /** The `interactive()` selection options for the Canvas/SVG Scene's node layer, where no lane carries them: a
-   *  click selects there, and a selection dims the others as on WebGL (#509). */
-  private sceneNodeSelection(): Partial<Pick<LayerSpec, "selectable" | "selection">> {
+  /** The `interactive()` options for the Canvas/SVG Scene's node layer, where no lane carries them: a click selects
+   *  there, a selection dims the others as on WebGL (#509), and a hover draws the hovered node's highlight and shows
+   *  the tooltip (#519). The layer's datum is the glyph id, so the tooltip and a custom hover draw get the lane's
+   *  {@link NetworkHit} through `datumOf`: O(1), once per hover change. */
+  private sceneNodeInteraction(datumOf: (id: number) => NetworkHit): Partial<Pick<LayerSpec, "selectable" | "selection" | "hover" | "tooltip">> {
     const opts = this.interactiveOpts;
-    return opts ? { selectable: opts.selectable, selection: opts.selection } : {};
+    if (!opts) return {};
+    const tip = opts.tooltip;
+    return {
+      selectable: opts.selectable,
+      selection: opts.selection,
+      hover: sceneHover(opts.hover, datumOf),
+      tooltip: tip && ((_d, id) => (typeof id === "number" ? tip(datumOf(id), id) : null)),
+    };
   }
 
   /** Resolved style, memoised until style()/data() invalidates it (radii resolution is O(n)). */
@@ -6081,4 +6090,12 @@ export class Network extends BaseEngine {
 /** Create a {@link Network} engine on `host`. */
 export function network(host: HTMLElement, opts: NetworkOptions = {}): Network {
   return new Network(host, opts);
+}
+
+/** `interactive({ hover })` for a Scene node layer (#519), whose datum is the glyph id: a custom hover draw gets the
+ *  node's {@link NetworkHit} through `datumOf`, as on the WebGL lane; `true`, a style and `others` pass through. */
+function sceneHover(hover: InteractiveLayerOptions<NetworkHit>["hover"], datumOf: (id: number) => NetworkHit): LayerSpec["hover"] {
+  const { hovered: own, others } = hoverParts(hover);
+  const hovered: HoverOption | undefined = typeof own === "function" ? (d, b) => { if (typeof d === "number") own(datumOf(d), b); } : own;
+  return others ? { hovered: hovered === true ? undefined : hovered, others } : hovered;
 }

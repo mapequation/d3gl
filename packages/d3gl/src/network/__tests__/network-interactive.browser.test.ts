@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import { leavesUnder } from "../lod.js";
+import { buildStateGraph } from "../state-graph.js";
+import type { Network } from "../network.js";
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -501,4 +503,52 @@ describe("network shader highlight: selection.others dim + outgoing links (#162)
     h.remove();
   });
   /* eslint-enable @typescript-eslint/no-explicit-any */
+});
+
+// #519: `interactive({ hover, tooltip })` alone — no `on(...)` handler — must hover a node on every backend. WebGL's
+// instanced lane attaches the pointer listeners and carries the options; Canvas/SVG register no lane, so the engine
+// must attach them and hand the hover options to the Scene's node layer, or a pointer move does nothing there.
+describe("interactive({ hover, tooltip }) without an on() handler (#519)", () => {
+  const plain = (net: Network): void => {
+    net.data(buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false })).style({ nodeRadius: 8 })
+      .layout({ backend: "positions", positions: new Float32Array([40, 40, 100, 100, 160, 60]) });
+  };
+  // A state network in its state view (a plain network of state nodes): 4 state nodes over 3 physical nodes. The
+  // physical nodes are placed; the state view starts from its rosette, where state node 2, alone in physical node 1,
+  // sits on that physical node's centre (100, 100).
+  const state = (net: Network): void => {
+    const graph = buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 2], source: [0, 1, 2], target: [1, 2, 3], directed: false });
+    net.style({ nodeRadius: 8 }).stateNetwork(graph, { view: "physical" });
+    net.layout({ backend: "positions", positions: new Float32Array([40, 40, 100, 100, 160, 60]) });
+    net.view("state");
+  };
+  const cases = [["plain", plain, 1], ["state", state, 2]] as const;
+  for (const backend of ["webgl", "canvas", "svg"] as const) {
+    for (const [kind, setup, hovered] of cases) {
+      it(`${backend}, ${kind} network: a pointer move over a node shows its tooltip and hover highlight`, async () => {
+        const h = host();
+        const net = network(h, { width: 200, height: 200, backend });
+        await net.whenReady();
+        setup(net);
+        const tipped: (string | number)[] = [];
+        net.interactive({ hover: true, tooltip: (_d, id) => { tipped.push(id); return `node ${id}`; } });
+        net.setTransform({ k: 1, x: 0, y: 0 });
+        // The drawn shapes of the export: the hover highlight adds one (an empty overlay group may stay behind).
+        const shapes = (): number => net.toSVG().match(/<(circle|path|ellipse)\b/g)?.length ?? 0;
+        const before = shapes();
+        const r = h.getBoundingClientRect();
+        h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 100, clientY: r.top + 100, bubbles: true }));
+        expect(tipped).toEqual([hovered]); // the tooltip callback fired, once, for the hovered node
+        const tip = h.querySelector<HTMLElement>(".d3gl-tooltip");
+        expect(tip?.textContent).toBe(`node ${hovered}`);
+        expect(tip?.style.display).not.toBe("none");
+        expect(shapes(), "the hover highlight was drawn").toBeGreaterThan(before);
+        h.dispatchEvent(new PointerEvent("pointerleave", { clientX: r.left + 199, clientY: r.top + 199, bubbles: true }));
+        expect(tip?.style.display).toBe("none");
+        expect(shapes(), "the hover highlight was cleared").toBe(before);
+        net.destroy();
+        h.remove();
+      });
+    }
+  }
 });
