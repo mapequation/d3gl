@@ -6,7 +6,7 @@ import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, t
 import type { ScreenRect } from "../core/instanced-lane.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
 import { PairIndex } from "./pair-index.js";
-import { selfLoopLayers, selfLoopPrototype } from "./self-loops.js";
+import { selfLoopCache, selfLoopLayers, updateSelfLoops, type SelfLoopCache } from "./self-loops.js";
 
 // Re-exported so the network's link-curve math keeps one import site for consumers/tests, even
 // though the formulas themselves now live in core (shared with the export-only vector view, #200).
@@ -2729,8 +2729,12 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       }
     }
   }
-  // #505: the self-link loops, between the links and the nodes ([] — no work past a cached O(1) lookup — without self-links).
-  if (drawsLinks(graph, style)) layers.push(...selfLoopLayers(graph, style, selfLoopPrototype()));
+  // #505: the self-link loops, between the links and the nodes (none — past a cached O(1) lookup — without self-links).
+  const loops = drawsLinks(graph, style) && !style.nodeOffsets ? selfLoopCache(graph, style) : null;
+  if (loops) {
+    updateSelfLoops(graph, loops);
+    layers.push(...selfLoopLayers(loops));
+  }
   layers.push({
     name: "nodes",
     primitive: "circles",
@@ -2782,6 +2786,9 @@ export interface NoLodStyleCache {
   /** Each link's end offsets (#509), from the style's {@link ResolvedNetworkStyle.nodeOffsets}: built once per
    *  style version, so the link layers hand the renderer the same arrays every frame. Absent without offsets. */
   ends?: EdgeOffsets;
+  /** The self-link loops (#505): their style columns, and position columns rewritten in place each frame.
+   *  Absent without self-links (and, for now, with node offsets: the state network's both view). */
+  loops?: SelfLoopCache;
 }
 
 /** Each link's two end offsets (#509), interleaved `[dx, dy, …]` per link in size units: its source's and its
@@ -2829,6 +2836,8 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   const groupTarget = style.directed ? undefined : Float32Array.from(graph.target);
   // The links' end offsets (#509): one O(edges) pass per style version, never per frame.
   const ends = style.nodeOffsets ? edgeOffsets(graph, style.nodeOffsets) : undefined;
+  // The self-link loops (#505): O(S) per style version; nothing without self-links (a cached O(E) scan per graph).
+  const loops = style.nodeOffsets ? undefined : (selfLoopCache(graph, style) ?? undefined);
   if (halfArrow) {
     return {
       kind: "half-arrows",
@@ -2838,14 +2847,15 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
       groupTarget,
       nodeGroups,
       ends,
+      loops,
     };
   }
   const lines = linkLinesStyleAttrs(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend });
   if (style.directed) {
     const arrows = linkArrowsStyleAttrs(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 });
-    return { kind: "lines+arrows", sizeMode, lines, arrows, groupSource, groupTarget, nodeGroups, ends };
+    return { kind: "lines+arrows", sizeMode, lines, arrows, groupSource, groupTarget, nodeGroups, ends, loops };
   }
-  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups, ends };
+  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups, ends, loops };
 }
 
 /**
@@ -2873,8 +2883,11 @@ export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetwo
       }
     }
   }
-  // #505: the self-link loops, between the links and the nodes ([] — no work past a cached O(1) lookup — without self-links).
-  if (drawsLinks(graph, style)) layers.push(...selfLoopLayers(graph, style, selfLoopPrototype()));
+  // #505: the self-link loops, between the links and the nodes: the cached columns, rewritten in place (O(S)).
+  if (cache.loops) {
+    updateSelfLoops(graph, cache.loops);
+    layers.push(...selfLoopLayers(cache.loops));
+  }
   layers.push({
     name: "nodes",
     primitive: "circles",
@@ -3022,6 +3035,7 @@ export function emitHalfLinks(
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
+    if (s === t) continue; // #505: a self-link is a loop (emitSelfLoopHalfArrows), not a zero-length glyph
     const o = opposite[e] ?? -1;
     // Solve in pixel space (positions × bake, px sizes); scale the result back by 1/bake to emit world
     // geometry the Scene's view transform restores to pixels. bake = 1 ⇒ plain world geometry.
