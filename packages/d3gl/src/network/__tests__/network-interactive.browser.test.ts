@@ -552,3 +552,130 @@ describe("interactive({ hover, tooltip }) without an on() handler (#519)", () =>
     }
   }
 });
+
+// #519: on Canvas/SVG a hover change repaints only the hover overlay slot — Canvas puts back the pixels it kept
+// under the old highlight, SVG rewrites one group. These pin that the slot leaves no ghost and agrees with a full
+// repaint, also after a full repaint (a zoom step, a layout frame) happened while a node was hovered.
+describe("Canvas/SVG hover overlay slot (#519)", () => {
+  const positions = new Float32Array([40, 40, 100, 100, 160, 60]);
+  const setup = (net: Network): void => {
+    net.data(buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false })).style({ nodeRadius: 8 })
+      .layout({ backend: "positions", positions });
+    net.interactive({ hover: true });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+  };
+  const move = (h: HTMLElement, x: number, y: number): void => {
+    const r = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + x, clientY: r.top + y, bubbles: true }));
+  };
+  const leave = (h: HTMLElement): void => {
+    const r = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointerleave", { clientX: r.left + 199, clientY: r.top + 199, bubbles: true }));
+  };
+
+  // Canvas: the live pixels, and how many bytes differ between two captures.
+  const pixels = (h: HTMLElement): Uint8ClampedArray => {
+    const cv = h.querySelector("canvas");
+    const ctx = cv?.getContext("2d");
+    if (!cv || !ctx) throw new Error("no 2D canvas");
+    return ctx.getImageData(0, 0, cv.width, cv.height).data;
+  };
+  const diff = (a: Uint8ClampedArray, b: Uint8ClampedArray): number => {
+    let n = 0;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) n++;
+    return n;
+  };
+
+  it("canvas: the highlight appears, leaves no ghost, and matches a full repaint after a move, a zoom step and a layout frame", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200, backend: "canvas" });
+    await net.whenReady();
+    setup(net);
+    net.render();
+    const clean = pixels(h);
+
+    move(h, 100, 100); // node 1
+    const on1 = pixels(h);
+    expect(diff(on1, clean), "the highlight was painted").toBeGreaterThan(0);
+    net.render(); // a full repaint paints the same highlight from the stored overlay
+    expect(diff(pixels(h), on1), "slot paint === full repaint").toBe(0);
+
+    move(h, 160, 60); // straight to node 2: node 1's highlight must go
+    const on2 = pixels(h);
+    net.render();
+    expect(diff(pixels(h), on2), "after a move: slot === full repaint (no ghost of node 1)").toBe(0);
+    leave(h);
+    expect(diff(pixels(h), clean), "after leaving: the clean scene, byte for byte").toBe(0);
+
+    // A zoom step while hovered repaints everything; the slot keeps fresh pixels and still clears exactly.
+    move(h, 100, 100);
+    net.setTransform({ k: 1.25, x: -10, y: -10 });
+    const zoomedOn = pixels(h);
+    leave(h);
+    const zoomedOff = pixels(h);
+    expect(diff(zoomedOn, zoomedOff), "the highlight was drawn again after the zoom").toBeGreaterThan(0);
+    net.render();
+    expect(diff(pixels(h), zoomedOff), "after the zoom: no ghost").toBe(0);
+
+    // A layout frame while hovered (new positions): no ghost of the highlight at the old place.
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    move(h, 100, 100);
+    net.layout({ backend: "positions", positions: new Float32Array([40, 40, 110, 120, 160, 60]) });
+    move(h, 110, 120);
+    leave(h);
+    const afterFrame = pixels(h);
+    net.render();
+    expect(diff(pixels(h), afterFrame), "after a layout frame: no ghost").toBe(0);
+    net.destroy();
+    h.remove();
+  });
+
+  it("svg: a hover change rewrites only the overlay group, leaves no ghost, and survives a zoom step and a layout frame", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    setup(net);
+    const svg = h.querySelector("svg");
+    if (!svg) throw new Error("no svg");
+    const clean = svg.innerHTML;
+    // Count the elements a change adds to the document: the overlay's few, never the scene's.
+    let added = 0;
+    const mo = new MutationObserver((rs) => {
+      for (const r of rs) for (const n of r.addedNodes) if (n instanceof Element) added += 1 + n.querySelectorAll("*").length;
+    });
+    mo.observe(svg, { childList: true, subtree: true });
+    const flush = (): number => { for (const r of mo.takeRecords()) for (const n of r.addedNodes) if (n instanceof Element) added += 1 + n.querySelectorAll("*").length; const a = added; added = 0; return a; };
+
+    move(h, 100, 100);
+    const onCount = flush();
+    expect(onCount, "the highlight was written").toBeGreaterThan(0);
+    expect(onCount, "and only the highlight (a few elements, not the 3 nodes + 2 links again)").toBeLessThan(5);
+    const on1 = svg.innerHTML;
+    move(h, 160, 60);
+    flush();
+    move(h, 100, 100);
+    expect(svg.innerHTML, "back on node 1: the same document, no ghost of node 2").toBe(on1);
+    leave(h);
+    expect(svg.innerHTML, "after leaving: the clean document").toBe(clean);
+
+    move(h, 100, 100);
+    net.setTransform({ k: 1.25, x: -10, y: -10 });
+    // The overlay group: the root's 4th child (defs, scene, screen-size scene, overlays, labels, hover label).
+    const overlayShapes = (): number => svg.children[3]?.querySelectorAll("circle, path, ellipse").length ?? -1;
+    expect(overlayShapes(), "the highlight was written again after the zoom").toBeGreaterThan(0);
+    leave(h);
+    expect(overlayShapes(), "the overlay group is empty after leaving").toBe(0);
+
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    move(h, 100, 100);
+    net.layout({ backend: "positions", positions: new Float32Array([40, 40, 110, 120, 160, 60]) });
+    move(h, 110, 120);
+    leave(h);
+    const afterFrame = svg.innerHTML;
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    expect(svg.innerHTML, "after a layout frame: no ghost").toBe(afterFrame);
+    mo.disconnect();
+    net.destroy();
+    h.remove();
+  });
+});

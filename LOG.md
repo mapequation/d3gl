@@ -121,6 +121,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | plot lane, per-frame | **WebGL** | `map/plot-points-perf.browser.test.ts` | 5k | `PERF_BROWSER_N` |
 | declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
+| hover overlay **slot** (#519): a hover change repaints only the highlight — zero `clearRect`, ≤ 8 `fill`+`stroke` per change (Canvas); scene groups untouched, ≤ 8 elements written per change (SVG); median ms per change | Canvas, SVG | `network/__tests__/network-hover-slot-perf.browser.test.ts` | 50k nodes + links, LOD off, 120 hover changes | `perfN` (max 200k) |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band — on a flat **and** a `multilevel` solver (#353: every seeded run ticks the graph's level on the latter), whose graph-level ticks are also pinned bitwise equal to the flat solver's (pyramid with hub rows, and all-pairs) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
@@ -809,6 +810,15 @@ correct:
 - **Withdraw a request whose state is gone** (`withdrawRedraw()`, e.g. a halted layout's streamed frame).
 - Guards: `map/zoom-coalesce.browser.test.ts` (base engine), `network/__tests__/network-input-coalesce.browser.test.ts`
   (WebGL/Canvas/SVG) and the ≈1M per-frame guard `network-input-coalesce-perf.browser.test.ts`.
+
+- **A hover change on Canvas/SVG repaints only the overlay slot (#519)**, never the scene: the engine hands
+  hover/`highlight()` overlays to `Backend.setOverlays` (not `setLayers`) and calls `renderOverlays()`. Canvas
+  keeps the pixels under each overlay's bounding box (`overlayBounds`, a `drawImage` copy, not `getImageData`)
+  and puts them back on the next change; SVG rewrites one group between the scene and the labels. Anything
+  that paints onto the live Canvas without a clear (`appendToLayer`, `drawPassThrough`) must `liftTop()`
+  before and `paintTop()` after, or the next hover change puts stale pixels back over the new shapes.
+  On Canvas the overlay sits over the placed labels (WebGL's HTML labels sit over it): keeping them on top
+  would mean repainting every placed label per change. Guard: `network-hover-slot-perf.browser.test.ts`.
 
 ## Curve bake tolerance is per DRAWABLE (#45, #283)
 

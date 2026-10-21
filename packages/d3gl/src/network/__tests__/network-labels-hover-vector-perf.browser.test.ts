@@ -83,8 +83,11 @@ describe.each(["svg", "canvas"] as const)("hover sweep, maxWidth labels — %s (
       expect(mutations / changes, "DOM mutation records per hover change").toBeLessThanOrEqual(4);
     } else {
       expect(clear.mock.calls.length, "the scene was repainted").toBe(0);
-      expect(fill.mock.calls.length / changes).toBeLessThanOrEqual(1);
-      expect(draw.mock.calls.length / changes).toBeLessThanOrEqual(2);
+      // The label once, plus once more when the hover highlight's slot (#519) repaints under it: the highlight
+      // slot lifts the label above it, puts back the old highlight's pixels, paints the new one and the label again.
+      expect(fill.mock.calls.length / changes).toBeLessThanOrEqual(2);
+      // A copy out and back per slot paint: the label's own change, the highlight (#519), and the label again above it.
+      expect(draw.mock.calls.length / changes).toBeLessThanOrEqual(6);
     }
     expect(worst).toBeLessThan(perfBudget(25));
     vi.restoreAllMocks();
