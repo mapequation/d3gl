@@ -3,9 +3,10 @@ import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 
 /**
- * #512: LOD declutter hides a frontier glyph only when it overlaps a kept glyph (default
- * `declutterSpacing` 1). Two module aggregates that sit apart are both drawn at radius 12, on WebGL,
- * Canvas and SVG; `declutterSpacing: 2` still widens the exclusion and drops one of them.
+ * #512: LOD declutter hides a frontier glyph whose centre is within `declutterSpacing·(rᵢ + rⱼ)` of a
+ * kept glyph. The default spacing 2 keeps a gap around kept glyphs (so links between them stay visible),
+ * which in this small graph hides one of two module aggregates that don't overlap. `declutterSpacing: 1`
+ * (only real overlaps) and `declutter: false` draw both. WebGL, Canvas and SVG.
  */
 
 const W = 200;
@@ -25,13 +26,15 @@ function host(): HTMLElement {
   return el;
 }
 
-async function drawnCircles(backend: (typeof BACKENDS)[number], declutterSpacing?: number): Promise<number> {
+type Declutter = { declutter?: boolean; declutterSpacing?: number };
+
+async function drawnCircles(backend: (typeof BACKENDS)[number], declutter: Declutter = {}): Promise<number> {
   const net = network(host(), { width: W, height: W, backend });
   await net.whenReady();
   net
     .data(buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true }))
     .style({ nodeRadius: 12, linkStyle: "none" });
-  net.lod({ modules: MODULES, expandPx: 20, ...(declutterSpacing === undefined ? {} : { declutterSpacing }) });
+  net.lod({ modules: MODULES, expandPx: 20, ...declutter });
   net.layout({ backend: "positions", positions: CLUSTERED });
   net.setTransform({ k: 1, x: 0, y: 0 });
   const count = (net.toSVG().match(/<circle[^>]*>/g) ?? []).length;
@@ -39,14 +42,18 @@ async function drawnCircles(backend: (typeof BACKENDS)[number], declutterSpacing
   return count;
 }
 
-describe("#512 LOD declutter hides only overlapping glyphs by default", () => {
+describe("#512 LOD declutter's spacing rule", () => {
   for (const backend of BACKENDS) {
-    it(`${backend}: both non-overlapping module aggregates are drawn at radius 12`, async () => {
-      expect(await drawnCircles(backend)).toBe(2);
+    it(`${backend}: the default spacing 2 hides one of two non-overlapping module aggregates`, async () => {
+      expect(await drawnCircles(backend)).toBe(1);
     });
 
-    it(`${backend}: declutterSpacing 2 still widens the exclusion and drops one`, async () => {
-      expect(await drawnCircles(backend, 2)).toBe(1);
+    it(`${backend}: declutterSpacing 1 hides only real overlaps, so both aggregates are drawn`, async () => {
+      expect(await drawnCircles(backend, { declutterSpacing: 1 })).toBe(2);
+    });
+
+    it(`${backend}: declutter false draws both aggregates`, async () => {
+      expect(await drawnCircles(backend, { declutter: false })).toBe(2);
     });
   }
 });

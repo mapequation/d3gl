@@ -2770,7 +2770,8 @@ export interface DeclutterOptions {
   maxAggregateRadius?: number;
   /**
    * Multiplier on the exclusion distance: a glyph is dropped when its centre is within
-   * `spacing·(rᵢ + rⱼ)` of a kept glyph (>1 = sparser, <1 = denser). Default 1: only real overlaps.
+   * `spacing·(rᵢ + rⱼ)` of a kept glyph (>1 = sparser, <1 = denser). Default 2: kept glyphs keep a
+   * gap around them, so the links between them stay visible (#512); 1 drops only real overlaps.
    */
   spacing?: number;
   /**
@@ -2873,8 +2874,9 @@ function sortOrderByWeightDesc(sc: DeclutterFrontierScratch, F: number): Uint32A
 /**
  * Thin an LOD frontier in screen space: keep higher-importance glyphs (by tree {@link LODTree.weight}
  * = strength) and drop lower-importance ones whose centre lies within `spacing·(rᵢ + rⱼ)` of a kept
- * glyph. The default spacing 1 drops only glyphs that really **overlap** a kept one (#512); a larger
- * spacing also drops near neighbours. Greedy in descending importance over a screen grid, so a dense
+ * glyph. The default spacing 2 also drops near neighbours, so kept glyphs keep a gap around them and
+ * the links between them stay visible; in a small graph that can hide a whole non-overlapping module
+ * aggregate (#512). Spacing 1 drops only glyphs that really **overlap** a kept one. Greedy in descending importance over a screen grid, so a dense
  * cluster keeps its most important members and the kept set is overlap-free (no overdraw). Runs per
  * cut, so it's zoom-dependent — more glyphs resolve as you zoom in. Returns the kept frontier ids
  * (original order).
@@ -2895,7 +2897,7 @@ export function declutterFrontier(
   const F = frontier.length;
   if (F <= 1) return frontier;
   const maxAgg = opts.maxAggregateRadius ?? Infinity;
-  const spacing = opts.spacing ?? 1; // #512: only real overlaps by default
+  const spacing = opts.spacing ?? 2;
 
   // #213: all working storage comes from the (reused) scratch, grown together to the largest frontier
   // seen. Every array's `[0, F)` prefix is fully rewritten below, so reuse needs no clearing.

@@ -146,7 +146,7 @@ function referenceDeclutter(tree: LODTree, frontier: Uint32Array, t: LODTransfor
     return false;
   };
   const ignore = par ? (i: number, j: number) => onSamePath(frontier[i]!, frontier[j]!) : undefined;
-  const kept = declutterScreen(F, px, py, pr, order, W, H, opts.spacing ?? 1, new Uint8Array(F), undefined, ignore);
+  const kept = declutterScreen(F, px, py, pr, order, W, H, opts.spacing ?? 2, new Uint8Array(F), undefined, ignore);
   let n = 0;
   for (let i = 0; i < F; i++) if (kept[i]) n++;
   const out = new Uint32Array(n);
