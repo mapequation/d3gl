@@ -85,13 +85,18 @@ function record(draw: (ctx: PathRecorder) => void, tolerance = DEFAULT_CURVE_TOL
  * on its ring centreline: `r·(1 − b/2)` with `stroke-width = r·b` covers `[r·(1−b), r]` in the ring
  * colour and leaves the fill visible inside — which also renders a *transparent-fill* ring (the LOD
  * aggregate halo) correctly, where two stacked discs would fill the hole.
+ *
+ * With {@link InstancedCirclesData.bordersPx} the entries are px widths instead (#495), turned into the fraction
+ * the shader draws at the export's zoom: `pxPerUnit` is the zoom `k` for a world layer, 1 for a screen one.
  */
-export function circlesToDrawables(c: InstancedCirclesData): DrawableVector[] {
+export function circlesToDrawables(c: InstancedCirclesData, pxPerUnit = 1): DrawableVector[] {
   const out: DrawableVector[] = [];
   const { centers, radii, borders, borderColors } = c;
   for (let i = 0; i < c.count; i++) {
     const r = radii[i] ?? 0;
-    const b = borders ? (borders[i] ?? 0) : 0;
+    const raw = borders ? (borders[i] ?? 0) : 0;
+    // A px ring (#495) as the shader draws it at this zoom: `pxPerUnit` px per radius unit.
+    const b = c.bordersPx ? (r > 0 ? Math.min(1, raw / (r * pxPerUnit)) : 0) : raw;
     const ring = b > 0 && r > 0;
     out.push(
       drawable(i, {
@@ -262,7 +267,7 @@ export function instancedVectorLayers(
     const bake = screen ? k || 1 : 1;
     switch (layer.primitive) {
       case "circles":
-        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: circlesToDrawables(layer.circles) });
+        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: circlesToDrawables(layer.circles, screen ? 1 : k || 1) });
         break;
       case "pie":
         out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: pieToDrawables(layer.pie, screen, tolerance) });

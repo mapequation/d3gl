@@ -121,6 +121,10 @@ export interface InstancedCirclesData {
   borders?: Float32Array;
   /** Optional RGBA ring colour bytes per circle, length `4 * count`. Paired with {@link borders}. */
   borderColors?: Uint8Array;
+  /** {@link borders} are ring widths in screen px, the same at every zoom (#495), instead of fractions of the
+   *  radius: a thin outline of a world-sized disc. The zoom is applied where the ring is drawn (a shader uniform on
+   *  WebGL, the bake on the vector paths), so no column is rewritten per frame. */
+  bordersPx?: boolean;
   /** Optional per-instance **group id** for shader-driven highlight (#162): the node id a circle is,
    *  so the vertex shader can match `u_hoverGroup` / index the selected set. Length `count`. */
   groups?: Float32Array;

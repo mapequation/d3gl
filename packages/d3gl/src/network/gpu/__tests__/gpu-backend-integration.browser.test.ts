@@ -621,7 +621,7 @@ describe("backend:'auto' (#375)", () => {
     net.destroy();
   });
 
-  it.each(AUTO_RESOLUTIONS)("streams a state network's physical graph on the transport 'auto' resolved to ($name) and derives the rosette", async ({ engine, transport }) => {
+  it.each(AUTO_RESOLUTIONS)("streams each state-network view's own layout on the transport 'auto' resolved to ($name) (#495)", async ({ engine, transport }) => {
     const graph = buildStateGraph({
       stateCount: 4,
       stateToPhysical: [0, 0, 1, 2],
@@ -633,17 +633,16 @@ describe("backend:'auto' (#375)", () => {
     const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [2, 1] }, { id: 2, path: [1, 2] }, { id: 3, path: [2, 2] }];
     const net = await engine();
     const warn = vi.spyOn(console, "warn");
+    // The state view lays out the state graph; the physical view, never laid out, runs the same options when shown.
     net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "auto", iterations: 20 });
     await net.whenSettled();
     expect(net.layoutTransport).toBe(transport()); // streamed, not the synchronous main-thread force solve
+    expect(new Set(Array.from(graph.state.positions, (v) => v.toFixed(3))).size).toBeGreaterThan(2);
+    net.view("physical");
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe(transport());
     expect(fallbackWarnings(warn)).toHaveLength(0);
     expect(new Set(Array.from(graph.physical.positions, (v) => v.toFixed(3))).size).toBeGreaterThan(2);
-    const state = graph.state.positions, phys = graph.physical.positions;
-    for (let s = 0; s < graph.state.nodeCount; s++) {
-      const q = at(graph.stateToPhysical, s);
-      const d = Math.hypot(at(state, 2 * s) - at(phys, 2 * q), at(state, 2 * s + 1) - at(phys, 2 * q + 1));
-      expect(d).toBeLessThan(200); // each state node in its own physical node's rosette
-    }
     net.destroy();
   });
 
