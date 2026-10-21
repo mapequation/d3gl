@@ -106,7 +106,8 @@ async function runLeg(loops: boolean, lod: boolean): Promise<Leg> {
     const pu = selfLoopStats.updates;
     const pi = selfLoopStats.instances;
     const moved = new Float32Array(positions.length);
-    for (let f = 1; f <= POSITION_FRAMES; f++) {
+    // LOD legs skip them: the guard asserts LOD's zoom frames, and each LOD position frame rebuilds a 1M-leaf tree.
+    for (let f = 1; f <= (lod ? 0 : POSITION_FRAMES); f++) {
       for (let i = 0; i < positions.length; i++) moved[i] = (positions[i] ?? 0) + f;
       net.layout({ backend: "positions", positions: moved.slice() });
       net.render();
