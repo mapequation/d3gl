@@ -262,6 +262,14 @@ place" an assertion about the fake, and a node fake *canvas* is precisely the se
   d3-color parsing. The ratio inverts somewhere around 10k-50k drawables **with no regression
   present**. Raising its cap means reformulating against an absolute per-drawable cost first.
 
+**A leg's GPU backlog is billed to the NEXT leg's first synchronous GL call (#505).** WebGL draws only
+queue; on SwiftShader under load a 100k leg queues minutes of rasterisation that nothing in the leg waits
+for. The next engine's registration links its shaders (`getProgramParameter` blocks until the GPU process
+is idle), so it pays the whole backlog: the self-link guard's S-loops leg took 150 s after the no-loop leg
+(244 ms) and 10 s alone, and was misread as a superlinear loop cost (its JS was ~0.1 s, its draw work
+linear). Before calling a leg superlinear, run it alone; a multi-leg guard drains each leg's GPU queue
+(a 1×1 `readPixels`) before `destroy()` so every leg pays only its own draws.
+
 ## GPU layout: reduce with a gather tree, never a 1-texel scatter (#349)
 
 **Never reduce over all N nodes by scattering N points into one texel** with ADD or MAX blending.

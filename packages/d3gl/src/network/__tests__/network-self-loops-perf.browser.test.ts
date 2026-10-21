@@ -16,6 +16,9 @@ import { GlBufferSpy, perfHost, zoomSteps } from "../../__tests__/engine-sweep.j
  *   loops' columns stay resident), a position frame rewrites exactly the S loops, in place;
  * - LOD on, with S self-links: each frame lists its kept leaves' loops in at most min(S, frontier) reads and
  *   writes at most that many loop instances: O(visible), never O(S) when the frontier is smaller.
+ * - LOD off, at a fixed small N (never scaled): what the loops add to a position frame — draw calls, vertices
+ *   drawn, loop instances written — is the same per loop at N and 2N, so a superlinear step (a per-loop draw or
+ *   upload, an O(S²) vertex count) shows at 5k–10k without a 100k run. Counts, so the machine's load cannot move it.
  * The full-detail zoom frame also keeps the static ceiling of `network-selection-sweep-1m-perf`.
  */
 
@@ -23,18 +26,28 @@ const N = perfN(1_000_000, { max: 1_000_000 });
 /** One node in LOOP_EVERY has a self-link. */
 const LOOP_EVERY = 10;
 const S = Math.ceil(N / LOOP_EVERY);
-const COLS = Math.max(1, Math.round(Math.sqrt(N)));
 const W = 640;
 const H = 400;
 const FRAME_MS_STATIC = perfBudget(4 + (4 * N) / 50_000);
 const POSITION_FRAMES = 3;
 
+/**
+ * Wait for the GPU to finish the leg's queued draws (a 1×1 read-back), so the next leg's first synchronous GL
+ * call (a shader link at its registration) does not pay this leg's backlog. Without it, the leg after a 100k
+ * leg looked superlinear on SwiftShader (#505: 150 s for the S-loops leg after the no-loop leg, 10 s alone).
+ */
+function drainGpu(host: HTMLElement): void {
+  const gl = host.querySelector("canvas")?.getContext("webgl2");
+  gl?.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+}
+
 /** A binary tree on a square grid (as the selection sweep's), with a self-link on every LOOP_EVERY-th node. */
 function fixture(n: number, loops: boolean): { graph: ReturnType<typeof buildGraph>; positions: Float32Array } {
+  const cols = Math.max(1, Math.round(Math.sqrt(n)));
   const positions = new Float32Array(n * 2);
   for (let i = 0; i < n; i++) {
-    positions[i * 2] = (i % COLS) * 8;
-    positions[i * 2 + 1] = Math.floor(i / COLS) * 8;
+    positions[i * 2] = (i % cols) * 8;
+    positions[i * 2 + 1] = Math.floor(i / cols) * 8;
   }
   const m = n - 1 + (loops ? Math.ceil(n / LOOP_EVERY) : 0);
   const source = new Int32Array(m);
@@ -126,6 +139,7 @@ async function runLeg(loops: boolean, lod: boolean): Promise<Leg> {
       registered,
     };
   } finally {
+    drainGpu(host);
     spy.restore();
     net.destroy();
     host.remove();
@@ -133,6 +147,97 @@ async function runLeg(loops: boolean, lod: boolean): Promise<Leg> {
 }
 
 const TIMEOUT = perfBudget(180_000 + N / 2);
+
+/** Draw calls and vertices (instances × vertices per instance) the WebGL2 context issues while installed. */
+class GlDrawSpy {
+  calls = 0;
+  vertices = 0;
+  private readonly proto = WebGL2RenderingContext.prototype;
+  private readonly arrays = this.proto.drawArrays;
+  private readonly elements = this.proto.drawElements;
+  private readonly arraysInstanced = this.proto.drawArraysInstanced;
+  private readonly elementsInstanced = this.proto.drawElementsInstanced;
+
+  constructor() {
+    const spy = this;
+    this.proto.drawArrays = function (this: WebGL2RenderingContext, mode: GLenum, first: GLint, count: GLsizei) {
+      spy.calls++;
+      spy.vertices += count;
+      spy.arrays.call(this, mode, first, count);
+    };
+    this.proto.drawElements = function (this: WebGL2RenderingContext, mode: GLenum, count: GLsizei, type: GLenum, offset: GLintptr) {
+      spy.calls++;
+      spy.vertices += count;
+      spy.elements.call(this, mode, count, type, offset);
+    };
+    this.proto.drawArraysInstanced = function (this: WebGL2RenderingContext, mode: GLenum, first: GLint, count: GLsizei, instances: GLsizei) {
+      spy.calls++;
+      spy.vertices += count * instances;
+      spy.arraysInstanced.call(this, mode, first, count, instances);
+    };
+    this.proto.drawElementsInstanced = function (this: WebGL2RenderingContext, mode: GLenum, count: GLsizei, type: GLenum, offset: GLintptr, instances: GLsizei) {
+      spy.calls++;
+      spy.vertices += count * instances;
+      spy.elementsInstanced.call(this, mode, count, type, offset, instances);
+    };
+  }
+
+  restore(): void {
+    this.proto.drawArrays = this.arrays;
+    this.proto.drawElements = this.elements;
+    this.proto.drawArraysInstanced = this.arraysInstanced;
+    this.proto.drawElementsInstanced = this.elementsInstanced;
+  }
+}
+
+interface FrameWork {
+  calls: number;
+  vertices: number;
+  instances: number;
+}
+
+/** The draw work and loop instances of one LOD-off position frame at `n` nodes (mean of POSITION_FRAMES). */
+async function positionFrameWork(n: number, loops: boolean): Promise<FrameWork> {
+  const host = perfHost(W, H);
+  const net: Network = network(host, { width: W, height: H, backend: "webgl" });
+  const spy = new GlDrawSpy();
+  try {
+    await net.whenReady();
+    const { graph, positions } = fixture(n, loops);
+    net
+      .data(graph)
+      .style({ nodeRadius: 3, sizeMode: "screen", linkStroke: "rgb(100,116,139)" })
+      .lod(false)
+      .layout({ backend: "positions", positions });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    const c0 = spy.calls;
+    const v0 = spy.vertices;
+    const i0 = selfLoopStats.instances;
+    const moved = new Float32Array(positions.length);
+    for (let f = 1; f <= POSITION_FRAMES; f++) {
+      for (let i = 0; i < positions.length; i++) moved[i] = (positions[i] ?? 0) + f;
+      net.layout({ backend: "positions", positions: moved.slice() });
+      net.render();
+    }
+    return {
+      calls: (spy.calls - c0) / POSITION_FRAMES,
+      vertices: (spy.vertices - v0) / POSITION_FRAMES,
+      instances: (selfLoopStats.instances - i0) / POSITION_FRAMES,
+    };
+  } finally {
+    drainGpu(host);
+    spy.restore();
+    net.destroy();
+    host.remove();
+  }
+}
+
+/** What S loops add to a position frame at `n` nodes: the frame with them minus the frame without. */
+async function loopFrameWork(n: number): Promise<FrameWork> {
+  const without = await positionFrameWork(n, false);
+  const withLoops = await positionFrameWork(n, true);
+  return { calls: withLoops.calls - without.calls, vertices: withLoops.vertices - without.vertices, instances: withLoops.instances - without.instances };
+}
 
 describe(`self-link loops per frame (#505) at N=${N.toLocaleString()}, S=${S.toLocaleString()}`, () => {
   afterAll(() => document.body.replaceChildren());
@@ -164,6 +269,23 @@ describe(`self-link loops per frame (#505) at N=${N.toLocaleString()}, S=${S.toL
       console.log(`  LOD off, S=${S}: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms, ${leg.positionUpdates} loop updates over ${POSITION_FRAMES} position frames`);
     },
     TIMEOUT,
+  );
+
+  it(
+    "LOD off: what S loops add to a position frame is linear in S (5k vs 10k nodes, never scaled)",
+    async () => {
+      const small = await loopFrameWork(5_000);
+      const large = await loopFrameWork(10_000);
+      const sSmall = Math.ceil(5_000 / LOOP_EVERY);
+      const sLarge = Math.ceil(10_000 / LOOP_EVERY);
+      expect(small.instances, "the position frames never reached the loops (non-vacuity)").toBe(sSmall);
+      expect(large.instances).toBe(sLarge);
+      expect(small.vertices, "the loops drew nothing (non-vacuity)").toBeGreaterThan(0);
+      expect(large.calls, `loop draw calls per frame grew with S: ${small.calls} at S=${sSmall}, ${large.calls} at S=${sLarge}`).toBe(small.calls);
+      expect(large.vertices / sLarge, `vertices drawn per loop grew with S: ${small.vertices / sSmall} at S=${sSmall}`).toBeLessThanOrEqual(small.vertices / sSmall);
+      console.log(`  LOD off, per position frame the loops add ${small.calls} draws, ${small.vertices / sSmall} vertices per loop`);
+    },
+    perfBudget(180_000),
   );
 
   it(
