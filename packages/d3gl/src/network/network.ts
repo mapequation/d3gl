@@ -2037,7 +2037,7 @@ export class Network extends BaseEngine {
       if (this.lodReady() && tree) {
         if (id < tree.size) { text = labelText(opts, id, this.lodDatum(tree, id)); x = tree.cx[id] ?? 0; y = tree.cy[id] ?? 0; }
       } else if (!this.lodAwaitsTree() && id < this.graph.nodeCount) {
-        text = labelText(opts, id, NO_LOD_INFO); x = this.graph.positions[2 * id] ?? 0; y = this.graph.positions[2 * id + 1] ?? 0;
+        text = labelText(opts, id, !this.stateData ? NO_LOD_INFO : this.activeView === "physical" ? PHYSICAL_LEAF_INFO : STATE_LEAF_INFO); x = this.graph.positions[2 * id] ?? 0; y = this.graph.positions[2 * id + 1] ?? 0;
       }
     }
     if (id === null || !text || maxW === undefined) { this.setLabelHover(null, ""); return; }
