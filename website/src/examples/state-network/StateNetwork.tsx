@@ -7,7 +7,9 @@ const notState = (o: Record<string, unknown>) => o.view !== "State";
 
 /** Harness for the state-network example: **Nodes** (physical count, up to 10k), a **Backend** toggle
  *  (Force / Worker / GPU — #182) for the physical layout, a **View** toggle (Physical pies / State
- *  rosette / Both), a **Links** toggle (half-arrow / line, both bent), **Physical** / **State** label
+ *  rosette / Both), a **Links** toggle (half-arrow / line, both bent), **Colours** (the engine's module
+ *  colours / an app palette via `style({ moduleColor })`), **Modules** (on / off: a raw state network,
+ *  #494), **Physical** / **State** label
  *  toggles, and the "directed map of modules" option set. The LOD cut only applies to the State view, so
  *  LOD + its sub-controls are **disabled** (greyed, no reflow) in the other views. */
 export default function StateNetwork() {
@@ -18,6 +20,8 @@ export default function StateNetwork() {
         { type: "segmented", key: "backend", label: "Backend", options: ["Force", "Worker", "GPU"], value: "GPU" },
         { type: "segmented", key: "view", label: "View", options: ["Physical", "State", "Both"] },
         { type: "segmented", key: "links", label: "Links", options: ["Half-arrow", "Line"] },
+        { type: "segmented", key: "colors", label: "Colours", options: ["Engine", "Palette"] },
+        { type: "segmented", key: "modules", label: "Modules", options: ["On", "Off"] },
         { type: "segmented", key: "physLabels", label: "Physical labels", options: ["Off", "On"] },
         { type: "segmented", key: "stateLabels", label: "State labels", options: ["Off", "On"] },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"], disabled: (o) => o.view === "Both" },

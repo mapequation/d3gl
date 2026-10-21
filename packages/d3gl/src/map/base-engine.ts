@@ -764,6 +764,12 @@ export abstract class BaseEngine {
     }
   }
 
+  /** Clear the pointer hover (its highlight, the hovered ids and the tooltip), as a pointer leaving the host
+   *  does — e.g. when an engine swaps the graph the hovered id belonged to (#494). */
+  protected clearHover(): void {
+    this.clearHoverState();
+  }
+
   /** Drop any managed selection + hover highlight for `layer` — e.g. when an engine disables that
    *  layer's interaction (so a stale selection can't survive as un-highlightable ghost state). */
   protected clearLayerSelection(layer: string): void {

@@ -87,3 +87,82 @@ export function moduleColors(nodes: ArrayLike<ModulePathNode>, opts: ModuleColor
   }
   return out;
 }
+
+/**
+ * Every node's **enclosing module** (#494) — its path minus the final rank, as {@link moduleColors} colours
+ * it — with each distinct module listed once, so a colour per module is resolved once per module, not once
+ * per node. `moduleOf[id]` indexes `paths`; −1 for an id no record covers.
+ */
+export interface NodeModules {
+  /** Node id → its enclosing module's index in {@link paths} (−1: no record). Length `nodeCount`. */
+  moduleOf: Int32Array;
+  /** Module index → its path (`[]` for the root: a node whose path is its rank alone). */
+  paths: readonly (readonly number[])[];
+}
+
+/** {@link NodeModules} of `records` over `nodeCount` node ids: O(total path length + modules · depth). */
+export function nodeModules(nodeCount: number, records: ArrayLike<ModulePathNode>): NodeModules {
+  const n = records.length;
+  const offset = new Uint32Array(n + 1);
+  for (let r = 0, total = 0; r < n; r++) {
+    total += records[r]?.path.length ?? 0;
+    offset[r + 1] = total;
+  }
+  const { moduleParent, moduleBranch, recordModule } = internModules(offset, copyRecordPaths(records, offset));
+  // A module is registered after its parent, so one forward pass extends each parent's path.
+  const paths = new Array<readonly number[]>(moduleParent.length);
+  for (let m = 0; m < moduleParent.length; m++) {
+    const parent = moduleParent[m] ?? -1;
+    paths[m] = parent < 0 ? [] : [...(paths[parent] ?? []), moduleBranch[m] ?? 0];
+  }
+  const moduleOf = new Int32Array(nodeCount).fill(-1);
+  for (let r = 0; r < n; r++) {
+    const id = records[r]?.id ?? -1;
+    if (id >= 0 && id < nodeCount) moduleOf[id] = recordModule[r] ?? -1;
+  }
+  return { moduleOf, paths };
+}
+
+/** The parts of a provided-module LOD tree that name its aggregates' modules (`parent` + `branch`, #197). */
+export interface ModuleTreeNames {
+  leafCount: number;
+  size: number;
+  levelCount: number;
+  levelOffset: Uint32Array;
+  parent?: Int32Array;
+  branch?: Int32Array;
+}
+
+/**
+ * Each aggregate's own module colour on a module tree (#494): RGBA per aggregate, `4·(size − leafCount)`. An
+ * aggregate's module path (as its hit's `path`) is looked up among `paths` (an interned hierarchy's modules)
+ * and coloured `rgbaOf(m)` — so a module the nodes' colours already resolved is not asked again — or, for a path
+ * outside it (an explicit `lod({ modules })` of another partition), `rgbaOfPath(path)`. Null for a tree that is
+ * not a module tree (spatial, structural): its aggregates are no modules. Levels are walked from the root down,
+ * so each path extends its parent's. O(aggregates · depth + modules · depth) once per (tree, style), never per
+ * frame; the path index is dropped when it returns.
+ */
+export function moduleAggregateColors(
+  tree: ModuleTreeNames,
+  paths: readonly (readonly number[])[],
+  rgbaOf: (m: number) => ArrayLike<number>,
+  rgbaOfPath: (path: readonly number[]) => ArrayLike<number>,
+): Uint8Array | null {
+  const { leafCount, size, levelCount, levelOffset, parent, branch } = tree;
+  if (!parent || !branch) return null;
+  const index = new Map<string, number>();
+  for (let m = 0; m < paths.length; m++) index.set((paths[m] ?? []).join(","), m);
+  const out = new Uint8Array(4 * (size - leafCount));
+  const named = new Array<readonly number[]>(size - leafCount);
+  // A parent sits on a higher level than its children (levels are module heights), so it is named first.
+  for (let k = levelCount - 1; k >= 1; k--) {
+    for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
+      const p = parent[g]!;
+      const path = p < 0 ? [] : [...(named[p - leafCount] ?? []), branch[g]!];
+      named[g - leafCount] = path;
+      const m = index.get(path.join(","));
+      out.set(m === undefined ? rgbaOfPath(path) : rgbaOf(m), 4 * (g - leafCount));
+    }
+  }
+  return out;
+}

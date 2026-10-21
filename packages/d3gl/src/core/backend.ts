@@ -124,6 +124,9 @@ export interface InstancedCirclesData {
   /** Optional per-instance **group id** for shader-driven highlight (#162): the node id a circle is,
    *  so the vertex shader can match `u_hoverGroup` / index the selected set. Length `count`. */
   groups?: Float32Array;
+  /** Optional second per-instance group id (#494): the circle is also lit while this group is hovered — a
+   *  state network's state node while its physical container is. Length `count`; absent ⇒ none. */
+  groups2?: Float32Array;
   /** Optional per-instance **selected flag** (0/1) for shader-driven dim/recolour (#162). Length `count`. */
   selected?: Uint8Array;
   count: number;
@@ -177,8 +180,13 @@ export interface InstancedArrowsData {
   sources: Float32Array;
   /** [x, y] target *centre* per arrow, length `2 * count`; the tip is set back by `radii` in-shader. */
   targets: Float32Array;
-  /** Target node radius per arrow (active sizeMode units), length `count` — the boundary setback. */
+  /** Target node radius per arrow (active sizeMode units, or world units with {@link radiiWorld}), length
+   *  `count` — the boundary setback. */
   radii: Float32Array;
+  /** `radii` are **world** units on a `screen`-sized layer (#494): px-sized arrowheads meeting world-sized
+   *  nodes (a state network's both view). The setback is scaled to px by the zoom (in-shader on WebGL, at
+   *  the bake on the vector paths), so the tip stays on the node boundary. No effect on a world layer. */
+  radiiWorld?: boolean;
   /** arrow size (active sizeMode units) per arrow, length `count`. */
   sizes: Float32Array;
   /** RGBA bytes per arrow, length `4 * count`. */
@@ -219,6 +227,8 @@ export interface InstancedHalfArrowsData {
   targets: Float32Array;
   /** [r0, r1] source/target node radii per link, length `2 * count` (the tip lands on r1). */
   radii: Float32Array;
+  /** `radii` are **world** units on a `screen`-sized layer (#494): see {@link InstancedArrowsData.radiiWorld}. */
+  radiiWorld?: boolean;
   /** [width, oppositeWidth] per link, length `2 * count` (opposite width spaces the source foot). */
   widths: Float32Array;
   /** Bend per link (⟂ offset as a fraction of the chord, #296; sign picks the bow side), length `count`. */
@@ -256,6 +266,8 @@ export interface InstancedHalfArrowsData {
  * and no wedge texture — it draws in one instanced call and updates in place like {@link InstancedCirclesData}.
  * (Single-module physical nodes stay on the {@link InstancedCirclesData} lane as solid discs.)
  */
+/** SoA for instanced pie wedges. On an update the WebGL layer re-uploads a column only when it is a different
+ *  array from the last one it uploaded (#494), so hand a new array to change a column; never mutate one in place. */
 export interface InstancedPieData {
   /** [x, y] world centre per wedge (a pie's wedges share a centre), length `2 * count`. */
   centers: Float32Array;
