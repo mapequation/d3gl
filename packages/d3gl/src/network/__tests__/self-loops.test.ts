@@ -2,7 +2,12 @@ import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
 import { bezierControl, halfLinkGeometry, chordBend } from "../../core/half-link.js";
+import { StableColumns } from "../../core/stable-columns.js";
 import {
+  keptLeafLoops,
+  keptLoopStats,
+  makeKeptLoopsScratch,
+  selfLoopSubset,
   buildSelfLoopIndex,
   selfLoopOfEdge,
   selfLoopAngles,
@@ -205,3 +210,53 @@ describe("self-loop cache and layers (per-frame cost)", () => {
     expect(loopLayers.map((l) => l.primitive)).toEqual(["half-arrows"]);
   });
 });
+
+describe("an LOD frame's loops on kept leaves", () => {
+  // Nodes 0..9 on a line; self-links on 2, 5 and 7 (5 twice: one loop, summed weight).
+  const g = buildGraph({
+    nodeCount: 10,
+    source: [0, 1, 2, 3, 4, 5, 6, 7, 8, 2, 5, 5, 7],
+    target: [1, 2, 3, 4, 5, 6, 7, 8, 9, 2, 5, 5, 7],
+    weight: [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 3, 1],
+    directed: false,
+  });
+  g.positions.set(Array.from({ length: 20 }, (_, i) => (i % 2 ? 0 : 10 * (i / 2))));
+  const style = { nodeRadii: new Float32Array(10).fill(2), linkWidthOf: () => 1, linkColorOf: (): [number, number, number, number] => [255, 0, 0, 255], directed: false, arrowSize: 3, linkStyle: "line", sizeMode: "world" as const };
+
+  it("lists the loops of kept leaves in min(S, frontier) reads, by either pass", () => {
+    const c = selfLoopCache(g, style);
+    if (!c) throw new Error("expected loops");
+    const sc = makeKeptLoopsScratch();
+    const kept = new Set([5, 6, 7, 8, 12]); // 12: an aggregate (≥ nodeCount), never a leaf
+    const frontier = Uint32Array.from(kept);
+    const r0 = keptLoopStats.reads;
+    // S = 3 ≤ 5 glyphs, with the gather's stamp: one pass over the loops.
+    const m1 = keptLeafLoops(c.loops, 10, frontier, (v) => kept.has(v), sc);
+    expect(Array.from(sc.list.subarray(0, m1)).map((j) => c.loops.nodes[j])).toEqual([5, 7]);
+    expect(keptLoopStats.reads - r0).toBe(3);
+    // No stamp (or more loops than glyphs): one pass over the frontier against the per-node slots.
+    const r1 = keptLoopStats.reads;
+    const m2 = keptLeafLoops(c.loops, 10, Uint32Array.of(2, 12), null, sc);
+    expect(Array.from(sc.list.subarray(0, m2)).map((j) => c.loops.nodes[j])).toEqual([2]);
+    expect(keptLoopStats.reads - r1).toBe(2);
+  });
+
+  it("solves the subset's loops away from their neighbours and hands back unchanged columns", () => {
+    const c = selfLoopCache(g, style);
+    if (!c) throw new Error("expected loops");
+    const sc = makeKeptLoopsScratch();
+    const memo = new StableColumns();
+    const frame = { cx: Float32Array.from({ length: 10 }, (_, i) => 10 * i), cy: new Float32Array(10) };
+    const m = keptLeafLoops(c.loops, 10, Uint32Array.of(9, 5), null, sc);
+    const a = selfLoopSubset(c, g, m, frame, memo, sc);
+    expect(Array.from(a.loops.nodes)).toEqual([5]);
+    expect(a.loops.weights[0]).toBeCloseTo(4); // 1 + 3: the summed self-links
+    expect(a.centres[0]).toBe(50);
+    // Node 5's neighbours sit at ±x: the mean cancels and the loop takes the fallback angle; both ends on its rim.
+    expect(Math.hypot(a.sourceOffsets[0] ?? 0, a.sourceOffsets[1] ?? 0)).toBeCloseTo(2, 5);
+    const m2 = keptLeafLoops(c.loops, 10, Uint32Array.of(9, 5), null, sc);
+    const b = selfLoopSubset(c, g, m2, frame, memo, sc);
+    for (const k of ["centres", "sourceOffsets", "targetOffsets", "widths", "colors", "groups", "bends"] as const) expect(b[k], k).toBe(a[k]);
+  });
+});
+

@@ -115,6 +115,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | followed warm stream frame (#454): a transition retargeted to a newer frame every frame | — | same file, `followed` legs | 100k, LOD on **and** off, vs a streamed layout frame | `BENCH_TRANSITION` |
 | streaming fit box, per streamed frame (#327) | — | `network/__tests__/fit-box-perf.test.ts` | 200k leaves (LOD-independent): clean disc in radial **and** shuffled order + 64 stragglers; exact, allocation-free | `BENCH_FIT_BOX` |
 | both-view packing of state nodes in their physical node (#509, D2 area spiral; once per style or data change, not per frame): `packStateNodes` on 1–2 state nodes per physical node, Pareto-sized physical nodes up to 5,000, and one of 100k; flow-like radii 2–20. Signature: no overlapping pair, every state node enclosed (grid-checked on the float32 output); each physical node centred on its enclosing circle (Welzl up to 64 state nodes, Ritter beyond), so a pair's radius is the sum of its two. Measured at 1,008,000 state nodes, M1 Max under a load average of 14–100 (upper bounds): pairs ≈33 ms (≈23 ms with the closed-form pair), Pareto ≈195–280 ms (≈+28 % with the centring, interleaved A/B), one 100k ≈45–50 ms | — | `network/__tests__/both-layout.bench.test.ts` (unit tests: `both-layout.test.ts`, 100k in one physical node) | — | `BENCH_BOTH_PACK` (ceilings `PERF_BOTH_PACK_{PAIRS,PARETO,ONE}_MS` under `PERF_ASSERT`, c0 + c1·N) |
+| network **self-link loops** (#505): LOD off — the loops' cached columns, rewritten in place per position frame (O(S + Σ degree of looped nodes)); LOD on — the kept leaves' loops listed per frame from the gather's kept stamp or a per-node loop slot (O(min(S, frontier))), their columns through `StableColumns`. Asserted (counts): a graph without self-links runs no loop update, writes no loop instance and lists no loop, LOD off or on, on zoom and position frames; LOD off with S = N/10 self-links: a zoom frame does no loop work and creates/destroys no GPU buffer, a position frame writes exactly S; LOD on: every frame reads ≤ min(S, frontier) entries and writes ≤ that many loops; plus the full-detail static zoom ceiling | **WebGL** | `network/__tests__/network-self-loops-perf.browser.test.ts` | 1M nodes, S = 100k, LOD off and on (+ `self-loops.test.ts`: the count-based per-frame cache) | `PERF_BROWSER_N` |
 | LOD super-edge **build** | — | `network/__tests__/super-edges-build.test.ts` | equivalence | `BENCH_SUPER_EDGES_BUILD` |
 | retained memory | — | `core/point-memory.bench.test.ts` | — | `BENCH_MEM` |
 | declutter allocation | — | `core/declutter-alloc.bench.test.ts` | — | — |
@@ -834,6 +835,23 @@ tolerance depends on how a drawable is *drawn*. World-scaled geometry bakes at t
   the *world* tolerance, so their bend facets at `curveTolerance·k` px after each zoom-end re-bake.
 - Guards: `core/__tests__/curve-tolerance.test.ts`, `network/__tests__/pie-instances.test.ts`,
   `map/curve-tolerance.browser.test.ts` (per-layer counts on all three backends + pixel identity).
+
+## A half-arrow's bow side must not hang on rounding (#505)
+
+The half-arrow lane (and `halfLinkGeometry`) picks the side a link bows to from the chord's direction
+(`positiveCurvature = dir.x > 0 || (dir.x == 0 && dir.y < 0)`), so a reciprocal pair nests. A self-link loop's
+chord is short and sits beside its node centre: at `θ ≈ 0` or `π` (a neighbour level with the node) it is
+vertical, and `(c + to) − (c + so)` in float32 is rounding noise around a far larger `c`, so WebGL world mode
+bowed the loop INTO its node. The fix is a seam, not a nudge (step 1 turned such loops by ≈3°):
+
+- the shader decides the side from `(a_p1 − a_p0) + (a_targetOffset − a_sourceOffset)` — bit-for-bit the old
+  value without end offsets, and exactly `to − so` for a loop (both centres the same point);
+- the CPU picks the loop's bend sign from the **stored float32 offsets** (`halfArrowLoopBend(dx, dy)`), the
+  values that rule reads; the Scene twin passes the chord of the ends it hands `halfLinkGeometry`.
+
+Rule: whenever the CPU pre-computes a sign the GPU re-derives, derive both from the same stored values, never
+from a double-precision angle. Guard: `self-loops.test.ts` ("half-arrow loop side", the lane's rule in float32
+at θ = 0, ±π, ±1e-9) and `network-self-loops.browser.test.ts` (a level neighbour, WebGL world mode).
 
 ## Pass-through layers share ONE accumulation surface (#110)
 
