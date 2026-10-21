@@ -74,6 +74,14 @@ export interface HalfLinkParams {
   oppositeWidth?: number;
   /** Bend: absolute perpendicular offset of the centre curve, in world units (the reference's `bend`). */
   bend: number;
+  /**
+   * The vector whose direction fixes the bow side, when it is not the chord `(x1 − x0, y1 − y0)`. The export
+   * of an instanced lane passes the shader's own `(p1 − p0) + (targetOffset − sourceOffset)` (#505): a self-link
+   * loop's chord is short beside a far larger centre, so the chord from the baked ends can round its x to 0
+   * and pick the other side than the lane.
+   */
+  sideX?: number;
+  sideY?: number;
 }
 
 /** The resolved anchor + control points of a half-arrow link (the vertices its outline visits). */
@@ -151,7 +159,9 @@ export function halfLinkGeometry(p: HalfLinkParams): HalfLinkGeometry | null {
   // world side and the two halves nest), times the sign of `bend`.
   const bendMagnitude = Math.abs(bend);
   const outerBendAddition = Math.pow(bendMagnitude / 10, 0.4);
-  const positiveCurvature = dirx > 0 || (dirx === 0 && diry < 0);
+  const sideX = p.sideX ?? dirx;
+  const sideY = p.sideY ?? diry;
+  const positiveCurvature = sideX > 0 || (sideX === 0 && sideY < 0);
   const curvatureSign = positiveCurvature ? 1 : -1;
   const bendSign = bend > 0 ? 1 : -1;
   const signedBend = curvatureSign * bendSign * bendMagnitude;

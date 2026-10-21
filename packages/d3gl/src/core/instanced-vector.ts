@@ -251,6 +251,9 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
       width: h.widths[r * 2] ?? 0,
       oppositeWidth: h.widths[r * 2 + 1] ?? 0,
       bend: chordBend(x0, y0, x1, y1, h.bends[r] ?? 0),
+      // The shader's bow side: the centres' delta plus the offsets' delta, not the baked ends' delta (#505).
+      sideX: ((h.targets[e * 2] ?? 0) - (h.sources[e * 2] ?? 0)) * bake + offsetAt(to, e * 2, 1) - offsetAt(so, e * 2, 1),
+      sideY: ((h.targets[e * 2 + 1] ?? 0) - (h.sources[e * 2 + 1] ?? 0)) * bake + offsetAt(to, e * 2 + 1, 1) - offsetAt(so, e * 2 + 1, 1),
     });
     if (!geom) continue;
     const g = bake === 1 ? geom : scaleHalfLink(geom, inv);

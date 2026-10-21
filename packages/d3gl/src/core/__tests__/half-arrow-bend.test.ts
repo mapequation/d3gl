@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { halfArrowsToDrawables } from "../instanced-vector.js";
 import type { InstancedHalfArrowsData } from "../backend.js";
+import { halfArrowLoopBend } from "../../network/self-loops.js";
 
 // #296: a half-arrow's `bend` is a fraction of the chord, so in screen sizeMode (px sizes, baked at the
 // current zoom `k`) the bow must scale with the link's on-screen length. It used to be an absolute px
@@ -38,5 +39,44 @@ describe("half-arrow bend is a fraction of the chord (#296)", () => {
     const shares = [4, 1, 0.25].map((k) => apexPerChord(0.15, k));
     for (const share of shares) expect(share).toBeGreaterThan(0.07); // a genuine bow (quadratic apex ≈ bend/2)
     expect(Math.max(...shares) / Math.min(...shares)).toBeLessThan(1.4);
+  });
+});
+
+// #505: a self-link loop is a half-arrow whose two centres are one point and whose ends are the offsets. Its
+// chord is short beside the centre, so at a near-vertical chord the baked ends' x delta rounds to 0 and the
+// y rule picks a side. The lane (and its bend sign, `halfArrowLoopBend`) read the offsets' delta instead, so the
+// export must too, or the exported loop bows into its node.
+describe("half-arrow export picks the lane's bow side for a self-link loop (#505)", () => {
+  const so = Float32Array.from([0, -10]);
+  const to = Float32Array.from([1e-12, 10]); // the chord's x is positive, far below the centre's ulp
+  const loop = (cx: number): InstancedHalfArrowsData => ({
+    sources: Float32Array.from([cx, 0]),
+    targets: Float32Array.from([cx, 0]),
+    sourceOffsets: so,
+    targetOffsets: to,
+    radii: Float32Array.from([0, 0]),
+    widths: Float32Array.from([2, 0]),
+    bends: Float32Array.from([halfArrowLoopBend((to[0] ?? 0) - (so[0] ?? 0), (to[1] ?? 0) - (so[1] ?? 0))]),
+    colors: Uint8Array.from([0, 0, 0, 255]),
+    count: 1,
+  });
+  /** Mean x of the outline relative to the node centre: its sign is the side the loop bows to. */
+  const bowSide = (cx: number, bake: number): number => {
+    const d = halfArrowsToDrawables(loop(cx), bake)[0];
+    expect(d).toBeDefined();
+    let sum = 0, n = 0;
+    for (const sp of d?.subpaths ?? [])
+      for (let i = 0; i + 1 < sp.points.length; i += 2) {
+        sum += (sp.points[i] ?? 0) - cx;
+        n++;
+      }
+    return Math.sign(sum / n);
+  };
+
+  it("bows to the same side at a far centre (chord x rounded away) as at the origin", () => {
+    const side = bowSide(0, 1);
+    expect(side).not.toBe(0);
+    expect(bowSide(1e5, 1)).toBe(side);
+    expect(bowSide(1e5, 4)).toBe(side); // screen-mode bake
   });
 });
