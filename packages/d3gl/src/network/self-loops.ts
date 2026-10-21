@@ -162,6 +162,21 @@ export function halfArrowLoopBend(theta: number): number {
   return positive ? TEARDROP_BEND : -TEARDROP_BEND;
 }
 
+/** The least `|sin θ|` a half-arrow loop is drawn at: see {@link halfArrowSafeAngle}. */
+export const HALF_ARROW_MIN_SIN = 0.05;
+
+/**
+ * `θ` moved off a vertical chord for a half-arrow loop. The half-arrow's bow side flips with the sign of the
+ * chord's x (`dir.x > 0`), and a loop at `θ ≈ 0` or `π` (a neighbour level with its node) has a vertical chord
+ * whose x is float rounding noise on the GPU, so the loop could bow INTO the node. Turning such a loop by at
+ * most ≈3° (`|sin θ| ≥` {@link HALF_ARROW_MIN_SIN}) makes the chord's x clearly positive, the side certain.
+ */
+export function halfArrowSafeAngle(theta: number): number {
+  if (Math.abs(Math.sin(theta)) >= HALF_ARROW_MIN_SIN) return theta;
+  const turn = Math.asin(HALF_ARROW_MIN_SIN);
+  return Math.cos(theta) >= 0 ? turn : Math.PI - turn;
+}
+
 /** Trace one teardrop into a path context, its ends at `(px, py)` + the offsets. The Scene twin of the lane. */
 export function traceTeardrop(
   ctx: { moveTo(x: number, y: number): void; quadraticCurveTo(cx: number, cy: number, x: number, y: number): void },
@@ -288,6 +303,7 @@ export function updateSelfLoops(graph: NetworkGraph, c: SelfLoopCache): void {
     centres[2 * i + 1] = pos[2 * n + 1] ?? 0;
   }
   selfLoopAngles(pos, graph.csr, loops, angles);
+  if (c.halfArrow) for (let i = 0; i < S; i++) angles[i] = halfArrowSafeAngle(angles[i] ?? 0);
   teardropEnds(loops, angles, c.radii, c.sourceOffsets, c.targetOffsets);
   if (c.halfArrow) {
     const cur = c.halfBends[c.halfBendSlot];

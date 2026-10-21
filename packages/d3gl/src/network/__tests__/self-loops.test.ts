@@ -8,6 +8,8 @@ import {
   selfLoopAngles,
   teardropEnds,
   halfArrowLoopBend,
+  halfArrowSafeAngle,
+  HALF_ARROW_MIN_SIN,
   selfLoopCache,
   updateSelfLoops,
   selfLoopStats,
@@ -115,6 +117,18 @@ describe("self-loop geometry", () => {
       // The centre curve's control lies beyond the rim, along θ.
       expect(geom.cp1x * Math.cos(theta) + geom.cp1y * Math.sin(theta)).toBeGreaterThan(r);
     }
+  });
+});
+
+describe("half-arrow loop angle", () => {
+  it("turns a loop off a vertical chord (θ ≈ 0, π) by at most ≈3°, and keeps any other angle", () => {
+    for (const theta of [0, Math.PI, -Math.PI, 1e-9, Math.PI - 1e-9]) {
+      const t = halfArrowSafeAngle(theta);
+      expect(Math.sin(t)).toBeGreaterThanOrEqual(HALF_ARROW_MIN_SIN - 1e-12); // the chord's x is clearly positive
+      expect(Math.cos(t) * Math.cos(theta)).toBeGreaterThan(0); // still on the same side
+      expect(Math.abs(Math.atan2(Math.sin(t - theta), Math.cos(t - theta)))).toBeLessThan(0.051);
+    }
+    for (const theta of [0.5, -1, 2, -2.5]) expect(halfArrowSafeAngle(theta)).toBe(theta);
   });
 });
 
