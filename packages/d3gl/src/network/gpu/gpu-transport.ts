@@ -69,7 +69,7 @@ import { compilePrograms, type CompileOutcome, type ProgramCompile } from "./pro
 import { moduleSeedPlan, type SeedPlan, type SeedPlanOptions } from "./seed-plan.js";
 import { SeedWorker } from "./seed-worker.js";
 import { LODRelay, type OnLODTree, type SeedRequest } from "./lod-relay.js";
-import { spawnLayoutWorker, startWorkerLayout, withModuleSprings, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
+import { spawnLayoutWorker, startWorkerLayout, withModuleSprings, type LayoutContinuation, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
 import { seedPositions, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { LODTopology } from "../lod.js";
 import type { LeafStyle, LODView } from "../lod-frame.js";
@@ -265,6 +265,19 @@ class GpuLayoutRun implements WorkerLayoutHandle {
 
   get transport(): "gpu" | "worker" | "pending" {
     return this.inner ? (this.inner.transport ?? "worker") : "pending";
+  }
+
+  /**
+   * Where the initial run stands (#495), for a run that goes on from the same positions: the GPU stream's state
+   * at its last painted frame, as a move continues it (#311), or the worker fallback's. Null while it waits for
+   * a device or a seed plan (nothing painted to go on from), and once the initial run is spent.
+   */
+  continuation(): LayoutContinuation | null {
+    if (this.stopped) return null;
+    const stream = this.stream;
+    if (!stream) return this.inner?.continuation?.() ?? null;
+    const state = stream.runState();
+    return state && state.mode === "run" && state.ticksLeft > 0 ? { iterations: state.ticksLeft, warm: { heat: state.heat, decaying: state.decaying } } : null;
   }
 
   /**

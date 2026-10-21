@@ -207,6 +207,7 @@ in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
 in vec2 a_center;           // per-instance world centre
 in float a_radius;          // per-instance radius
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+uniform float u_borderPx;   // 1.0 = a_border is a ring width in screen px (#495), 0.0 = a fraction of the radius
 in float a_border;          // per-instance ring thickness as a fraction of radius (0 = no ring)
 in vec4 a_borderColor;      // per-instance ring RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
 out vec4 v_color;
@@ -216,7 +217,9 @@ out vec4 v_borderColor;
 void main() {
   v_color = a_color;${HL_APPLY}
   v_local = a_corner;
-  v_border = a_border;
+  // A px ring on a world disc: the disc's radius in px is a_radius · k, with k = ½ · viewport · |transform₀₀|.
+  float radiusPx = (u_screen > 0.5) ? a_radius : a_radius * 0.5 * u_viewport.x * abs(u_transform[0][0]);
+  v_border = (u_borderPx > 0.5) ? min(1.0, a_border / max(radiusPx, 1e-6)) : a_border;
   v_borderColor = a_borderColor;
   if (!hl && u_dimActive > 0.5) v_borderColor.a *= u_dimOpacity; // dim the flow-border ring with its node (#162)
   vec3 c = u_transform * vec3(a_center, 1.0);

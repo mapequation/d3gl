@@ -892,14 +892,16 @@ derives the physical network) plus a per-**state-node** module assignment, and `
   half-arrow links). A physical node whose state nodes span ≥2 modules renders as a **pie chart** — one
   wedge per module, sized by that module's summed flow and coloured by module; a single-module node is a
   solid disc.
-- **State** — every state node on a golden-angle **rosette** around its physical node, coloured by
-  module, so you can see *why* a node splits (its memory nodes belong to different communities). The
-  **LOD** control (`net.lod({ modules })`) aggregates the state nodes into their modules on zoom-out —
-  the state nodes carry the module tree, so the [modular LOD cut](#modular-level-of-detail) applies
-  directly. (LOD is a state-view feature; the physical/both views draw full detail.)
-- **Both** — a hybrid: each physical node is a faint **container** disc holding its state nodes on a
-  rosette confined inside it, drawn with **state-level** links — the memory structure in its physical
-  context. Everything is world-sized so the state nodes stay inside their physical node at every zoom.
+- **State** — the state graph as an ordinary network with its modules: exactly what
+  `net.data(stateGraph, { modules })` gives. It has a layout of its own (the **State layout** control lays it
+  out by force, or **nested** by module), the **LOD** control cuts its module tree with a ring around each open
+  module — the [modular LOD cut](#modular-level-of-detail) — and every hit names its module `path`. (LOD is a
+  state-view feature; the physical/both views draw full detail.)
+- **Both** — a hybrid: each physical node is a faint **container** disc, outlined by a thin ring in a darker
+  shade of its colour, holding its state nodes, drawn with **state-level** links — the memory structure in
+  its physical context. Each state node keeps its place in its container as the physical layout moves, and a
+  state node dragged there stays inside its container, where you put it. The nodes are world-sized so they stay inside their physical node at
+  every zoom.
 
 The **Nodes** slider scales the physical network from 10 to 10,000. The cap comes from the demo's
 synthetic data, not from the layout (the Worker and GPU backends lay out far larger graphs, as in the
@@ -918,9 +920,9 @@ const graph = buildStateGraph({ stateCount, stateToPhysical, source, target, wei
 net
   .style({ sizeMode: "screen", nodeRadius: 9 })
   .stateNetwork(graph, { modules }) // modules = Infomap's per-state-node { id, path } records
-  .layout({ backend: "force" });    // lays out the physical graph + derives rosette state positions
+  .layout({ backend: "force" });    // lays out the view on screen: the physical graph
 
-net.view("physical"); // pie glyphs for overlapping nodes · net.view("state") for the rosette
+net.view("state"); // the state graph, laid out now with the same options, and kept · "physical" | "both"
 
 // Your own module palette, in every view: state nodes, pie wedges and physical discs (#494). With a
 // nodeFill by a metric (`{ by: "flow", scale }`) the nodes follow it; pie wedges and containers keep the palette.
@@ -942,12 +944,15 @@ filled arc sectors, so the physical view **exports to `toSVG()`** and renders id
 backends. The synthetic data (an **LFR** physical network + **node2vec** triangle-closing trigrams, with
 each state node's module set to its *previous* node's community) is in the `state-network-data.ts` tab.
 
-The **physical** positions come from the layout backend the **Backend** control picks (Force, Worker or
-GPU, with `fit: true`; GPU by default), and the deterministic **rosette** fans each physical node's state
-nodes onto a ring around it. On Worker and GPU the rosette is re-derived on every streamed frame, so the
-state and both views converge along with the physical layout. Laying the state nodes out by force around
-their physical node, instead of on the rosette, is tracked in
-[#189](https://github.com/mapequation/d3gl/issues/189).
+**Each view keeps its own layout.** `layout()` lays out the view on screen with the backend the **Backend**
+control picks (Force, Worker or GPU, with `fit: true`; GPU by default): the physical graph in the physical and
+both views, which share that layout, and the state graph in the state view. A view shown for the first time
+is laid out with the app's last `layout()` options, from where its nodes are — the state nodes start on a
+rosette around their physical node — and every view keeps its positions across switches, so the app never
+re-runs a layout to switch views; a layout still running when its view is left goes on where it stood when the
+view is back (unless `stopLayout()` stopped it), and each view comes back at the pan and zoom it was left at. A node drag reheats the layout of the view it is in, also after a switch;
+in the both view a container drag reheats the physical layout, its state nodes riding along. `net.positions`
+gives the positions of the view on screen (in the both view the state dots', which no graph holds).
 
 <ExampleCard files={["state-network/draw.ts"]}>
   <StateNetwork client:visible slot="demo" />

@@ -6,8 +6,8 @@ import { setup } from "./draw.js";
 const notState = (o: Record<string, unknown>) => o.view !== "State";
 
 /** Harness for the state-network example: **Nodes** (physical count, up to 10k), a **Backend** toggle
- *  (Force / Worker / GPU — #182) for the physical layout, a **View** toggle (Physical pies / State
- *  rosette / Both), a **Links** toggle (half-arrow / line, both bent), **Colours** (the engine's module
+ *  (Force / Worker / GPU — #182) for the layouts, a **View** toggle (Physical pies / State / Both), a **State
+ *  layout** toggle (Force / Nested by module, #495), a **Links** toggle (half-arrow / line, both bent), **Colours** (the engine's module
  *  colours / an app palette via `style({ moduleColor })`), **Modules** (on / off: a raw state network,
  *  #494), **Physical** / **State** label
  *  toggles, and the "directed map of modules" option set. The LOD cut only applies to the State view, so
@@ -19,6 +19,7 @@ export default function StateNetwork() {
         { type: "range", key: "nodes", label: "Nodes", min: 0, max: 3, step: 1, value: 1, display: ["10", "100", "1,000", "10,000"] },
         { type: "segmented", key: "backend", label: "Backend", options: ["Force", "Worker", "GPU"], value: "GPU" },
         { type: "segmented", key: "view", label: "View", options: ["Physical", "State", "Both"] },
+        { type: "segmented", key: "stateLayout", label: "State layout", options: ["Force", "Nested"], disabled: (o) => notState(o) || o.modules === "Off" },
         { type: "segmented", key: "links", label: "Links", options: ["Half-arrow", "Line"] },
         { type: "segmented", key: "colors", label: "Colours", options: ["Engine", "Palette"] },
         { type: "segmented", key: "modules", label: "Modules", options: ["On", "Off"] },

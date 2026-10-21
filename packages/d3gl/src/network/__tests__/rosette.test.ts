@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildStateGraph } from "../state-graph.js";
-import { rosettePositions } from "../rosette.js";
+import { rosetteOffsets, rosettePositions } from "../rosette.js";
 
 // Physical A(0): state nodes 0,1,2; Physical B(1): a lone state node 3.
 const graph = buildStateGraph({
@@ -44,5 +44,21 @@ describe("rosettePositions", () => {
     const out = rosettePositions(graph);
     expect(out).toBeInstanceOf(Float32Array);
     expect(out.length).toBe(4 * 2);
+  });
+});
+
+describe("rosetteOffsets (#495)", () => {
+  it("is the rosette of a constant radius relative to each physical node: positions minus their centre", () => {
+    graph.physical.positions.set([10, 20, -5, 7]);
+    const pos = rosettePositions(graph, { radius: 0.72 });
+    const off = rosetteOffsets(graph, 0.72);
+    for (let s = 0; s < graph.state.nodeCount; s++) {
+      const p = graph.stateToPhysical[s]!;
+      expect(off[2 * s]).toBeCloseTo(pos[2 * s]! - graph.physical.positions[2 * p]!, 5);
+      expect(off[2 * s + 1]).toBeCloseTo(pos[2 * s + 1]! - graph.physical.positions[2 * p + 1]!, 5);
+      expect(Math.hypot(off[2 * s]!, off[2 * s + 1]!)).toBeLessThanOrEqual(0.72 + 1e-6); // inside the unit container's rosette
+    }
+    expect(off[6]).toBe(0); // the lone state node sits on its physical node
+    expect(off[7]).toBe(0);
   });
 });
