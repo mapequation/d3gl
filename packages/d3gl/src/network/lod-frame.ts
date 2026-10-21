@@ -87,6 +87,8 @@ export interface LeafSizing {
 export interface LeafStyle extends LeafSizing {
   weight: Float32Array;
   border?: Float32Array;
+  /** The leaf flow of a share-mode flow border (#510), summed onto the tree as {@link LODTree.borderFlow}. */
+  borderFlow?: Float32Array;
   colors?: Uint8Array;
   /** Whether links are drawn (#433): a stream that knows the edges builds super-edge rows only then.
    *  Default true. */
@@ -113,6 +115,8 @@ export interface SpatialFrameHeader {
   styleVersion: number;
   /** The frame id it was built for (the worker's tick). */
   frame: number;
+  /** Whether the frame holds a `borderFlow` array (a share-mode flow border, #510); else it has none. */
+  borderFlow?: boolean;
   /** Whether `clearZoom` holds the tree's crowding (#426): only a settled frame's does; a streamed frame's is
    *  `Infinity` (the footprint rule alone), and the engine computes the crowding once the layout settles. */
   crowding: boolean;
@@ -147,13 +151,18 @@ export interface SpatialFrameArrays extends MortonTopologyArrays {
   radius: Float32Array;
   weight: Float32Array;
   border: Float32Array;
+  /** Present only in a frame packed with `borderFlow` (a share-mode flow border, #510). */
+  borderFlow?: Float32Array;
   color: Uint8Array;
 }
 
-/** Bytes a packed spatial frame of these sizes needs: the 4-byte arrays first, then the byte arrays. */
-export function spatialFrameByteLength({ size, leafCount, levelCount }: MortonTopologySizes): number {
+/**
+ * Bytes a packed spatial frame of these sizes needs: the 4-byte arrays first, then the byte arrays. With
+ * `borderFlow` (a share-mode flow border, #510) it holds one more `Float32Array(size)`.
+ */
+export function spatialFrameByteLength({ size, leafCount, levelCount }: MortonTopologySizes, borderFlow = false): number {
   const cells = size - leafCount;
-  const words = levelCount + 1 + (size + 1) + Math.max(0, size - 1) + 3 * size + leafCount + cells + 5 * size + 3 * size;
+  const words = levelCount + 1 + (size + 1) + Math.max(0, size - 1) + 3 * size + leafCount + cells + 5 * size + 3 * size + (borderFlow ? size : 0);
   return 4 * words + 4 * size + cells;
 }
 
@@ -161,7 +170,7 @@ export function spatialFrameByteLength({ size, leafCount, levelCount }: MortonTo
  * The arrays of a packed spatial frame, viewed in `buffer` — the one layout the writer (the worker) and the
  * reader (the main thread) share. O(1): views only.
  */
-export function spatialFrameViews(buffer: ArrayBufferLike, { size, leafCount, levelCount }: MortonTopologySizes): SpatialFrameArrays {
+export function spatialFrameViews(buffer: ArrayBufferLike, { size, leafCount, levelCount }: MortonTopologySizes, borderFlow = false): SpatialFrameArrays {
   const cells = size - leafCount;
   let at = 0;
   const u32 = (n: number): Uint32Array => { const v = new Uint32Array(buffer, at, n); at += 4 * n; return v; };
@@ -185,6 +194,7 @@ export function spatialFrameViews(buffer: ArrayBufferLike, { size, leafCount, le
     radius: f32(size),
     weight: f32(size),
     border: f32(size),
+    borderFlow: borderFlow ? f32(size) : undefined,
     color: u8(4 * size),
     mortonLevel: u8(cells),
   };
@@ -197,7 +207,7 @@ export function spatialFrameViews(buffer: ArrayBufferLike, { size, leafCount, le
  */
 export function lodTreeFromSpatialFrame(frame: SpatialLODFrame): LODTree {
   const { header, buffer, rows } = frame;
-  const v = spatialFrameViews(buffer, header);
+  const v = spatialFrameViews(buffer, header, header.borderFlow === true);
   const topo = {
     size: header.size,
     leafCount: header.leafCount,
@@ -216,7 +226,7 @@ export function lodTreeFromSpatialFrame(frame: SpatialLODFrame): LODTree {
     // The empty same-level adjacency every spatial tree shares (see buildMortonTopology).
     { ...topo, edgeOffset: emptyAdjacency(header.size), edgeNeighbors: NO_NEIGHBORS },
     { cx: v.cx, cy: v.cy, extent: v.extent, clearZoom: v.clearZoom },
-    { count: v.count, radius: v.radius, weight: v.weight, border: v.border, color: v.color, leafBranching: header.leafBranching },
+    { count: v.count, radius: v.radius, weight: v.weight, border: v.border, borderFlow: v.borderFlow, color: v.color, leafBranching: header.leafBranching },
   );
 }
 
@@ -439,9 +449,11 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
   stream.box = box;
   // The topology is written straight into the frame buffer, sized once the cell count is known.
   const out: { buffer: ArrayBuffer | null; views: SpatialFrameArrays | null } = { buffer: null, views: null };
+  const style = stream.style;
+  const borderFlow = !!style?.borderFlow; // a share-mode flow border's summed flow travels in the frame (#510)
   const topology = buildMortonTopology(positions, n, { box }, stream.scratch, (sizes) => {
-    const buffer = takeBuffer(stream.pool, spatialFrameByteLength(sizes));
-    const views = spatialFrameViews(buffer, sizes);
+    const buffer = takeBuffer(stream.pool, spatialFrameByteLength(sizes, borderFlow));
+    const views = spatialFrameViews(buffer, sizes, borderFlow);
     out.buffer = buffer;
     out.views = views;
     return views;
@@ -453,11 +465,11 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     radius: views.radius,
     weight: views.weight,
     border: views.border,
+    borderFlow: views.borderFlow,
     color: views.color,
   });
   computeLODPositions(tree, positions, undefined, stream.bounds);
-  const style = stream.style;
-  if (style) computeLODStyle(tree, style.radii, style.weight, style.border, style.colors);
+  if (style) computeLODStyle(tree, style.radii, style.weight, style.border, style.colors, undefined, undefined, style.borderFlow);
   else {
     views.radius.fill(0);
     views.weight.fill(0);
@@ -479,6 +491,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     frame,
     crowding,
   };
+  if (borderFlow) header.borderFlow = true;
   if (cover?.fitBox) header.fitBox = cover.fitBox;
   return { header, buffer, rows: cover?.rows };
 }
