@@ -1,4 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type LayerSpec, type NodeDragSession } from "../map/base-engine.js";
+import { emitSelfLoops, emitSelfLoopArrows, selfLoopPrototype } from "./self-loops.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue, resolveNodeBorder, darkenedCss } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
@@ -3941,7 +3942,7 @@ export class Network extends BaseEngine {
   private flagPickableLinks(layers: InstancedLayer[]): InstancedLayer[] {
     if (this.pickLinksEnabled)
       for (const l of layers)
-        if (l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") l.pickable = true;
+        if ((l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") && !l.name.startsWith("self-")) l.pickable = true; // TEMP(#505): loop picking not wired yet
     return layers;
   }
 
@@ -3965,7 +3966,7 @@ export class Network extends BaseEngine {
         // `both` view (#494): a hovered container (id `stateCount + p`) keeps its state dots lit.
         const groups2 = this.bothGroups2();
         if (groups2) l.circles.groups2 = groups2;
-      } else if (l.primitive === "lines" || l.primitive === "half-arrows" || l.primitive === "arrows") {
+      } else if ((l.primitive === "lines" || l.primitive === "half-arrows" || l.primitive === "arrows") && !l.name.startsWith("self-")) { // TEMP(#505)
         const link = l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows;
         link.groups = cache.groupSource;
         if (cache.groupTarget) link.groups2 = cache.groupTarget;
@@ -5592,6 +5593,7 @@ export class Network extends BaseEngine {
         if (!emit || !drawLinks) return;
         if (halfArrow) emitHalfLinks(g, drawn, style.nodeRadii, style.linkWidthOf, style.linkBend, bake);
         else emitLinks(g, drawn, style.linkWidthOf, style.linkBend);
+        emitSelfLoops(g, drawn, style, selfLoopPrototype()); // #505
       },
     });
     this.registerLayer({
@@ -5602,7 +5604,10 @@ export class Network extends BaseEngine {
       sizeMode: arrowBake !== 1 ? "world" : linkMode,
       fill: (e) => linkColorAt(e as number),
       build: (g) => {
-        if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, drawn, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
+        if (emit && drawLinks && style.directed && !halfArrow) {
+          emitArrows(g, drawn, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
+          emitSelfLoopArrows(g, drawn, style, selfLoopPrototype(), arrowBake); // #505
+        }
       },
     });
     // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the

@@ -6,6 +6,7 @@ import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, t
 import type { ScreenRect } from "../core/instanced-lane.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
 import { PairIndex } from "./pair-index.js";
+import { selfLoopLayers, selfLoopPrototype } from "./self-loops.js";
 
 // Re-exported so the network's link-curve math keeps one import site for consumers/tests, even
 // though the formulas themselves now live in core (shared with the export-only vector view, #200).
@@ -2728,6 +2729,8 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       }
     }
   }
+  // #505: the self-link loops, between the links and the nodes ([] — no work past a cached O(1) lookup — without self-links).
+  if (drawsLinks(graph, style)) layers.push(...selfLoopLayers(graph, style, selfLoopPrototype()));
   layers.push({
     name: "nodes",
     primitive: "circles",
@@ -2870,6 +2873,8 @@ export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetwo
       }
     }
   }
+  // #505: the self-link loops, between the links and the nodes ([] — no work past a cached O(1) lookup — without self-links).
+  if (drawsLinks(graph, style)) layers.push(...selfLoopLayers(graph, style, selfLoopPrototype()));
   layers.push({
     name: "nodes",
     primitive: "circles",
@@ -2930,6 +2935,7 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
+    if (s === t) continue; // #505: a self-link is a loop (emitSelfLoops), not a zero-length line
     const sx = graph.positions[s * 2]!;
     const sy = graph.positions[s * 2 + 1]!;
     const tx = graph.positions[t * 2]!;
@@ -2968,6 +2974,7 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
+    if (s === t) continue; // #505: the loop's arrowhead is emitSelfLoopArrows'
     const sx = graph.positions[s * 2]! * bake;
     const sy = graph.positions[s * 2 + 1]! * bake;
     const tx = graph.positions[t * 2]! * bake;
