@@ -8,8 +8,6 @@ import {
   selfLoopAngles,
   teardropEnds,
   halfArrowLoopBend,
-  halfArrowSafeAngle,
-  HALF_ARROW_MIN_SIN,
   selfLoopCache,
   updateSelfLoops,
   selfLoopStats,
@@ -112,7 +110,7 @@ describe("self-loop geometry", () => {
       const to = new Float32Array(2);
       teardropEnds(loops, [theta], [r], so, to);
       const x0 = so[0] ?? 0, y0 = so[1] ?? 0, x1 = to[0] ?? 0, y1 = to[1] ?? 0;
-      const geom = halfLinkGeometry({ x0, y0, r0: 0, x1, y1, r1: 0, width: 1, oppositeWidth: 0, bend: chordBend(x0, y0, x1, y1, halfArrowLoopBend(theta)) });
+      const geom = halfLinkGeometry({ x0, y0, r0: 0, x1, y1, r1: 0, width: 1, oppositeWidth: 0, bend: chordBend(x0, y0, x1, y1, halfArrowLoopBend(x1 - x0, y1 - y0)) });
       if (!geom) throw new Error("expected a half-arrow");
       // The centre curve's control lies beyond the rim, along θ.
       expect(geom.cp1x * Math.cos(theta) + geom.cp1y * Math.sin(theta)).toBeGreaterThan(r);
@@ -120,15 +118,32 @@ describe("self-loop geometry", () => {
   });
 });
 
-describe("half-arrow loop angle", () => {
-  it("turns a loop off a vertical chord (θ ≈ 0, π) by at most ≈3°, and keeps any other angle", () => {
-    for (const theta of [0, Math.PI, -Math.PI, 1e-9, Math.PI - 1e-9]) {
-      const t = halfArrowSafeAngle(theta);
-      expect(Math.sin(t)).toBeGreaterThanOrEqual(HALF_ARROW_MIN_SIN - 1e-12); // the chord's x is clearly positive
-      expect(Math.cos(t) * Math.cos(theta)).toBeGreaterThan(0); // still on the same side
-      expect(Math.abs(Math.atan2(Math.sin(t - theta), Math.cos(t - theta)))).toBeLessThan(0.051);
+describe("half-arrow loop side", () => {
+  // The WebGL lane's rule, in float32: the side from the centres' delta (0 for a loop) plus the offsets' delta.
+  const laneOutward = (so: Float32Array, to: Float32Array, bend: number, theta: number): boolean => {
+    const sx = Math.fround(Math.fround(0) + Math.fround((to[0] ?? 0) - (so[0] ?? 0)));
+    const sy = Math.fround((to[1] ?? 0) - (so[1] ?? 0));
+    const curvature = sx > 0 || (sx === 0 && sy < 0) ? 1 : -1;
+    const dx = (to[0] ?? 0) - (so[0] ?? 0);
+    const dy = (to[1] ?? 0) - (so[1] ?? 0);
+    const len = Math.hypot(dx, dy);
+    // The bow goes along curvature · sign(bend) · right, right = (−dy, dx) / len; outward is along θ.
+    const along = (curvature * Math.sign(bend) * (-dy * Math.cos(theta) + dx * Math.sin(theta))) / len;
+    return along > 0;
+  };
+
+  it("bows outward on a vertical chord (θ ≈ 0, π), where the chord's x is rounding, at its exact angle", () => {
+    const loops = buildSelfLoopIndex([0], [0], [1], 1);
+    if (!loops) throw new Error("expected loops");
+    for (const theta of [0, Math.PI, -Math.PI, 1e-9, -1e-9, Math.PI - 1e-9, -Math.PI + 1e-9, 1e-30]) {
+      for (const r of [0.001, 3, 10, 12345]) {
+        const so = new Float32Array(2);
+        const to = new Float32Array(2);
+        teardropEnds(loops, [theta], [r], so, to);
+        const bend = halfArrowLoopBend((to[0] ?? 0) - (so[0] ?? 0), (to[1] ?? 0) - (so[1] ?? 0));
+        expect(laneOutward(so, to, bend, theta)).toBe(true);
+      }
     }
-    for (const theta of [0.5, -1, 2, -2.5]) expect(halfArrowSafeAngle(theta)).toBe(theta);
   });
 });
 

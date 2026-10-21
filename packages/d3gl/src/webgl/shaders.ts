@@ -473,7 +473,12 @@ void main() {
 
   float bendMagnitude = abs(a_bend) * l;
   float outerBendAddition = pow(bendMagnitude / 10.0, 0.4);
-  bool positiveCurvature = dir.x > 0.0 || (dir.x == 0.0 && dir.y < 0.0);
+  // The bow side, from the centres' delta plus the offsets' delta (#505): bit-for-bit d without end offsets, and
+  // exact for a self-link loop (both centres one point), whose d is a short chord beside a far larger centre
+  // that rounding can zero (then the y rule picks a side the CPU did not); the CPU picks the loop's bend sign
+  // from these same offsets.
+  vec2 side = (screen ? worldToPx(a_p1) - worldToPx(a_p0) : a_p1 - a_p0) + (a_targetOffset - a_sourceOffset);
+  bool positiveCurvature = side.x > 0.0 || (side.x == 0.0 && side.y < 0.0);
   float curvatureSign = positiveCurvature ? 1.0 : -1.0;
   float bendSign = a_bend > 0.0 ? 1.0 : -1.0;
   float signedBend = curvatureSign * bendSign * bendMagnitude;

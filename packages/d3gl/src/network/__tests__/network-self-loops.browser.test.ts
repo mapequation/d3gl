@@ -53,6 +53,8 @@ interface Case {
   linkStyle?: "line" | "half-arrow";
   /** The edges after the 0–1 link: node 0's self-links (several = duplicates). */
   selfWeights?: number[];
+  /** LOD on, every leaf kept (the loops of an LOD frame's kept leaves). */
+  lod?: boolean;
 }
 
 async function draw(c: Case) {
@@ -63,6 +65,7 @@ async function draw(c: Case) {
   net
     .data(g)
     .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: 3, arrowSize: 4, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode })
+    .lod(c.lod ? { expandPx: 1, declutter: false } : false)
     .layout({ backend: "positions", positions: POSITIONS });
   net.setTransform({ k: 1, x: 0, y: 0 });
   return net;
@@ -138,4 +141,45 @@ describe("self-link loops (#505)", () => {
       expect(hit?.id).toBe(1);
       net.destroy();
     });
+
+  for (const backend of BACKENDS)
+    it(`${backend}: with LOD on, a kept leaf draws its loop (line, directed, half-arrow)`, async () => {
+      for (const sizeMode of SIZE_MODES) {
+        const plainNet = await draw({ backend, sizeMode, directed: false, lod: true });
+        const plain = await loopRed(frame(plainNet, backend));
+        const elsewhere = await redPixels(frame(plainNet, backend), 152, CY - 14, 180, CY + 14);
+        plainNet.destroy();
+        expect(plain, sizeMode).toBeGreaterThan(20);
+        expect(elsewhere, sizeMode).toBe(0);
+        const directed = await draw({ backend, sizeMode, directed: true, lod: true });
+        const withHead = await loopRed(frame(directed, backend));
+        directed.destroy();
+        expect(withHead, sizeMode).toBeGreaterThan(plain + 4);
+        const half = await draw({ backend, sizeMode, directed: true, linkStyle: "half-arrow", lod: true });
+        const halfRed = await loopRed(frame(half, backend));
+        half.destroy();
+        expect(halfRed, sizeMode).toBeGreaterThan(10);
+      }
+    });
+
+  it("webgl: with LOD on, picking a kept leaf's loop reports its first self-link, with the summed weight", async () => {
+    const net = await draw({ backend: "webgl", sizeMode: "world", directed: false, selfWeights: [1, 3], lod: true });
+    net.interactive({ hover: true });
+    net.pickLinks(true);
+    const hit = net.pick(APEX_X + 1, CY);
+    expect(hit?.layer).toBe("links");
+    expect(hit?.id).toBe(1);
+    expect((hit?.datum as NetworkLinkHit).weight).toBeCloseTo(4);
+    expect(net.pick(100, CY)?.id).toBe(0); // the 0–1 leaf link still picks as edge 0
+    net.destroy();
+  });
+
+  it("webgl: a half-arrow loop level with its neighbour (a vertical chord) bows outward in world mode", async () => {
+    // Node 1 exactly level with node 0 (θ = π): the chord is vertical, the case the lane's side rule decides from
+    // the offsets alone (#505). Inward, the loop would hide under the node and leave its box empty.
+    const net = await draw({ backend: "webgl", sizeMode: "world", directed: true, linkStyle: "half-arrow" });
+    const red = await loopRed(net.toPNG());
+    net.destroy();
+    expect(red).toBeGreaterThan(10);
+  });
 });

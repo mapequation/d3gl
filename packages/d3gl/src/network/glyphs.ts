@@ -2730,9 +2730,9 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
     }
   }
   // #505: the self-link loops, between the links and the nodes (none — past a cached O(1) lookup — without self-links).
-  const loops = drawsLinks(graph, style) && !style.nodeOffsets ? selfLoopCache(graph, style) : null;
+  const loops = drawsLinks(graph, style) ? selfLoopCache(graph, style) : null;
   if (loops) {
-    updateSelfLoops(graph, loops);
+    updateSelfLoops(graph, loops, style.nodeOffsets);
     layers.push(...selfLoopLayers(loops));
   }
   layers.push({
@@ -2837,7 +2837,7 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   // The links' end offsets (#509): one O(edges) pass per style version, never per frame.
   const ends = style.nodeOffsets ? edgeOffsets(graph, style.nodeOffsets) : undefined;
   // The self-link loops (#505): O(S) per style version; nothing without self-links (a cached O(E) scan per graph).
-  const loops = style.nodeOffsets ? undefined : (selfLoopCache(graph, style) ?? undefined);
+  const loops = selfLoopCache(graph, style) ?? undefined;
   if (halfArrow) {
     return {
       kind: "half-arrows",
@@ -2885,7 +2885,7 @@ export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetwo
   }
   // #505: the self-link loops, between the links and the nodes: the cached columns, rewritten in place (O(S)).
   if (cache.loops) {
-    updateSelfLoops(graph, cache.loops);
+    updateSelfLoops(graph, cache.loops, style.nodeOffsets);
     layers.push(...selfLoopLayers(cache.loops));
   }
   layers.push({

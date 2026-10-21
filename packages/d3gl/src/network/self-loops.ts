@@ -26,6 +26,7 @@ import type { NetworkGraph } from "./graph.js";
 import { bezierControl, bentEndTangent, chordBend, halfLinkGeometry, scaleHalfLink, traceHalfLink } from "../core/half-link.js";
 import type { InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { RGBAValue } from "./glyphs.js";
+import type { StableColumns } from "../core/stable-columns.js";
 
 /** The direction of a loop whose node has no neighbours to point away from (radians, y down: up-right). */
 export const FALLBACK_ANGLE = -Math.PI / 4;
@@ -110,29 +111,38 @@ interface Adjacency {
 }
 
 /** Each loop's direction (radians, y down), into `out`: opposite the weighted mean of the unit vectors from
- *  its node to its neighbours, or {@link FALLBACK_ANGLE}. O(Σ degree of the looped nodes). */
-export function selfLoopAngles(positions: ArrayLike<number>, csr: Adjacency, loops: SelfLoopIndex, out: Float32Array): Float32Array {
-  for (let i = 0; i < loops.count; i++) {
-    const n = loops.nodes[i] ?? 0;
-    const px = positions[2 * n] ?? 0;
-    const py = positions[2 * n + 1] ?? 0;
-    let sx = 0;
-    let sy = 0;
-    const end = csr.offsets[n + 1] ?? 0;
-    for (let k = csr.offsets[n] ?? 0; k < end; k++) {
-      const m = csr.neighbors[k] ?? n;
-      if (m === n) continue;
-      const dx = (positions[2 * m] ?? 0) - px;
-      const dy = (positions[2 * m + 1] ?? 0) - py;
-      const len = Math.hypot(dx, dy);
-      if (len === 0) continue;
-      const w = csr.weights ? (csr.weights[k] ?? 1) : 1;
-      sx += (w * dx) / len;
-      sy += (w * dy) / len;
-    }
-    out[i] = Math.hypot(sx, sy) > 1e-9 ? Math.atan2(-sy, -sx) : FALLBACK_ANGLE;
-  }
+ *  its node to its neighbours, or {@link FALLBACK_ANGLE}. With `nodeOffsets` (#509: a state node drawn at its
+ *  physical node's centre plus a px offset), a neighbour at the same centre — a state node of the same physical
+ *  node — points along the offsets' difference instead: a unit vector either way, so the angle is the same at
+ *  every zoom. O(Σ degree of the looped nodes). */
+export function selfLoopAngles(positions: ArrayLike<number>, csr: Adjacency, loops: SelfLoopIndex, out: Float32Array, nodeOffsets?: ArrayLike<number>): Float32Array {
+  for (let i = 0; i < loops.count; i++) out[i] = selfLoopAngle(positions, csr, loops.nodes[i] ?? 0, nodeOffsets);
   return out;
+}
+
+/** One loop's direction, at node `n`: see {@link selfLoopAngles}. O(degree of `n`). */
+function selfLoopAngle(positions: ArrayLike<number>, csr: Adjacency, n: number, nodeOffsets?: ArrayLike<number>): number {
+  const px = positions[2 * n] ?? 0;
+  const py = positions[2 * n + 1] ?? 0;
+  let sx = 0;
+  let sy = 0;
+  const end = csr.offsets[n + 1] ?? 0;
+  for (let k = csr.offsets[n] ?? 0; k < end; k++) {
+    const m = csr.neighbors[k] ?? n;
+    if (m === n) continue;
+    let dx = (positions[2 * m] ?? 0) - px;
+    let dy = (positions[2 * m + 1] ?? 0) - py;
+    if (nodeOffsets && dx === 0 && dy === 0) {
+      dx = (nodeOffsets[2 * m] ?? 0) - (nodeOffsets[2 * n] ?? 0);
+      dy = (nodeOffsets[2 * m + 1] ?? 0) - (nodeOffsets[2 * n + 1] ?? 0);
+    }
+    const len = Math.hypot(dx, dy);
+    if (len === 0) continue;
+    const w = csr.weights ? (csr.weights[k] ?? 1) : 1;
+    sx += (w * dx) / len;
+    sy += (w * dy) / len;
+  }
+  return Math.hypot(sx, sy) > 1e-9 ? Math.atan2(-sy, -sx) : FALLBACK_ANGLE;
 }
 
 /** Each loop's two ends as offsets from its node centre (size units), into `sourceOffsets` / `targetOffsets`:
@@ -150,31 +160,17 @@ export function teardropEnds(loops: SelfLoopIndex, angles: ArrayLike<number>, ra
 }
 
 /**
- * The half-arrow lane's bend for a loop at angle `θ`. The half-arrow fixes its bow side by the chord's
- * direction (`positiveCurvature`, so a reciprocal pair nests) and multiplies by the bend's sign, where the line
- * lane bows by the sign alone. The loop's chord runs `θ + α → θ − α`, along `(sin θ, −cos θ)`, so the sign
- * that bows it outward flips with that rule.
+ * The half-arrow lane's bend for a loop whose chord (its target end minus its source end) is `(dx, dy)`. The
+ * half-arrow fixes its bow side by the chord's direction (`positiveCurvature`, so a reciprocal pair nests) and
+ * multiplies by the bend's sign, where the line lane bows by the sign alone. The loop's chord runs
+ * `θ + α → θ − α`, along `(sin θ, −cos θ)`, whose right-hand normal points away from the node, so the bend
+ * takes the rule's sign. Pass the chord the drawing reads, not `θ`: at `θ ≈ 0` or `π` (a neighbour level with
+ * its node) the chord is vertical and its x is rounding, so only that same x gives the side that path picks
+ * (the WebGL lane reads it from the stored offsets, the Scene twin from its own ends).
  */
-export function halfArrowLoopBend(theta: number): number {
-  const dx = Math.sin(theta);
-  const dy = -Math.cos(theta);
+export function halfArrowLoopBend(dx: number, dy: number): number {
   const positive = dx > 0 || (dx === 0 && dy < 0);
   return positive ? TEARDROP_BEND : -TEARDROP_BEND;
-}
-
-/** The least `|sin θ|` a half-arrow loop is drawn at: see {@link halfArrowSafeAngle}. */
-export const HALF_ARROW_MIN_SIN = 0.05;
-
-/**
- * `θ` moved off a vertical chord for a half-arrow loop. The half-arrow's bow side flips with the sign of the
- * chord's x (`dir.x > 0`), and a loop at `θ ≈ 0` or `π` (a neighbour level with its node) has a vertical chord
- * whose x is float rounding noise on the GPU, so the loop could bow INTO the node. Turning such a loop by at
- * most ≈3° (`|sin θ| ≥` {@link HALF_ARROW_MIN_SIN}) makes the chord's x clearly positive, the side certain.
- */
-export function halfArrowSafeAngle(theta: number): number {
-  if (Math.abs(Math.sin(theta)) >= HALF_ARROW_MIN_SIN) return theta;
-  const turn = Math.asin(HALF_ARROW_MIN_SIN);
-  return Math.cos(theta) >= 0 ? turn : Math.PI - turn;
 }
 
 /** Trace one teardrop into a path context, its ends at `(px, py)` + the offsets. The Scene twin of the lane. */
@@ -244,8 +240,11 @@ export interface SelfLoopCache {
    *  renderer (which uploads bends by reference) sees the change without an allocation. */
   halfBends: [Float32Array, Float32Array];
   halfBendSlot: 0 | 1;
-  /** `[0, S)`: every end offset is rewritten each position frame (#509 in-place range upload). */
-  changed: Uint32Array;
+  /** `[0, S)`: every end offset is rewritten each position frame (#509 in-place range upload). Absent on an LOD
+   *  frame's subset ({@link selfLoopSubset}), whose columns are handed back unchanged when their values are. */
+  changed?: Uint32Array;
+  /** Per-loop `selected` flags (#162), on an LOD frame's subset (the no-LOD lane attaches its own). */
+  selected?: Uint8Array;
 }
 
 /** Instrumentation for the per-frame guard: loop updates run, and loop instances they touched. */
@@ -292,8 +291,9 @@ export function selfLoopCache(graph: NetworkGraph, style: SelfLoopStyle): SelfLo
 }
 
 /** The position frame: each loop's centre, angle and ends (and half-arrow bend) from `graph.positions`, in
- *  place. O(S + Σ degree of the looped nodes), no allocation. */
-export function updateSelfLoops(graph: NetworkGraph, c: SelfLoopCache): void {
+ *  place. With `nodeOffsets` (#509, the both view in screen sizeMode) each loop's ends also carry its node's
+ *  offset, as the node and its links do. O(S + Σ degree of the looped nodes), no allocation. */
+export function updateSelfLoops(graph: NetworkGraph, c: SelfLoopCache, nodeOffsets?: Float32Array): void {
   const { loops, centres, angles } = c;
   const S = loops.count;
   const pos = graph.positions;
@@ -302,15 +302,30 @@ export function updateSelfLoops(graph: NetworkGraph, c: SelfLoopCache): void {
     centres[2 * i] = pos[2 * n] ?? 0;
     centres[2 * i + 1] = pos[2 * n + 1] ?? 0;
   }
-  selfLoopAngles(pos, graph.csr, loops, angles);
-  if (c.halfArrow) for (let i = 0; i < S; i++) angles[i] = halfArrowSafeAngle(angles[i] ?? 0);
+  selfLoopAngles(pos, graph.csr, loops, angles, nodeOffsets);
   teardropEnds(loops, angles, c.radii, c.sourceOffsets, c.targetOffsets);
+  if (nodeOffsets) {
+    const so = c.sourceOffsets;
+    const to = c.targetOffsets;
+    for (let i = 0; i < S; i++) {
+      const n = loops.nodes[i] ?? 0;
+      const ox = nodeOffsets[2 * n] ?? 0;
+      const oy = nodeOffsets[2 * n + 1] ?? 0;
+      so[2 * i] = (so[2 * i] ?? 0) + ox;
+      so[2 * i + 1] = (so[2 * i + 1] ?? 0) + oy;
+      to[2 * i] = (to[2 * i] ?? 0) + ox;
+      to[2 * i + 1] = (to[2 * i + 1] ?? 0) + oy;
+    }
+  }
   if (c.halfArrow) {
     const cur = c.halfBends[c.halfBendSlot];
     const next = c.halfBends[c.halfBendSlot === 0 ? 1 : 0];
     let flipped = false;
+    const so = c.sourceOffsets;
+    const to = c.targetOffsets;
     for (let i = 0; i < S; i++) {
-      const b = halfArrowLoopBend(angles[i] ?? 0);
+      // From the stored (float32) offsets, the values the lane's side rule reads.
+      const b = halfArrowLoopBend((to[2 * i] ?? 0) - (so[2 * i] ?? 0), (to[2 * i + 1] ?? 0) - (so[2 * i + 1] ?? 0));
       next[i] = b;
       if (cur[i] !== b) flipped = true;
     }
@@ -329,7 +344,8 @@ export const SELF_LOOP_ARROW_LAYER = "self-loop-arrows";
  * {@link updateSelfLoops} first): a `lines` (or `half-arrows`) layer, plus an `arrows` layer for a directed
  * `line` style. Instance `i` is loop `i`; its pick resolves to `loops.edges[i]`. O(1): no array is built.
  */
-export function selfLoopLayers(c: SelfLoopCache): InstancedLayer[] {
+export function selfLoopLayers(c: SelfLoopCache, pickable?: true, pickBase?: number): InstancedLayer[] {
+  const pick = pickBase === undefined ? {} : { pickable, pickBase };
   const { centres, sourceOffsets, targetOffsets, changed, sizeMode } = c;
   const count = c.loops.count;
   const ends = { sourceOffsets, targetOffsets, endOffsetsChanged: changed };
@@ -339,18 +355,20 @@ export function selfLoopLayers(c: SelfLoopCache): InstancedLayer[] {
         name: SELF_LOOP_LAYER,
         primitive: "half-arrows",
         sizeMode,
-        halfArrows: { sources: centres, targets: centres, radii: c.zeroRadii, widths: c.halfWidths, bends: c.halfBends[c.halfBendSlot], colors: c.colors, samples: LOOP_SAMPLES, groups: c.groups, ...ends, count },
+        ...pick,
+        halfArrows: { sources: centres, targets: centres, radii: c.zeroRadii, widths: c.halfWidths, bends: c.halfBends[c.halfBendSlot], colors: c.colors, samples: LOOP_SAMPLES, groups: c.groups, selected: c.selected, ...ends, count },
       },
     ];
   const layers: InstancedLayer[] = [
-    { name: SELF_LOOP_LAYER, primitive: "lines", sizeMode, lines: { sources: centres, targets: centres, widths: c.widths, colors: c.colors, bends: c.bends, samples: LOOP_SAMPLES, groups: c.groups, ...ends, count } },
+    { name: SELF_LOOP_LAYER, primitive: "lines", sizeMode, ...pick, lines: { sources: centres, targets: centres, widths: c.widths, colors: c.colors, bends: c.bends, samples: LOOP_SAMPLES, groups: c.groups, selected: c.selected, ...ends, count } },
   ];
   if (c.arrowheads)
     layers.push({
       name: SELF_LOOP_ARROW_LAYER,
       primitive: "arrows",
       sizeMode,
-      arrows: { sources: centres, targets: centres, radii: c.zeroRadii, sizes: c.arrowSizes, colors: c.colors, bends: c.bends, groups: c.groups, ...ends, count },
+      ...pick,
+      arrows: { sources: centres, targets: centres, radii: c.zeroRadii, sizes: c.arrowSizes, colors: c.colors, bends: c.bends, groups: c.groups, selected: c.selected, ...ends, count },
     });
   return layers;
 }
@@ -368,37 +386,37 @@ export function selfLoopSelected(loops: SelfLoopIndex, linkSelected: Uint8Array)
  * the node centre, which the Scene draws as `anchor′ + (p − anchor)`: constant px at every zoom, no re-bake.
  * Reads the columns {@link updateSelfLoops} wrote; each drawable captures its numbers, not the columns.
  */
-export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache): void {
+export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const screen = c.sizeMode === "screen";
   for (let i = 0; i < loops.count; i++) {
     const px = centres[2 * i] ?? 0;
     const py = centres[2 * i + 1] ?? 0;
     const sox = so[2 * i] ?? 0, soy = so[2 * i + 1] ?? 0, tox = to[2 * i] ?? 0, toy = to[2 * i + 1] ?? 0;
-    g.drawable(loops.edges[i] ?? 0, (ctx) => traceTeardrop(ctx, px, py, sox, soy, tox, toy), { lineWidth: c.widths[i] ?? 0, anchor: screen ? [px, py] : undefined });
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceTeardrop(ctx, px, py, sox, soy, tox, toy), { lineWidth: c.widths[i] ?? 0, anchor: screen ? [px, py] : undefined });
   }
 }
 
 /** The Scene twin of the `half-arrow` loops: one filled half-arrow glyph each, keyed by its edge. `bake` as
  *  `emitHalfLinks`: screen mode solves in px around the node centre × bake and emits ÷ bake. */
-export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1): void {
-  const { loops, centres, sourceOffsets: so, targetOffsets: to, angles } = c;
+export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, idBase = 0): void {
+  const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
     const x0 = px + (so[2 * i] ?? 0), y0 = py + (so[2 * i + 1] ?? 0);
     const x1 = px + (to[2 * i] ?? 0), y1 = py + (to[2 * i + 1] ?? 0);
     const width = c.widths[i] ?? 0;
-    const geom = halfLinkGeometry({ x0, y0, r0: 0, x1, y1, r1: 0, width, oppositeWidth: 0, bend: chordBend(x0, y0, x1, y1, halfArrowLoopBend(angles[i] ?? 0)) });
+    const geom = halfLinkGeometry({ x0, y0, r0: 0, x1, y1, r1: 0, width, oppositeWidth: 0, bend: chordBend(x0, y0, x1, y1, halfArrowLoopBend(x1 - x0, y1 - y0)) });
     if (!geom) continue;
     const out = bake === 1 ? geom : scaleHalfLink(geom, 1 / bake);
-    g.drawable(loops.edges[i] ?? 0, (ctx) => traceHalfLink(out, ctx));
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceHalfLink(out, ctx));
   }
 }
 
 /** The Scene twin of the loop arrowheads, in the `arrows` group (filled). `bake` as `emitArrows`: screen mode
  *  solves in px around the node centre × bake and emits ÷ bake (re-baked with the other arrowheads). */
-export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, size: number, bake = 1): void {
+export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, size: number, bake = 1, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const inv = 1 / bake;
   for (let i = 0; i < loops.count; i++) {
@@ -411,11 +429,181 @@ export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, size: numb
     const [ux, uy] = bentEndTangent(sx, sy, tipX, tipY, TEARDROP_BEND);
     const baseX = tipX - ux * 2 * size;
     const baseY = tipY - uy * 2 * size;
-    g.drawable(loops.edges[i] ?? 0, (ctx) => {
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => {
       ctx.moveTo(tipX * inv, tipY * inv);
       ctx.lineTo((baseX + uy * size) * inv, (baseY - ux * size) * inv);
       ctx.lineTo((baseX - uy * size) * inv, (baseY + ux * size) * inv);
       ctx.closePath();
     });
   }
+}
+
+/** Reusable state for the loops of an LOD frame (#505): each node's loop (−1 for none, built once per index, only
+ *  for a graph with self-links), the frame's loop list, and the subset's id / angle columns. */
+export interface KeptLoopsScratch {
+  of: SelfLoopIndex | null;
+  slot: Int32Array;
+  list: Uint32Array;
+  nodes: Uint32Array;
+  edges: Uint32Array;
+  weights: Float32Array;
+  angles: Float32Array;
+}
+
+/** A fresh, empty {@link KeptLoopsScratch}. */
+export function makeKeptLoopsScratch(): KeptLoopsScratch {
+  return { of: null, slot: new Int32Array(0), list: new Uint32Array(0), nodes: new Uint32Array(0), edges: new Uint32Array(0), weights: new Float32Array(0), angles: new Float32Array(0) };
+}
+
+/** Instrumentation for the per-frame guards: LOD frames that listed loops, and the entries they read. */
+export const keptLoopStats = { frames: 0, reads: 0 };
+
+/**
+ * The loops whose node is a kept leaf of a cut, as loop indices into `sc.list[0..m)`; returns `m`. The cheaper of
+ * two passes: with `isKept` (the frame's gather stamps its kept leaves) and no more loops than glyphs, one over the
+ * S loops; else one over the frontier against each node's loop slot (4 B per node, once per graph). So
+ * O(min(S, frontier)), never more than the frame already reads, and never run for a graph without self-links.
+ */
+export function keptLeafLoops(loops: SelfLoopIndex, nodeCount: number, frontier: ArrayLike<number>, isKept: ((v: number) => boolean) | null, sc: KeptLoopsScratch): number {
+  const S = loops.count;
+  if (sc.list.length < S) sc.list = new Uint32Array(S);
+  const list = sc.list;
+  let m = 0;
+  keptLoopStats.frames++;
+  if (isKept && S <= frontier.length) {
+    for (let i = 0; i < S; i++) if (isKept(loops.nodes[i] ?? 0)) list[m++] = i;
+    keptLoopStats.reads += S;
+    return m;
+  }
+  if (sc.of !== loops) {
+    if (sc.slot.length !== nodeCount) sc.slot = new Int32Array(nodeCount);
+    sc.slot.fill(-1);
+    for (let i = 0; i < S; i++) sc.slot[loops.nodes[i] ?? 0] = i;
+    sc.of = loops;
+  }
+  const slot = sc.slot;
+  for (let k = 0; k < frontier.length; k++) {
+    const g = frontier[k] ?? 0;
+    if (g >= nodeCount) continue;
+    const j = slot[g] ?? -1;
+    if (j >= 0) list[m++] = j;
+  }
+  keptLoopStats.reads += frontier.length;
+  return m;
+}
+
+/** Where an LOD frame draws its loops: the leaves' drawn centres, their cross-fade alpha, the per-edge selection. */
+export interface LoopSubsetFrame {
+  cx: ArrayLike<number>;
+  cy: ArrayLike<number>;
+  fade?: ArrayLike<number> | null;
+  /** Per-edge `selected` flags (a loop takes its first self-link's). */
+  linkSelected?: Uint8Array;
+  nodeOffsets?: Float32Array;
+}
+
+/**
+ * The loops `sc.list[0..m)` of `c` as a {@link SelfLoopCache} of their own (#505: an LOD frame's loops on kept
+ * leaves), so {@link selfLoopLayers} and the Scene emitters draw it as they draw the whole set. Each loop's angle
+ * and ends are solved here (O(m + Σ degree of their nodes)); its style is copied from `c`. Every column goes
+ * through `memo` ({@link StableColumns}), so a frame whose loops and positions did not change hands back the
+ * arrays the GPU holds and uploads nothing; memory: two arrays per column, ≈ 2 × 80 B per drawn loop, reused.
+ */
+export function selfLoopSubset(c: SelfLoopCache, graph: NetworkGraph, m: number, frame: LoopSubsetFrame, memo: StableColumns, sc: KeptLoopsScratch): SelfLoopCache {
+  const list = sc.list;
+  if (sc.nodes.length < m) {
+    const cap = Math.max(m, 2 * sc.nodes.length);
+    sc.nodes = new Uint32Array(cap);
+    sc.edges = new Uint32Array(cap);
+    sc.weights = new Float32Array(cap);
+    sc.angles = new Float32Array(cap);
+  }
+  const { loops } = c;
+  const { nodes, edges, weights, angles } = sc;
+  const off = frame.nodeOffsets;
+  for (let i = 0; i < m; i++) {
+    const j = list[i] ?? 0;
+    const n = loops.nodes[j] ?? 0;
+    nodes[i] = n;
+    edges[i] = loops.edges[j] ?? 0;
+    weights[i] = loops.weights[j] ?? 0;
+    angles[i] = selfLoopAngle(graph.positions, graph.csr, n, off);
+  }
+  const { cx, cy, fade, linkSelected } = frame;
+  const a = TEARDROP_HALF_OPENING;
+  const radii = c.radii;
+  const endAt = (out: Float32Array, sign: number): void => {
+    for (let i = 0; i < m; i++) {
+      const n = nodes[i] ?? 0;
+      const r = radii[n] ?? 0;
+      const t = (angles[i] ?? 0) + sign * a;
+      out[2 * i] = r * Math.cos(t) + (off ? (off[2 * n] ?? 0) : 0);
+      out[2 * i + 1] = r * Math.sin(t) + (off ? (off[2 * n + 1] ?? 0) : 0);
+    }
+  };
+  const sourceOffsets = memo.float32Into("loops.sourceOffsets", 2 * m, (out) => endAt(out, 1));
+  const targetOffsets = memo.float32Into("loops.targetOffsets", 2 * m, (out) => endAt(out, -1));
+  const centres = memo.float32Into("loops.centres", 2 * m, (out) => {
+    for (let i = 0; i < m; i++) {
+      const n = nodes[i] ?? 0;
+      out[2 * i] = cx[n] ?? 0;
+      out[2 * i + 1] = cy[n] ?? 0;
+    }
+  });
+  const widths = memo.float32Into("loops.widths", m, (out) => {
+    for (let i = 0; i < m; i++) out[i] = c.widths[list[i] ?? 0] ?? 0;
+  });
+  const colors = memo.uint8Into("loops.colors", 4 * m, (out) => {
+    for (let i = 0; i < m; i++) {
+      const j = 4 * (list[i] ?? 0);
+      out[4 * i] = c.colors[j] ?? 0;
+      out[4 * i + 1] = c.colors[j + 1] ?? 0;
+      out[4 * i + 2] = c.colors[j + 2] ?? 0;
+      // The cross-fade band (#139) fades a loop with its leaf, in its colour: the loop layer is not indexed.
+      out[4 * i + 3] = Math.round((c.colors[j + 3] ?? 0) * (fade ? (fade[nodes[i] ?? 0] ?? 1) : 1));
+    }
+  });
+  const groups = memo.float32Into("loops.groups", m, (out) => {
+    for (let i = 0; i < m; i++) out[i] = nodes[i] ?? 0;
+  });
+  const bends = memo.float32Into("loops.bends", m, (out) => out.fill(TEARDROP_BEND));
+  const arrowSizes = memo.float32Into("loops.arrowSizes", m, (out) => out.fill(c.arrowSizes[0] ?? 0));
+  const zeroRadii = memo.float32Into("loops.zeroRadii", c.halfArrow ? 2 * m : m, (out) => out.fill(0));
+  const halfWidths = memo.float32Into("loops.halfWidths", c.halfArrow ? 2 * m : 0, (out) => {
+    for (let i = 0; i < m; i++) {
+      out[2 * i] = c.widths[list[i] ?? 0] ?? 0;
+      out[2 * i + 1] = 0;
+    }
+  });
+  const halfBends = memo.float32Into("loops.halfBends", c.halfArrow ? m : 0, (out) => {
+    for (let i = 0; i < out.length; i++)
+      out[i] = halfArrowLoopBend((targetOffsets[2 * i] ?? 0) - (sourceOffsets[2 * i] ?? 0), (targetOffsets[2 * i + 1] ?? 0) - (sourceOffsets[2 * i + 1] ?? 0));
+  });
+  const selected = linkSelected
+    ? memo.uint8Into("loops.selected", m, (out) => {
+        for (let i = 0; i < m; i++) out[i] = linkSelected[edges[i] ?? 0] ?? 0;
+      })
+    : undefined;
+  selfLoopStats.instances += m;
+  return {
+    loops: { nodes: nodes.subarray(0, m), edges: edges.subarray(0, m), weights: weights.subarray(0, m), count: m },
+    sizeMode: c.sizeMode,
+    halfArrow: c.halfArrow,
+    arrowheads: c.arrowheads,
+    radii,
+    widths,
+    colors,
+    groups,
+    bends,
+    arrowSizes,
+    zeroRadii,
+    halfWidths,
+    centres,
+    angles: angles.subarray(0, m),
+    sourceOffsets,
+    targetOffsets,
+    halfBends: [halfBends, halfBends],
+    halfBendSlot: 0,
+    selected,
+  };
 }

@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type LayerSpec, type NodeDragSession } from "../map/base-engine.js";
-import { emitSelfLoops, emitSelfLoopArrows, emitSelfLoopHalfArrows, updateSelfLoops, selfLoopOfEdge, selfLoopSelected, SELF_LOOP_LAYER, SELF_LOOP_ARROW_LAYER } from "./self-loops.js";
+import { emitSelfLoops, emitSelfLoopArrows, emitSelfLoopHalfArrows, updateSelfLoops, selfLoopOfEdge, selfLoopSelected, selfLoopLayers, selfLoopSubset, keptLeafLoops, makeKeptLoopsScratch, SELF_LOOP_LAYER, SELF_LOOP_ARROW_LAYER, type SelfLoopCache } from "./self-loops.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue, resolveNodeBorder, darkenedCss } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
@@ -19,7 +19,7 @@ import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList
 import type { StateNetworkGraph } from "./state-graph.js";
 import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type LayoutContinuation, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
-import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
+import { buildLeafIncidence, keptByLastGather, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import { incidenceSourceEdges } from "./spatial-rows.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
@@ -1173,6 +1173,11 @@ export class Network extends BaseEngine {
   private cutFrontier: Uint32Array = new Uint32Array(0);
   /** Whether a spatial tree's gather (lazy or from rows) has run (so {@link superEdgeStats} reports it). */
   private lazyGathered = false;
+  /** Which gather stamped the last frame's kept leaves (#505: the loops on kept leaves test that stamp), if any. */
+  private leafKeptBy: "lazy" | "csr" | null = null;
+  /** Reusable state for an LOD frame's loops (#505), and the loops the last frame drew (for its picks). */
+  private readonly keptLoops = makeKeptLoopsScratch();
+  private lodLoopsDrawn: SelfLoopCache | null = null;
   /** Version of the leaf style a worker tree aggregates (#343) and computes its crowding with (#426), bumped
    *  per resolved style and per explicit `expandPx`. */
   private lodStyleVersion = 0;
@@ -4986,6 +4991,7 @@ export class Network extends BaseEngine {
       gathered = superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
     }
     this.leafLinksDrawn = leaves ? this.listLeafLinks(leaves, frontier, listed) : 0;
+    this.leafKeptBy = !leaves ? null : listed ? "lazy" : "csr";
     if (!leaves || !combine) return gathered;
     return withLeafLinks(tree, leaves, this.leafLinksDrawn, this.noLodCache(leaves, style), gathered, this.fadeAlpha ?? undefined, this.leafLinksScratch);
   }
@@ -5029,6 +5035,34 @@ export class Network extends BaseEngine {
     const built = buildLeafIncidence(graph, directed);
     this.leafIncidence = built;
     return built;
+  }
+
+  /**
+   * The self-link loops of this cut's kept leaves (#505), as their own {@link SelfLoopCache} (the full-detail
+   * cache's style, this frame's centres and ends); null for a graph without self-links. Call after
+   * {@link frontierSuperEdges}, whose gather stamped the kept leaves. O(min(S, frontier)) to list them, then
+   * O(m + Σ degree of their nodes) for the m drawn; a frame that changes none of their values uploads nothing.
+   */
+  private lodLoopSubsetFor(tree: LODTree, graph: NetworkGraph, style: ResolvedNetworkStyle, frontier: Uint32Array, linkSelected: Uint8Array | undefined): SelfLoopCache | null {
+    const c = this.noLodCache(graph, style).loops;
+    if (!c) return (this.lodLoopsDrawn = null);
+    const n = graph.nodeCount;
+    const lazy = this.lazyScratch;
+    const csr = this.leafLinksScratch;
+    const gen = csr.gen;
+    const isKept = this.leafKeptBy === "lazy" ? (v: number) => keptByLastGather(lazy, v) : this.leafKeptBy === "csr" ? (v: number) => csr.kept[v] === gen : null;
+    const m = keptLeafLoops(c.loops, n, frontier, isKept, this.keptLoops);
+    const frame = { cx: tree.cx, cy: tree.cy, fade: this.fadeAlpha, linkSelected, nodeOffsets: style.nodeOffsets };
+    return (this.lodLoopsDrawn = selfLoopSubset(c, graph, m, frame, this.lodColumns, this.keptLoops));
+  }
+
+  /** The hit for loop `j` of the last LOD frame (#505): its node's first self-link, with the summed weight. */
+  private lodLoopHit(j: number): HoverHit | null {
+    const loops = this.lodLoopsDrawn?.loops;
+    if (!loops || j < 0 || j >= loops.count) return null;
+    const node = loops.nodes[j] ?? 0;
+    const datum: NetworkLinkHit = { source: node, target: node, aggregate: false, weight: loops.weights[j] ?? 0 };
+    return { layer: this.LINK_LAYER, id: loops.edges[j] ?? 0, datum };
   }
 
   /**
@@ -5208,12 +5242,17 @@ export class Network extends BaseEngine {
       if (lines) layers.push({ name: "links", primitive: "lines", pickable: pick, pickBase: leafBase, lines, sizeMode: style.sizeMode });
       if (leaf?.arrows) layers.push(leaf.arrows);
       if (arrows) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, pickBase: leafBase, arrows, sizeMode: style.sizeMode });
+      // #505: the self-link loops of the kept leaves (none for a graph without self-links; aggregates draw none),
+      // above the links, picked past the gathered links (instance j = the frame's loop j).
+      const loopBase = leafBase + ids.length;
+      const loops = leafGraph ? this.lodLoopSubsetFor(tree, leafGraph, style, frontier, isSel ? this.leafLinkSelected?.flags : undefined) : null;
+      if (loops) layers.push(...selfLoopLayers(loops, pick, loopBase));
       // Link picking (#141): instance i (gl_InstanceID) of every emitted link layer is super-edge i, so
       // one resolve maps the decoded id → its directed tree-node pair (ids[i]) + summed flow (flows[i]).
       // A leaf link's id is its edge (below `leafBase`): the same hit LOD off returns for it (#447).
       if (this.pickLinksEnabled) {
         this.linkResolve = leafGraph
-          ? (i) => (i < leafBase ? this.noLodLinkHit(leafGraph, i) : this.lodLinkHit(tree, ids, flows, i - leafBase))
+          ? (i) => (i < leafBase ? this.noLodLinkHit(leafGraph, i) : i < loopBase ? this.lodLinkHit(tree, ids, flows, i - leafBase) : this.lodLoopHit(i - loopBase))
           : (i) => this.lodLinkHit(tree, ids, flows, i);
       }
     }
@@ -5600,7 +5639,7 @@ export class Network extends BaseEngine {
     // Per-edge link colour (encodes weight/flow); the arrowhead shares it.
     // A self-link's loop (#505) is drawn with the summed weight of its node's self-links (its drawable is keyed
     // by the first one); the `s === t` test keeps graphs without self-links on the plain lookup.
-    const loops = drawLinks && !style.nodeOffsets ? (this.noLodCache(graph, style).loops ?? null) : null;
+    const loops = drawLinks ? (this.noLodCache(graph, style).loops ?? null) : null;
     const linkColorAt = (e: number): string => {
       if (loops && graph.source[e] === graph.target[e]) {
         const j = selfLoopOfEdge(loops.loops, e);
@@ -5637,7 +5676,8 @@ export class Network extends BaseEngine {
         else emitLinks(g, drawn, style.linkWidthOf, style.linkBend);
         // The self-link loops (#505), over the no-LOD cache's columns, which the WebGL lane's emit also writes.
         if (loops) {
-          updateSelfLoops(graph, loops);
+          // `drawn`: in the both view's screen mode each state node's offset is baked into it (#509), as for its links.
+          updateSelfLoops(drawn, loops);
           if (halfArrow) emitSelfLoopHalfArrows(g, loops, bake);
           else emitSelfLoops(g, loops);
         }
@@ -5655,7 +5695,7 @@ export class Network extends BaseEngine {
           emitArrows(g, drawn, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
           if (loops) {
             // #505: refreshed here too (O(S)), so an arrows-only re-bake never reads another frame's loop ends.
-            updateSelfLoops(graph, loops);
+            updateSelfLoops(drawn, loops);
             emitSelfLoopArrows(g, loops, style.arrowSize, arrowBake);
           }
         }
@@ -5785,6 +5825,16 @@ export class Network extends BaseEngine {
     // same trick the full-graph path uses; lines need no bake (world endpoints + per-line px width).
     const seBake = screen ? this.transform.k || 1 : 1;
     const isHalf = !!se.halfArrows;
+    // #505: the self-link loops of the kept leaves, after the frame's links, keyed past every pair id by their
+    // node's first self-link, as a leaf link is by its edge (none for a graph without self-links).
+    const seCount = seIds.length;
+    const leafLoops = leafEdges && graph && graph.nodeCount === tree.leafCount ? this.lodLoopSubsetFor(tree, graph, style, frontier, undefined) : null;
+    const drawLoops = leafLoops !== null && leafLoops.halfArrow === isHalf;
+    if (leafLoops && drawLoops) {
+      const past = tree.size * tree.size;
+      for (let i = 0; i < leafLoops.loops.count; i++) seIds.push(past + (leafLoops.loops.edges[i] ?? 0));
+    }
+    const loopCss = (i: number): string => (leafLoops ? rgbaCss(leafLoops.colors, i - seCount) : "");
     this.registerLayer({
       name: "links",
       data: seIds,
@@ -5792,11 +5842,16 @@ export class Network extends BaseEngine {
       // A half-arrow is one filled shape (baked to world in screen mode); a line keeps the sizeMode.
       sizeMode: isHalf ? "world" : style.sizeMode,
       ...(isHalf
-        ? { fill: (_d, i) => (se.halfArrows ? rgbaCss(se.halfArrows.colors, i) : "") }
-        : { stroke: (_d, i) => (se.lines ? rgbaCss(se.lines.colors, i) : "") }),
+        ? { fill: (_d, i) => (i >= seCount ? loopCss(i) : se.halfArrows ? rgbaCss(se.halfArrows.colors, i) : "") }
+        : { stroke: (_d, i) => (i >= seCount ? loopCss(i) : se.lines ? rgbaCss(se.lines.colors, i) : "") }),
       build: (g) => {
         if (se.halfArrows) traceSuperHalfArrows(g, se.halfArrows, seIds, seBake);
         else if (se.lines) traceSuperLines(g, se.lines, seIds);
+        if (leafLoops && drawLoops) {
+          const past = tree.size * tree.size;
+          if (isHalf) emitSelfLoopHalfArrows(g, leafLoops, seBake, past);
+          else emitSelfLoops(g, leafLoops, past);
+        }
       },
     });
     // Line-style directed arrowheads (the half-arrow's head is fused into its own filled shape, so this
@@ -5807,9 +5862,10 @@ export class Network extends BaseEngine {
       data: seIds,
       ids: seIds,
       sizeMode: arrowBake !== 1 ? "world" : style.sizeMode,
-      fill: (_d, i) => (se.arrows ? rgbaCss(se.arrows.colors, i) : ""),
+      fill: (_d, i) => (i >= seCount ? loopCss(i) : se.arrows ? rgbaCss(se.arrows.colors, i) : ""),
       build: (g) => {
         if (se.arrows) traceSuperArrows(g, se.arrows, seIds, arrowBake);
+        if (leafLoops && drawLoops && leafLoops.arrowheads) emitSelfLoopArrows(g, leafLoops, style.arrowSize, arrowBake, tree.size * tree.size);
       },
     });
 
