@@ -2,12 +2,13 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { network, type Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
 import { buildGraph } from "../graph.js";
+import type { NodeRadiusSpec } from "../glyphs.js";
 import { physicalPieWedges } from "../pie.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedHighlight, InstancedLayer } from "../../core/backend.js";
 import type { HoverHit } from "../../map/base-engine.js";
-import { decodeImage } from "../../map/__tests__/backend-equivalence-harness.js";
+import { decodeImage, diffExports } from "../../map/__tests__/backend-equivalence-harness.js";
 
 /**
  * State-network correctness across its three views (#494): optional modules, the app's module colours,
@@ -127,8 +128,17 @@ function containerPoint(net: Network, g: ReturnType<typeof fixture>["graph"], p:
   const containers = circlesOf(net.toSVG()).filter((c) => c.stroked);
   const own = containers.find((c) => Math.abs(c.cx - cx) < 0.01 && Math.abs(c.cy - cy) < 0.01);
   expect(own, `no container drawn at physical ${p}`).toBeDefined();
-  // The exported ring's centreline radius r·(1 − b/2): 85% of it is inside the disc, past every dot.
-  return [cx, cy - 0.85 * (own?.r ?? 0)];
+  // The exported ring's centreline radius r·(1 − b/2): 85% of it is inside the disc. The state nodes are packed
+  // around their enclosing circle's centre (#509), so look around that rim for a point clear of every state node
+  // and its highlight ring.
+  const dots = circlesOf(net.toSVG()).filter((c) => !c.stroked);
+  const rim = 0.85 * (own?.r ?? 0);
+  for (let a = 0; a < 32; a++) {
+    const t = -Math.PI / 2 + (a / 32) * 2 * Math.PI;
+    const x = cx + rim * Math.cos(t), y = cy + rim * Math.sin(t);
+    if (dots.every((d) => Math.hypot(x - d.cx, y - d.cy) > 1.5 * d.r + 1)) return [x, y];
+  }
+  return [cx, cy - rim];
 }
 
 function laneSpy() {
@@ -198,17 +208,20 @@ describe("the both view (#494, 2-3)", () => {
     const containers = circles.filter((c) => c.stroked);
     const dots = circles.filter((c) => !c.stroked);
     expect(dots.length).toBe(S);
-    for (let s = 0; s < S; s++) {
-      const p = graph.stateToPhysical[s]!;
-      const [x, y] = statePos(net, s);
-      const dot = dots.find((c) => Math.abs(c.cx - x) < 0.01 && Math.abs(c.cy - y) < 0.01);
-      const box = containers.find((c) => Math.abs(c.cx - POS[2 * p]!) < 0.01 && Math.abs(c.cy - POS[2 * p + 1]!) < 0.01);
-      expect(dot && box, `state ${s} or its container is not drawn`).toBeTruthy();
-      if (!dot || !box) continue;
-      const k = graph.physicalToState.offsets[p + 1]! - graph.physicalToState.offsets[p]!;
+    // In screen mode a state node is drawn at its physical node plus a px offset (#509), so each physical node's
+    // state nodes are found where they are drawn: the dots whose centre lies in its container.
+    for (let p = 0; p < graph.physicalCount; p++) {
+      const box = containers.find((c) => Math.abs(c.cx - (POS[2 * p] ?? 0)) < 0.01 && Math.abs(c.cy - (POS[2 * p + 1] ?? 0)) < 0.01);
+      expect(box, `physical ${p}'s container is not drawn`).toBeDefined();
+      if (!box) continue;
+      const k = (graph.physicalToState.offsets[p + 1] ?? 0) - (graph.physicalToState.offsets[p] ?? 0);
       const R = box.outer;
-      expect(Math.hypot(x - box.cx, y - box.cy) + dot.r, `state ${s} pokes out of its container`).toBeLessThanOrEqual(R + 1e-3);
-      expect(dot.r, `state ${s}'s dot is too small to see`).toBeGreaterThanOrEqual((0.2 * R) / Math.sqrt(k));
+      const inner = dots.filter((c) => Math.hypot(c.cx - box.cx, c.cy - box.cy) < R);
+      expect(inner.length, `physical ${p} does not draw its ${k} state nodes`).toBe(k);
+      for (const dot of inner) {
+        expect(Math.hypot(dot.cx - box.cx, dot.cy - box.cy) + dot.r, `a state node pokes out of physical ${p}`).toBeLessThanOrEqual(R + 1e-3);
+        expect(dot.r, `a state node of physical ${p} is too small to see`).toBeGreaterThanOrEqual((0.2 * R) / Math.sqrt(k));
+      }
     }
     net.destroy();
   });
@@ -345,16 +358,12 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     ev("pointerup", x + 20, y + 12);
     expect(graph.physical.positions[2]! - p0[0]!).toBeCloseTo(20, 3);
     expect(graph.physical.positions[3]! - p0[1]!).toBeCloseTo(12, 3);
-    // Each state dot keeps its place in its container (#495): the same direction from the container's centre, at
-    // the same share of its radius — the container may have re-sized as the layout's scale moved a step.
+    // Each state node keeps its offset from its physical node (#495, #509: the packing does not follow the layout).
     for (const [k, s] of [2, 4].entries()) {
       const [sx, sy] = statePos(net, s);
       const before = [s0[k]![0] - p0[0]!, s0[k]![1] - p0[1]!];
       const after = [sx - graph.physical.positions[2]!, sy - graph.physical.positions[3]!];
-      const f = Math.hypot(after[0]!, after[1]!) / Math.hypot(before[0]!, before[1]!);
-      expect(f, `state ${s} did not follow its container`).toBeGreaterThan(0.8);
-      expect(f).toBeLessThan(1.25);
-      expect(Math.abs(after[0]! * before[1]! - after[1]! * before[0]!) / Math.hypot(before[0]!, before[1]!) ** 2, "it turned").toBeLessThan(1e-3);
+      expect(Math.hypot(after[0]! - before[0]!, after[1]! - before[1]!), `state ${s} did not follow its physical node`).toBeLessThan(1e-3);
     }
     expect(statePos(net, 3), "another physical node's state moved").toEqual(other);
     // The container is drawn where its physical node went.
@@ -548,7 +557,7 @@ describe("hits and labels name their level in state mode (#494)", () => {
 
     hoverAt(5, 195); // empty space: ends the hover
     net.view("state");
-    const [x, y] = statePos(graph, 3);
+    const [x, y] = statePos(net, 3);
     infos.length = 0;
     hoverAt(x, y); // state node 3
     const state = infos.filter((i) => i.id === 3);
@@ -570,23 +579,21 @@ const isLink = (c: readonly number[]): boolean => (c[1] ?? 0) > 120 && (c[0] ?? 
 /** A view at zoom `k` that keeps world point (100, 100), the link's middle, at the canvas centre. */
 const centred = (k: number) => ({ k, x: W / 2 - 100 * k, y: H / 2 - 100 * k });
 
-describe("the both view draws its links in the app's sizeMode (#494 review, 1)", () => {
+describe("the both view draws its links in the app's sizeMode (#494 review, 1; #509)", () => {
   for (const linkStyle of ["line", "half-arrow"] as const) {
-    it(`${linkStyle}: px-wide links and a tip on the dot's boundary at two zoom levels (sizeMode "screen")`, async () => {
+    it(`${linkStyle}: px-wide links and a tip on the px-sized state node's boundary at two zoom levels (sizeMode "screen")`, async () => {
       const { graph, positions } = pairFixture();
       const net = await engine(host());
       // Transparent dots, so the tip the dot would cover stays visible.
       net
-        .style({ sizeMode: "screen", linkStyle, linkWidth: 6, arrowSize: 6, linkStroke: `rgb(${LINK_RGB.join(",")})`, directed: true, nodeFill: "rgba(0,0,0,0)" })
+        .style({ sizeMode: "screen", nodeRadius: 8, linkStyle, linkWidth: 6, arrowSize: 6, linkStroke: `rgb(${LINK_RGB.join(",")})`, directed: true, nodeFill: "rgba(0,0,0,0)" })
         .stateNetwork(graph, { view: "both" });
       net.layout({ backend: "positions", positions });
-      // The target dot's world radius, from the export (the both view's dots are world-sized).
+      // The target state node: alone in its physical node, so at its centre, and 8 px in radius at every zoom (#509).
       const [tx, ty] = statePos(net, 1);
-      const dot = circlesOf(net.toSVG()).find((c) => !c.stroked && Math.abs(c.cx - tx) < 0.01 && Math.abs(c.cy - ty) < 0.01);
-      expect(dot, "no state dot drawn at the link's target").toBeDefined();
-      const r = dot?.r ?? 0;
-      expect(r, "the dot is too small for the setback to tell the units apart").toBeGreaterThan(3);
-      for (const k of [0.5, 2]) {
+      const r = 8;
+      // k = 1.5, not 2: the 8 px tip of the target at world x = 160 must stay on the 200 px canvas.
+      for (const k of [0.5, 1.5]) {
         const t = centred(k);
         net.setTransform(t);
         const img = await frame(net);
@@ -596,14 +603,14 @@ describe("the both view draws its links in the app's sizeMode (#494 review, 1)",
           for (let y = 0; y < H; y++) if (isLink(rgbaAt(img, W / 2, y))) rows++;
           expect(Math.abs(rows - 6), `k=${k}: link drawn ${rows} px wide, the app asked for 6 px`).toBeLessThanOrEqual(1.5);
         }
-        // Tip: the rightmost link pixel on the target's row sits on the dot's boundary, r·k px short of its centre.
+        // Tip: the rightmost link pixel on the target's row sits on the state node's boundary, r px short of its centre.
         const cx = tx * k + t.x;
         const cy = Math.round(ty * k + t.y);
         // The tip is a sharp point (a line also runs on to the transparent dot's centre), so it is read off the
         // head's slanted edge, clear of the line's band: on a row d px off the centre line the edge is at
         // tip − slope·d (a line's head: 2·size long, ±size wide; a half-arrow's: tipLength long, width + 2√width
         // wide), so each such row estimates the tip; their median is the drawn tip.
-        const head = linkStyle === "line" ? { slope: 2, rows: [4, 5] } : { slope: Math.min((120 * k - 2 * r * k) / 3, 10 * Math.cbrt(6)) / (6 + 2 * Math.sqrt(6)), rows: [6, 7, 8] };
+        const head = linkStyle === "line" ? { slope: 2, rows: [4, 5] } : { slope: Math.min((120 * k - 2 * r) / 3, 10 * Math.cbrt(6)) / (6 + 2 * Math.sqrt(6)), rows: [6, 7, 8] };
         const estimates: number[] = [];
         for (const d of head.rows) {
           for (const y of [cy - d, cy + d]) {
@@ -614,43 +621,221 @@ describe("the both view draws its links in the app's sizeMode (#494 review, 1)",
         }
         estimates.sort((a, b) => a - b);
         const tip = estimates[Math.floor(estimates.length / 2)] ?? NaN;
-        // Within 2 px (anti-aliasing reads the edge a little short); a setback in the wrong units is off by r·|k − 1| ≥ 3 px.
-        expect(Math.abs(tip - (cx - r * k)), `k=${k}: tip at ${tip.toFixed(1)} (${estimates.map((e) => e.toFixed(1)).join(" ")}), the boundary at ${(cx - r * k).toFixed(1)}`).toBeLessThanOrEqual(2);
+        // Within 2 px (anti-aliasing reads the edge a little short); a setback in the wrong units is off by r·|k − 1| ≥ 4 px.
+        expect(Math.abs(tip - (cx - r)), `k=${k}: tip at ${tip.toFixed(1)} (${estimates.map((e) => e.toFixed(1)).join(" ")}), the boundary at ${(cx - r).toFixed(1)}`).toBeLessThanOrEqual(2);
       }
       net.destroy();
     });
   }
+});
 
-  it("the vector twins agree: px-sized heads set back by the world radius at any zoom (WebGL export, SVG scene)", async () => {
-    const { graph, positions } = pairFixture();
-    /** Each path's first two points: an arrowhead's tip, then a base corner (2·size back, size aside: size·√5 away). */
-    const headsOf = (svg: string): { tip: number; side: number }[] =>
-      [...svg.matchAll(/<path d="M\s*([-\d.e]+)[ ,]\s*([-\d.e]+)\s*L\s*([-\d.e]+)[ ,]\s*([-\d.e]+)/g)]
-        .map((m) => ({ tip: Number(m[1]), side: Math.hypot(Number(m[3]) - Number(m[1]), Number(m[4]) - Number(m[2])) }))
-        .filter((h) => Number.isFinite(h.tip));
-    const tips: Record<string, number[]> = {};
-    for (const backend of ["webgl", "svg"] as const) {
-      const net = network(host(), { width: W, height: H, backend });
-      await net.whenReady();
-      net.style({ sizeMode: "screen", linkStyle: "line", linkWidth: 6, arrowSize: 6, directed: true }).stateNetwork(graph, { view: "both" });
-      net.layout({ backend: "positions", positions });
-      const [tx, ty] = statePos(net, 1);
-      const r = circlesOf(net.toSVG()).find((c) => !c.stroked && Math.abs(c.cx - tx) < 0.01 && Math.abs(c.cy - ty) < 0.01)?.r ?? NaN;
-      expect(r, `${backend}: the target dot`).toBeGreaterThan(0);
-      for (const k of [0.5, 2]) {
-        net.setTransform(centred(k));
-        net.syncScreenGeometry(); // re-bakes the vector path's screen-mode arrows at k
-        const svg = net.toSVG();
-        // An arrowhead's path starts at its tip: in world units r short of the target, whatever k.
-        const head = headsOf(svg).find((h) => Math.abs(h.tip - (tx - r)) < 0.5);
-        expect(head, `${backend} k=${k}: no arrow tip at the dot's boundary (${(tx - r).toFixed(2)})`).toBeDefined();
-        // The head is 6 px in size whatever the zoom: 6·√5 / k world units from the tip to a base corner.
-        expect(head?.side ?? NaN, `${backend} k=${k}: the head is not px-sized`).toBeCloseTo((6 * Math.sqrt(5)) / k, 1);
-        (tips[backend] ??= []).push(head?.tip ?? NaN);
-      }
-      net.destroy();
+// ── #509: the both view on every backend, state nodes offset inside their physical nodes ─────────────────────
+
+/** Three physical nodes holding 1, 3 and 2 state nodes; three directed links, two of them between state nodes
+ *  drawn off their physical node's centre. Each state node has its own colour, so an export names it. */
+function offsetFixture() {
+  const graph = buildStateGraph({
+    stateCount: 6,
+    stateToPhysical: [0, 1, 1, 1, 2, 2],
+    source: [0, 4, 2],
+    target: [1, 3, 5],
+    nodeFlow: [1, 1, 1, 1, 1, 1],
+    directed: true,
+  });
+  return { graph, positions: new Float32Array([70, 115, 130, 115, 100, 72]) };
+}
+const STATE_RGB: [number, number, number][] = [[255, 0, 0], [0, 200, 0], [0, 0, 255], [255, 0, 255], [0, 200, 200], [200, 200, 0]];
+const BOTH_RADIUS = 5;
+/** The physical view's radius of each physical node: world mode draws the physical nodes at it and scales their state
+ *  nodes to fit (D5). */
+const PHYSICAL_RADIUS = 18;
+const OFFSET_SIZES: NodeRadiusSpec = (_value, _index, g) => (g.nodeCount === 3 ? PHYSICAL_RADIUS : BOTH_RADIUS);
+const ARROW = 4;
+
+interface PxCircle { x: number; y: number; r: number; outer: number; stroked: boolean; rgb: number[] }
+interface ExportGeometry { states: (PxCircle | undefined)[]; containers: PxCircle[]; starts: [number, number][]; texts: { text: string; x: number; y: number }[] }
+/** An export's geometry in canvas px, whatever group transform each element sits under: each state node's circle
+ *  (by its colour), the stroked physical node circles, every path's first point, and every label. */
+function exportGeometry(svg: string): ExportGeometry {
+  const holder = document.createElement("div");
+  holder.innerHTML = svg;
+  document.body.appendChild(holder);
+  const root = holder.querySelector("svg");
+  const toPx = (el: SVGGraphicsElement, x: number, y: number): [number, number] => {
+    const m = el.getCTM();
+    return m ? [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f] : [NaN, NaN];
+  };
+  const out: ExportGeometry = { states: [], containers: [], starts: [], texts: [] };
+  for (const c of root?.querySelectorAll("circle") ?? []) {
+    const num = (name: string): number => Number(c.getAttribute(name) ?? NaN);
+    const [x, y] = toPx(c, num("cx"), num("cy"));
+    const scale = c.getCTM()?.a ?? NaN;
+    const sw = Number(c.getAttribute("stroke-width") ?? 0);
+    const rgb = (/(\d+),\s*(\d+),\s*(\d+)/.exec(c.getAttribute("fill") ?? "") ?? []).slice(1, 4).map(Number);
+    const circle = { x, y, r: num("r") * scale, outer: (num("r") + (sw > 0 ? sw / 2 : 0)) * scale, stroked: sw > 0, rgb };
+    if (circle.stroked) out.containers.push(circle);
+    else {
+      const s = STATE_RGB.findIndex((c) => near(c, rgb, 0));
+      if (s >= 0) out.states[s] = circle;
     }
-    expect(tips["webgl"]).toEqual(tips["svg"]?.map((x) => expect.closeTo(x, 2)));
+  }
+  for (const p of root?.querySelectorAll("path") ?? []) {
+    const m = /^M\s*([-\d.e]+)[ ,]\s*([-\d.e]+)/.exec(p.getAttribute("d") ?? "");
+    if (m) out.starts.push(toPx(p, Number(m[1]), Number(m[2])));
+  }
+  for (const t of root?.querySelectorAll("text") ?? []) {
+    const [x, y] = toPx(t, Number(t.getAttribute("x")), Number(t.getAttribute("y")));
+    out.texts.push({ text: t.textContent ?? "", x, y });
+  }
+  holder.remove();
+  return out;
+}
+
+async function offsetNet(backend: "webgl" | "canvas" | "svg", sizeMode: "world" | "screen"): Promise<{ net: Network; graph: ReturnType<typeof offsetFixture>["graph"]; physical: Float32Array }> {
+  const { graph, positions } = offsetFixture();
+  const net = network(host(), { width: W, height: H, backend });
+  await net.whenReady();
+  net
+    .style({
+      sizeMode,
+      nodeRadius: OFFSET_SIZES,
+      linkStyle: "line",
+      linkWidth: 1,
+      arrowSize: ARROW,
+      directed: true,
+      linkStroke: "#444444",
+      nodeFill: (i) => `rgb(${(STATE_RGB[i] ?? [0, 0, 0]).join(",")})`,
+    })
+    .stateNetwork(graph, { view: "both" });
+  net.layout({ backend: "positions", positions });
+  return { net, graph, physical: positions };
+}
+
+describe("the both view draws the same on WebGL, Canvas and SVG, state nodes offset in their physical nodes (#509)", () => {
+  for (const sizeMode of ["world", "screen"] as const) {
+    it(`sizeMode "${sizeMode}": the vector twins agree with WebGL at two zooms; px or world radii, and the arrow tips on the offset state nodes' rims`, async () => {
+      const exports: Record<string, string[]> = {};
+      const centres: Record<string, number[]> = {};
+      const offsets: number[][] = [];
+      for (const backend of ["webgl", "canvas", "svg"] as const) {
+        const { net, graph, physical } = await offsetNet(backend, sizeMode);
+        for (const k of [0.5, 2]) {
+          const t = centred(k);
+          net.setTransform(t);
+          net.syncScreenGeometry(); // the documented pre-export step: re-bakes the Canvas/SVG screen geometry at k
+          const svg = net.toSVG();
+          (exports[backend] ??= []).push(svg);
+          const geo = exportGeometry(svg);
+          const at = `${backend} k=${k}`;
+          // Screen mode: each state node at the state view's radius in px. World mode (D5): each physical node at the
+          // physical view's radius × k, its state nodes scaled to fit, all by one factor (the state view's radii are equal).
+          const rPx = sizeMode === "screen" ? BOTH_RADIUS : NaN;
+          const scaled: number[] = [];
+          for (let s = 0; s < graph.state.nodeCount; s++) {
+            const c = geo.states[s];
+            expect(c, `${at}: state node ${s} is not drawn`).toBeDefined();
+            if (!c) continue;
+            // Inside its physical node: the stroked circle centred on the physical node's projection.
+            const p = graph.stateToPhysical[s] ?? -1;
+            const px = (physical[2 * p] ?? NaN) * k + t.x, py = (physical[2 * p + 1] ?? NaN) * k + t.y;
+            const own = geo.containers.find((d) => Math.hypot(d.x - px, d.y - py) < 0.01);
+            expect(own, `${at}: physical node ${p} is not drawn`).toBeDefined();
+            if (sizeMode === "screen") expect(c.r, `${at}: state node ${s}'s radius`).toBeCloseTo(rPx, 2);
+            else {
+              expect(own?.outer ?? NaN, `${at}: physical node ${p} is not at the physical view's radius`).toBeCloseTo(PHYSICAL_RADIUS * k, 0);
+              expect(c.r, `${at}: state node ${s} is not drawn`).toBeGreaterThan(0);
+              if (scaled[p] === undefined) scaled[p] = c.r;
+              else expect(c.r, `${at}: state node ${s} breaks the state view's ratios in physical node ${p}`).toBeCloseTo(scaled[p] ?? NaN, 2);
+              for (let o = 0; o < s; o++) {
+                const d = geo.states[o];
+                if (d && graph.stateToPhysical[o] === p) expect(Math.hypot(c.x - d.x, c.y - d.y), `${at}: state nodes ${o} and ${s} overlap`).toBeGreaterThanOrEqual(c.r + d.r - 0.01);
+              }
+            }
+            expect(Math.hypot(c.x - px, c.y - py) + c.r, `${at}: state node ${s} leaves physical node ${p}`).toBeLessThanOrEqual((own?.outer ?? 0) + 0.01);
+            (centres[backend] ??= []).push(c.x, c.y);
+            if (backend === "webgl") (offsets[s] ??= []).push(Math.hypot(c.x - px, c.y - py));
+          }
+          // Each link starts at its source's drawn centre, and its arrowhead's tip is on the target's rim, along the link.
+          for (let e = 0; e < graph.state.edgeCount; e++) {
+            const a = geo.states[graph.state.source[e] ?? -1], b = geo.states[graph.state.target[e] ?? -1];
+            if (!a || !b) continue;
+            const len = Math.hypot(b.x - a.x, b.y - a.y);
+            const tip: [number, number] = [b.x - ((b.x - a.x) / len) * b.r, b.y - ((b.y - a.y) / len) * b.r];
+            const startsAt = ([x, y]: [number, number]): boolean => geo.starts.some(([sx, sy]) => Math.hypot(sx - x, sy - y) < 0.05);
+            expect(startsAt([a.x, a.y]), `${at}: link ${e} does not start at its source state node`).toBe(true);
+            expect(startsAt(tip), `${at}: arrow ${e}'s tip is not on the target's rim at (${tip[0].toFixed(2)}, ${tip[1].toFixed(2)})`).toBe(true);
+          }
+          // The live render (Canvas, WebGL): each state node's colour at its drawn centre.
+          if (backend !== "svg") {
+            const img = await frame(net);
+            for (let s = 0; s < graph.state.nodeCount; s++) {
+              const c = geo.states[s];
+              if (c) expect(near(rgbaAt(img, c.x, c.y), [...(STATE_RGB[s] ?? []), 255], 8), `${at}: state node ${s} is not rendered at its drawn centre`).toBe(true);
+            }
+          }
+        }
+        net.destroy();
+      }
+      // The state nodes really are offset: px-constant in screen mode, scaling with the zoom in world mode.
+      const moved = offsets.filter((o) => (o[0] ?? 0) > 1);
+      expect(moved.length, "no state node is drawn off its physical node's centre").toBeGreaterThanOrEqual(4);
+      for (const [lo, hi] of moved) expect(hi ?? NaN).toBeCloseTo((lo ?? NaN) * (sizeMode === "screen" ? 1 : 4), 2);
+      // The same places on every backend, and the same exported pixels.
+      for (const backend of ["canvas", "svg"]) {
+        expect(centres[backend], `${backend}: state node centres`).toEqual(centres["webgl"]?.map((v) => expect.closeTo(v, 2)));
+        for (let i = 0; i < 2; i++) {
+          const d = await diffExports(exports["webgl"]?.[i] ?? "", exports[backend]?.[i] ?? "", W, H, { radius: 1 });
+          expect(d.considered).toBeGreaterThan(300);
+          expect(d.fraction, `${backend} vs webgl export, zoom ${i}`).toBeLessThan(0.005);
+        }
+      }
+    });
+  }
+
+  it("labels the state nodes where they are drawn and the physical nodes just outside their discs, on every backend", async () => {
+    const GAP = 4;
+    for (const sizeMode of ["world", "screen"] as const) {
+      for (const backend of ["webgl", "canvas", "svg"] as const) {
+        const { net, graph, physical } = await offsetNet(backend, sizeMode);
+        let offCentre = 0;
+        // The state node labels and the physical node labels apart, so neither culls the other where they collide.
+        for (const [k, which] of [[0.5, "state"], [2, "state"], [0.5, "physical"], [2, "physical"]] as const) {
+          if (which === "state") net.labels({ labelOf: (s) => `s${s}` });
+          else net.labels({ labelOf: () => null, physical: { labelOf: (p) => `p${p}`, gap: GAP } });
+          const t = centred(k);
+          net.setTransform(t);
+          net.syncScreenGeometry();
+          const geo = exportGeometry(net.toSVG());
+          const at = `${sizeMode} ${backend} k=${k} ${which}`;
+          let states = 0, physicals = 0;
+          for (const label of geo.texts) {
+            const s = /^s(\d+)$/.exec(label.text), p = /^p(\d+)$/.exec(label.text);
+            if (s) {
+              const c = geo.states[Number(s[1])];
+              expect(Math.hypot(label.x - (c?.x ?? NaN), label.y - (c?.y ?? NaN)), `${at}: ${label.text} is off its state node`).toBeLessThan(0.01);
+              states++;
+              // A label on a state node drawn away from its physical node's centre: the case the offsets move.
+              const q = graph.stateToPhysical[Number(s[1])] ?? -1;
+              if (Math.hypot((c?.x ?? 0) - ((physical[2 * q] ?? NaN) * k + t.x), (c?.y ?? 0) - ((physical[2 * q + 1] ?? NaN) * k + t.y)) > 1) offCentre++;
+            } else if (p) {
+              // Upper right of the disc (≈1:30), its radius in px plus the gap from the physical node's centre.
+              const i = Number(p[1]);
+              const px = (physical[2 * i] ?? NaN) * k + t.x, py = (physical[2 * i + 1] ?? NaN) * k + t.y;
+              const disc = geo.containers.find((d) => Math.hypot(d.x - px, d.y - py) < 0.01);
+              const dist = (disc?.outer ?? NaN) + GAP;
+              expect(label.x - px, `${at}: ${label.text} x`).toBeCloseTo(Math.SQRT1_2 * dist, 1);
+              expect(label.y - py, `${at}: ${label.text} y`).toBeCloseTo(-Math.SQRT1_2 * dist, 1);
+              physicals++;
+            }
+          }
+          // The collision culling thins the state node labels (11 px text on 5 px state nodes), never to none.
+          if (which === "state") expect(states, `${at}: no state node label`).toBeGreaterThan(0);
+          else expect(physicals, `${at}: physical node labels`).toBeGreaterThanOrEqual(k < 1 ? 1 : graph.physicalCount);
+        }
+        expect(offCentre, `${sizeMode} ${backend}: no label on a state node drawn off its physical node's centre`).toBeGreaterThan(0);
+        net.destroy();
+      }
+    }
   });
 });
 

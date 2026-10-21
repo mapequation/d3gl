@@ -2,7 +2,7 @@ import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass, Texture } from "@luma.gl/core";
 import { INDEXED_LINE_VS, INDEXED_ARROW_VS, INDEXED_HALF_ARROW_VS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import { ARROW_TEMPLATE, HALF_ARROW_TEMPLATE, HALF_ARROW_SAMPLES, halfArrowTemplate, lineTemplate } from "./instanced.js";
+import { ARROW_TEMPLATE, HALF_ARROW_TEMPLATE, HALF_ARROW_SAMPLES, END_OFFSETS, halfArrowTemplate, lineTemplate, offsetLayout, zeroOffsets } from "./instanced.js";
 import type { InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
 
 /**
@@ -117,7 +117,6 @@ class IndexedLinkDraw {
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
       u_pickBase: 0,
-      u_radiusWorld: 0, // arrows / half-arrows: their data's `radiiWorld` (#494)
       u_hoverGroup: -1,
       u_hoverInstances: [0, 0],
       u_dimActive: 0,
@@ -180,8 +179,9 @@ class IndexedLinkDraw {
     return out;
   }
 
+  /** The ends take no offsets (#509): the shared shader's offset attributes read the constant zero, no buffer. */
   private makeModel(fs: string, parameters: typeof BLEND | typeof NO_BLEND): Model {
-    return new Model(this.device, {
+    const model = new Model(this.device, {
       vs: this.shape.vs,
       fs,
       bufferLayout: [
@@ -190,6 +190,7 @@ class IndexedLinkDraw {
         { name: this.shape.ends[0], format: "float32x2", stepMode: "instance" },
         { name: this.shape.ends[1], format: "float32x2", stepMode: "instance" },
         { name: "a_fade", format: "float32", stepMode: "instance" },
+        ...END_OFFSETS.map(offsetLayout),
       ],
       attributes: { [this.shape.templateName]: this.shape.template, ...this.laneBuffers() },
       bindings: this.bindings(),
@@ -199,6 +200,8 @@ class IndexedLinkDraw {
       vertexCount: this.shape.vertexCount,
       instanceCount: this.count,
     });
+    zeroOffsets(model, END_OFFSETS);
+    return model;
   }
 
   /** Draw `inst.count` edges of `inst.index`, from tables re-packed only where a source array changed. Every
@@ -490,14 +493,12 @@ export class IndexedArrows extends IndexedLinks {
     this.half = !!data.half;
     this.template = device.createBuffer({ data: this.half ? HALF_ARROW_TEMPLATE : ARROW_TEMPLATE });
     this.draw = new IndexedLinkDraw(device, { vs: INDEXED_ARROW_VS, template: this.template, templateName: "a_tri", ends: ["a_source", "a_target"], vertexCount: 3, topology: "triangle-list" }, inst, tableCount, arrowSpecs(data), width, height, pick);
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0; // #494: world setbacks on a screen layer
   }
   update(_device: Device, data: InstancedArrowsData): boolean {
     if (!data.index || !!data.half !== this.half) return false;
     const { inst, tableCount } = instancesOf(data);
     this.tableCount = tableCount;
     this.draw.update(inst, tableCount, arrowSpecs(data));
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     return true;
   }
 }
@@ -514,14 +515,12 @@ export class IndexedHalfArrows extends IndexedLinks {
     const template = halfArrowTemplate(this.samples);
     this.template = device.createBuffer({ data: template });
     this.draw = new IndexedLinkDraw(device, { vs: INDEXED_HALF_ARROW_VS, template: this.template, templateName: "a_kind", ends: ["a_p0", "a_p1"], vertexCount: template.length / 2, topology: "triangle-list" }, inst, tableCount, halfArrowSpecs(data), width, height, pick);
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0; // #494: world radii on a screen layer
   }
   update(_device: Device, data: InstancedHalfArrowsData): boolean {
     if (!data.index || Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0) !== this.samples) return false;
     const { inst, tableCount } = instancesOf(data);
     this.tableCount = tableCount;
     this.draw.update(inst, tableCount, halfArrowSpecs(data));
-    this.draw.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     return true;
   }
 }

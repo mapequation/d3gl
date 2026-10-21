@@ -88,10 +88,13 @@ function record(draw: (ctx: PathRecorder) => void, tolerance = DEFAULT_CURVE_TOL
  *
  * With {@link InstancedCirclesData.bordersPx} the entries are px widths instead (#495), turned into the fraction
  * the shader draws at the export's zoom: `pxPerUnit` is the zoom `k` for a world layer, 1 for a screen one.
+ *
+ * {@link InstancedCirclesData.offsets} (#509) move each centre by `offset · offsetScale` world units:
+ * `offsetScale` is `1 / k` for a screen layer (px offsets at the export's zoom) and 1 for a world one.
  */
-export function circlesToDrawables(c: InstancedCirclesData, pxPerUnit = 1): DrawableVector[] {
+export function circlesToDrawables(c: InstancedCirclesData, pxPerUnit = 1, offsetScale = 1): DrawableVector[] {
   const out: DrawableVector[] = [];
-  const { centers, radii, borders, borderColors } = c;
+  const { centers, radii, borders, borderColors, offsets } = c;
   for (let i = 0; i < c.count; i++) {
     const r = radii[i] ?? 0;
     const raw = borders ? (borders[i] ?? 0) : 0;
@@ -100,7 +103,7 @@ export function circlesToDrawables(c: InstancedCirclesData, pxPerUnit = 1): Draw
     const ring = b > 0 && r > 0;
     out.push(
       drawable(i, {
-        circles: [{ x: centers[i * 2] ?? 0, y: centers[i * 2 + 1] ?? 0, r: ring ? r * (1 - b / 2) : r }],
+        circles: [{ x: (centers[i * 2] ?? 0) + offsetAt(offsets, i * 2, offsetScale), y: (centers[i * 2 + 1] ?? 0) + offsetAt(offsets, i * 2 + 1, offsetScale), r: ring ? r * (1 - b / 2) : r }],
         fill: rgbaAt(c.colors, i),
         stroke: ring ? rgbaAt(borderColors, i) : NONE,
         lineWidth: ring ? r * b : 0,
@@ -108,6 +111,11 @@ export function circlesToDrawables(c: InstancedCirclesData, pxPerUnit = 1): Draw
     );
   }
   return out;
+}
+
+/** Component `j` of an optional offset column (#509), scaled to the caller's working units; 0 without a column. */
+function offsetAt(offsets: Float32Array | undefined, j: number, scale: number): number {
+  return offsets ? (offsets[j] ?? 0) * scale : 0;
 }
 
 /** Full turn — the wedge fraction → angle convention the pie fragment shader uses (CCW from +x). */
@@ -146,14 +154,17 @@ export function pieToDrawables(
 }
 
 /** Instanced lines → one stroked path per line (straight, or a quadratic bow for `bends`). World
- *  endpoints with a per-line width, so screen sizeMode needs no bake (the width alone is in px). */
-export function linesToDrawables(l: InstancedLinesData): DrawableVector[] {
+ *  endpoints with a per-line width, so screen sizeMode needs no bake (the width alone is in px). The end
+ *  offsets (#509) move each end by `offset · offsetScale` world units: `1 / k` on a screen layer, 1 on a world one
+ *  (the bend is a fraction of the chord, so the bow on the moved ends is the one the shader draws in px). */
+export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): DrawableVector[] {
   const out: DrawableVector[] = [];
+  const { sourceOffsets: so, targetOffsets: to } = l;
   for (let e = 0; e < l.count; e++) {
-    const sx = l.sources[e * 2] ?? 0;
-    const sy = l.sources[e * 2 + 1] ?? 0;
-    const tx = l.targets[e * 2] ?? 0;
-    const ty = l.targets[e * 2 + 1] ?? 0;
+    const sx = (l.sources[e * 2] ?? 0) + offsetAt(so, e * 2, offsetScale);
+    const sy = (l.sources[e * 2 + 1] ?? 0) + offsetAt(so, e * 2 + 1, offsetScale);
+    const tx = (l.targets[e * 2] ?? 0) + offsetAt(to, e * 2, offsetScale);
+    const ty = (l.targets[e * 2 + 1] ?? 0) + offsetAt(to, e * 2 + 1, offsetScale);
     const r = styleRow(l, e);
     const bend = l.bends ? (l.bends[r] ?? 0) : 0;
     out.push(
@@ -179,24 +190,25 @@ export function linesToDrawables(l: InstancedLinesData): DrawableVector[] {
  * Instanced arrowheads → one filled triangle per arrow, tip set back to the target node's boundary.
  * `bake` mirrors the Scene twin's screen-sizeMode trick: solve in pixel space (×k) and emit ÷k, so
  * the world-coordinate output reproduces the constant-pixel GPU render under the view's ×k transform.
- * World `radii` ({@link InstancedArrowsData.radiiWorld}) are scaled to px by the same `bake`, as the shader does.
+ * The end offsets (#509) are in size units, so they add unscaled in the solve space: px at `bake = k` (screen),
+ * world units at `bake = 1` (world).
  */
 export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVector[] {
   const inv = 1 / bake;
-  const radiusScale = a.radiiWorld ? bake : 1; // world setbacks in the px solve (#494)
   const half = a.half === true;
+  const { sourceOffsets: so, targetOffsets: to } = a;
   const out: DrawableVector[] = [];
   for (let e = 0; e < a.count; e++) {
-    const sx = (a.sources[e * 2] ?? 0) * bake;
-    const sy = (a.sources[e * 2 + 1] ?? 0) * bake;
-    const tx = (a.targets[e * 2] ?? 0) * bake;
-    const ty = (a.targets[e * 2 + 1] ?? 0) * bake;
+    const sx = (a.sources[e * 2] ?? 0) * bake + offsetAt(so, e * 2, 1);
+    const sy = (a.sources[e * 2 + 1] ?? 0) * bake + offsetAt(so, e * 2 + 1, 1);
+    const tx = (a.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1);
+    const ty = (a.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1);
     const r = styleRow(a, e);
     const bend = a.bends ? (a.bends[r] ?? 0) : 0;
     const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
-    const setback = (a.radii[r] ?? 0) * radiusScale;
+    const setback = a.radii[r] ?? 0;
     const size = a.sizes[r] ?? 0;
     const tipX = tx - ux * setback;
     const tipY = ty - uy * setback;
@@ -218,24 +230,24 @@ export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVec
 }
 
 /** Instanced half-arrows → one filled "map of networks" link shape per instance, via the shared
- *  {@link halfLinkGeometry} reference path. Same `bake` trick as {@link arrowsToDrawables}. */
+ *  {@link halfLinkGeometry} reference path. Same `bake` trick, and end offsets, as {@link arrowsToDrawables}. */
 export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): DrawableVector[] {
   const inv = 1 / bake;
-  const radiusScale = h.radiiWorld ? bake : 1; // world radii in the px solve (#494)
+  const { sourceOffsets: so, targetOffsets: to } = h;
   const out: DrawableVector[] = [];
   for (let e = 0; e < h.count; e++) {
-    const x0 = (h.sources[e * 2] ?? 0) * bake;
-    const y0 = (h.sources[e * 2 + 1] ?? 0) * bake;
-    const x1 = (h.targets[e * 2] ?? 0) * bake;
-    const y1 = (h.targets[e * 2 + 1] ?? 0) * bake;
+    const x0 = (h.sources[e * 2] ?? 0) * bake + offsetAt(so, e * 2, 1);
+    const y0 = (h.sources[e * 2 + 1] ?? 0) * bake + offsetAt(so, e * 2 + 1, 1);
+    const x1 = (h.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1);
+    const y1 = (h.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1);
     const r = styleRow(h, e);
     const geom = halfLinkGeometry({
       x0,
       y0,
-      r0: (h.radii[r * 2] ?? 0) * radiusScale,
+      r0: h.radii[r * 2] ?? 0,
       x1,
       y1,
-      r1: (h.radii[r * 2 + 1] ?? 0) * radiusScale,
+      r1: h.radii[r * 2 + 1] ?? 0,
       width: h.widths[r * 2] ?? 0,
       oppositeWidth: h.widths[r * 2 + 1] ?? 0,
       bend: chordBend(x0, y0, x1, y1, h.bends[r] ?? 0),
@@ -267,13 +279,13 @@ export function instancedVectorLayers(
     const bake = screen ? k || 1 : 1;
     switch (layer.primitive) {
       case "circles":
-        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: circlesToDrawables(layer.circles, screen ? 1 : k || 1) });
+        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: circlesToDrawables(layer.circles, screen ? 1 : k || 1, 1 / bake) });
         break;
       case "pie":
         out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: pieToDrawables(layer.pie, screen, tolerance) });
         break;
       case "lines":
-        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: linesToDrawables(layer.lines) });
+        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: linesToDrawables(layer.lines, 1 / bake) });
         break;
       case "arrows":
         out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: arrowsToDrawables(layer.arrows, bake) });

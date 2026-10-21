@@ -610,8 +610,8 @@ export abstract class BaseEngine {
     this.host.addEventListener("pointermove", this.onPointerMove);
     this.host.addEventListener("pointerleave", this.onPointerLeave);
   }
-  /** Attach pointer down/up/cancel for selection gestures (idempotent via same handler ref). */
-  private attachSelectPointer(): void {
+  /** Attach pointer down/up/cancel for selection gestures and node-drag (idempotent via same handler ref). */
+  protected attachSelectPointer(): void {
     this.host.addEventListener("pointerdown", this.onPointerDown);
     this.host.addEventListener("pointerup", this.onPointerUp);
     this.host.addEventListener("pointercancel", this.onPointerCancel);

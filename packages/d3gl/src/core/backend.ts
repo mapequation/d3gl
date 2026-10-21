@@ -133,6 +133,19 @@ export interface InstancedCirclesData {
   groups2?: Float32Array;
   /** Optional per-instance **selected flag** (0/1) for shader-driven dim/recolour (#162). Length `count`. */
   selected?: Uint8Array;
+  /**
+   * Optional per-circle offset from its centre (#509), in the layer's size units: the circle is drawn at
+   * `project(centre) + offset` px in `screen` mode and at `centre + offset` in `world` mode. Length `2 * count`;
+   * absent ⇒ no offset, with no buffer and no upload. Uploaded only when the array is a new object, so hand a new
+   * array to change it; a reference-stable column costs nothing per frame.
+   */
+  offsets?: Float32Array;
+  /**
+   * The instances whose {@link offsets} were rewritten in place since the last emit of this layer (#509), as flat
+   * `[start, end)` instance ranges: only those are uploaded, when `offsets` is the array the layer already holds
+   * (a state node drag moves one state node, not the column). Ignored with a new array, which uploads whole.
+   */
+  offsetsChanged?: Uint32Array;
   count: number;
 }
 
@@ -175,6 +188,17 @@ export interface InstancedLinesData {
   tableCount?: number;
   /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
   fade?: Float32Array;
+  /**
+   * Optional per-instance offsets of the two ends (#509), in the layer's size units: an end is drawn at
+   * `project(P) + offset` px in `screen` mode and at `P + offset` in `world` mode; the bend and the setbacks follow
+   * the offset ends. Length `2 * count` each; absent ⇒ no offset, with no buffer and no upload. Uploaded only when
+   * the array is a new object. Plain draws only: an indexed draw (`index`) takes no offsets.
+   */
+  sourceOffsets?: Float32Array;
+  targetOffsets?: Float32Array;
+  /** The instances whose end offsets were rewritten in place since the last emit (#509), as flat `[start, end)`
+   *  ranges, uploaded alone while the arrays are the ones the layer holds (see `InstancedCirclesData.offsetsChanged`). */
+  endOffsetsChanged?: Uint32Array;
   count: number;
 }
 
@@ -184,13 +208,8 @@ export interface InstancedArrowsData {
   sources: Float32Array;
   /** [x, y] target *centre* per arrow, length `2 * count`; the tip is set back by `radii` in-shader. */
   targets: Float32Array;
-  /** Target node radius per arrow (active sizeMode units, or world units with {@link radiiWorld}), length
-   *  `count` — the boundary setback. */
+  /** Target node radius per arrow (active sizeMode units), length `count` — the boundary setback. */
   radii: Float32Array;
-  /** `radii` are **world** units on a `screen`-sized layer (#494): px-sized arrowheads meeting world-sized
-   *  nodes (a state network's both view). The setback is scaled to px by the zoom (in-shader on WebGL, at
-   *  the bake on the vector paths), so the tip stays on the node boundary. No effect on a world layer. */
-  radiiWorld?: boolean;
   /** arrow size (active sizeMode units) per arrow, length `count`. */
   sizes: Float32Array;
   /** RGBA bytes per arrow, length `4 * count`. */
@@ -216,6 +235,17 @@ export interface InstancedArrowsData {
   tableCount?: number;
   /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
   fade?: Float32Array;
+  /**
+   * Optional per-instance offsets of the two ends (#509), in the layer's size units: an end is drawn at
+   * `project(P) + offset` px in `screen` mode and at `P + offset` in `world` mode; the bend and the setbacks follow
+   * the offset ends. Length `2 * count` each; absent ⇒ no offset, with no buffer and no upload. Uploaded only when
+   * the array is a new object. Plain draws only: an indexed draw (`index`) takes no offsets.
+   */
+  sourceOffsets?: Float32Array;
+  targetOffsets?: Float32Array;
+  /** The instances whose end offsets were rewritten in place since the last emit (#509), as flat `[start, end)`
+   *  ranges, uploaded alone while the arrays are the ones the layer holds (see `InstancedCirclesData.offsetsChanged`). */
+  endOffsetsChanged?: Uint32Array;
   count: number;
 }
 
@@ -231,8 +261,6 @@ export interface InstancedHalfArrowsData {
   targets: Float32Array;
   /** [r0, r1] source/target node radii per link, length `2 * count` (the tip lands on r1). */
   radii: Float32Array;
-  /** `radii` are **world** units on a `screen`-sized layer (#494): see {@link InstancedArrowsData.radiiWorld}. */
-  radiiWorld?: boolean;
   /** [width, oppositeWidth] per link, length `2 * count` (opposite width spaces the source foot). */
   widths: Float32Array;
   /** Bend per link (⟂ offset as a fraction of the chord, #296; sign picks the bow side), length `count`. */
@@ -258,6 +286,17 @@ export interface InstancedHalfArrowsData {
   tableCount?: number;
   /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
   fade?: Float32Array;
+  /**
+   * Optional per-instance offsets of the two ends (#509), in the layer's size units: an end is drawn at
+   * `project(P) + offset` px in `screen` mode and at `P + offset` in `world` mode; the bend and the setbacks follow
+   * the offset ends. Length `2 * count` each; absent ⇒ no offset, with no buffer and no upload. Uploaded only when
+   * the array is a new object. Plain draws only: an indexed draw (`index`) takes no offsets.
+   */
+  sourceOffsets?: Float32Array;
+  targetOffsets?: Float32Array;
+  /** The instances whose end offsets were rewritten in place since the last emit (#509), as flat `[start, end)`
+   *  ranges, uploaded alone while the arrays are the ones the layer holds (see `InstancedCirclesData.offsetsChanged`). */
+  endOffsetsChanged?: Uint32Array;
   count: number;
 }
 

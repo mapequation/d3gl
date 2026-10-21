@@ -189,6 +189,117 @@ function writeIfChanged<T extends ArrayBufferView>(buffer: Buffer, arr: T, last:
   return arr;
 }
 
+/** The value a vec2 offset attribute reads without a buffer: a WebGL constant attribute, shared and never written. */
+const ZERO_OFFSET = new Float32Array(2);
+
+/** Offset uploads (#509), for the per-frame guards: `buffers` created and `bytes` written to them. A layer without
+ *  offsets adds to neither; a frame whose offset columns are the same arrays as the last adds 0 bytes. */
+export const offsetColumnStats = { buffers: 0, bytes: 0 };
+
+/** Bind each named offset attribute to the constant (0, 0) on `model`: no buffer, no upload (#509). */
+export function zeroOffsets(model: Model, names: readonly string[]): void {
+  const constants: Record<string, Float32Array> = {};
+  for (const name of names) constants[name] = ZERO_OFFSET;
+  model.setConstantAttributes(constants);
+}
+
+/** The buffer-layout entry of a per-instance vec2 offset attribute. */
+export function offsetLayout(name: string): { name: string; format: "float32x2"; stepMode: "instance" } {
+  return { name, format: "float32x2", stepMode: "instance" };
+}
+
+/**
+ * An optional per-instance offset column (#509): a vec2 in the layer's size units that the shader adds to an
+ * instance's end after projecting it (screen) or before (world).
+ *
+ * Without data the attribute is a WebGL **constant attribute** (0, 0): its location is disabled in the VAO and
+ * reads the context's constant, so a layer without offsets allocates no buffer and uploads nothing, and a draw
+ * costs one `vertexAttrib2fv` more (luma.gl re-applies constants per draw). With data it is an instance buffer
+ * written only when the array is a new object, like the style columns (#179): reference-stable offsets upload
+ * once, never on a zoom frame. An array rewritten in place uploads only the instance ranges the emit names as
+ * changed (a state node drag: the held state nodes and their links' ends, not the whole column). The template attribute is pinned at location 0 in each shader, because luma.gl
+ * disables location 0 only on Chrome, so an offset never lands there.
+ */
+class OffsetColumn {
+  private buffer: Buffer | null = null;
+  private last: Float32Array | undefined;
+  /** Instances the buffer has room for. */
+  private room = 0;
+  constructor(readonly name: string) {}
+
+  /** Bind `data` on `models`, or the constant zero when it is absent, uploading only a new array. A new buffer
+   *  takes the layer's `capacity`, so it grows with the other columns. */
+  sync(device: Device, models: readonly Model[], data: Float32Array | undefined, count: number, capacity: number, changed?: Uint32Array): void {
+    if (!data) {
+      if (!this.buffer) return;
+      this.buffer.destroy();
+      this.buffer = null;
+      this.last = undefined;
+      for (const m of models) zeroOffsets(m, [this.name]);
+      return;
+    }
+    if (data === this.last && this.room >= count) {
+      // Rewritten in place (#509): only the changed instance ranges, 8 B per instance.
+      if (changed && this.buffer) {
+        for (let k = 0; k + 1 < changed.length; k += 2) {
+          const start = changed[k] ?? 0, end = Math.min(changed[k + 1] ?? 0, count);
+          if (end <= start) continue;
+          this.buffer.write(data.subarray(2 * start, 2 * end), 8 * start);
+          offsetColumnStats.bytes += 8 * (end - start);
+        }
+      }
+      return;
+    }
+    if (this.buffer && this.room >= count) this.buffer.write(data);
+    else if (!this.buffer && count === 0) return; // nothing to draw yet: the constant zero until there is
+    else {
+      this.buffer?.destroy();
+      this.room = Math.max(count, capacity);
+      this.buffer = grownBuffer(device, data, count, this.room);
+      offsetColumnStats.buffers++;
+      for (const m of models) m.setAttributes({ [this.name]: this.buffer });
+    }
+    offsetColumnStats.bytes += data.byteLength;
+    this.last = data;
+  }
+
+  destroy(): void {
+    this.buffer?.destroy();
+    this.buffer = null;
+  }
+}
+
+/** The end-offset attributes of a link layer (lines, arrows, half-arrows), shared with the indexed draws. */
+export const END_OFFSETS = ["a_sourceOffset", "a_targetOffset"] as const;
+
+/** The two end-offset columns of a link layer: `sourceOffsets` / `targetOffsets`. */
+class EndOffsets {
+  private readonly source = new OffsetColumn(END_OFFSETS[0]);
+  private readonly target = new OffsetColumn(END_OFFSETS[1]);
+  readonly layout = END_OFFSETS.map(offsetLayout);
+
+  /** Start `models` on the constant zero, then bind `data`'s columns. */
+  init(device: Device, models: readonly Model[], data: EndOffsetData, capacity: number): void {
+    for (const m of models) zeroOffsets(m, END_OFFSETS);
+    this.sync(device, models, data, capacity);
+  }
+  sync(device: Device, models: readonly Model[], data: EndOffsetData, capacity: number): void {
+    this.source.sync(device, models, data.sourceOffsets, data.count, capacity, data.endOffsetsChanged);
+    this.target.sync(device, models, data.targetOffsets, data.count, capacity, data.endOffsetsChanged);
+  }
+  destroy(): void {
+    this.source.destroy();
+    this.target.destroy();
+  }
+}
+
+interface EndOffsetData {
+  sourceOffsets?: Float32Array;
+  targetOffsets?: Float32Array;
+  endOffsetsChanged?: Uint32Array;
+  count: number;
+}
+
 export class InstancedCircles {
   count: number;
   /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
@@ -206,6 +317,8 @@ export class InstancedCircles {
   private color: Buffer;
   private border: Buffer;
   private borderColor: Buffer;
+  /** Per-instance offset from the centre (#509); the constant zero without one. */
+  private readonly offset = new OffsetColumn("a_offset");
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -239,6 +352,7 @@ export class InstancedCircles {
         { name: "a_color", format: "unorm8x4", stepMode: "instance" },
         { name: "a_border", format: "float32", stepMode: "instance" },
         { name: "a_borderColor", format: "unorm8x4", stepMode: "instance" },
+        offsetLayout("a_offset"),
         ...this.hl.layout,
       ],
       attributes: {
@@ -256,6 +370,8 @@ export class InstancedCircles {
       vertexCount: 4,
       instanceCount: this.count,
     });
+    zeroOffsets(this.model, ["a_offset"]);
+    this.offset.sync(device, [this.model], data.offsets, data.count, this._capacity, data.offsetsChanged);
   }
 
   /** Set shader-highlight uniforms (#162) — a hover/selection restyle with no geometry touch. */
@@ -325,6 +441,7 @@ export class InstancedCircles {
       }
       this.hl.write(data); // #162 refresh group/selected for the new frame's instances
     }
+    this.offset.sync(device, [this.model], data.offsets, data.count, this._capacity, data.offsetsChanged);
     this.count = data.count;
     this.model.setInstanceCount(data.count);
   }
@@ -340,6 +457,7 @@ export class InstancedCircles {
     this.color.destroy();
     this.border.destroy();
     this.borderColor.destroy();
+    this.offset.destroy();
     this.hl.destroy();
   }
 }
@@ -517,6 +635,8 @@ export class InstancedLines {
   private widthBuf: Buffer;
   private color: Buffer;
   private bend: Buffer;
+  /** The ends' offsets (#509); the constant zero without them. */
+  private readonly ends = new EndOffsets();
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -550,6 +670,7 @@ export class InstancedLines {
       { name: "a_width", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
       { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
+      ...this.ends.layout,
       ...this.hl.layout,
     ];
     const attributes = {
@@ -586,6 +707,12 @@ export class InstancedLines {
         instanceCount: this.count,
       });
     }
+    this.ends.init(device, this.models(), data, this._capacity);
+  }
+
+  /** The fill model and its pick twin, which share the instance attributes. */
+  private models(): Model[] {
+    return this.pickModel ? [this.model, this.pickModel] : [this.model];
   }
 
   setTransform(m: Float32Array): void {
@@ -666,6 +793,7 @@ export class InstancedLines {
       if (data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
       this.hl.write(data);
     }
+    this.ends.sync(device, this.models(), data, this._capacity);
     this.count = data.count;
     this.model.setInstanceCount(data.count);
     this.pickModel?.setInstanceCount(data.count);
@@ -688,6 +816,7 @@ export class InstancedLines {
     this.widthBuf.destroy();
     this.color.destroy();
     this.bend.destroy();
+    this.ends.destroy();
     this.hl.destroy();
   }
 }
@@ -722,6 +851,8 @@ export class InstancedArrows {
   private radius: Buffer;
   private color: Buffer;
   private bend: Buffer;
+  /** The ends' offsets (#509); the constant zero without them. */
+  private readonly ends = new EndOffsets();
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -747,7 +878,6 @@ export class InstancedArrows {
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
       u_pickBase: 0,
-      u_radiusWorld: data.radiiWorld ? 1 : 0, // #494: world setbacks on a screen layer
       ...highlightUniforms(1), // arrows recolour with their link
     };
     const bufferLayout = [
@@ -758,6 +888,7 @@ export class InstancedArrows {
       { name: "a_radius", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+      ...this.ends.layout,
       ...this.hl.layout,
     ];
     const attributes = {
@@ -794,6 +925,12 @@ export class InstancedArrows {
         instanceCount: this.count,
       });
     }
+    this.ends.init(device, this.models(), data, this._capacity);
+  }
+
+  /** The fill model and its pick twin, which share the instance attributes. */
+  private models(): Model[] {
+    return this.pickModel ? [this.model, this.pickModel] : [this.model];
   }
 
   setTransform(m: Float32Array): void {
@@ -823,7 +960,6 @@ export class InstancedArrows {
   update(device: Device, data: InstancedArrowsData): boolean {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     if (!!data.half !== this._half) return false; // vertex template changed — caller must recreate
-    this.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
@@ -875,6 +1011,7 @@ export class InstancedArrows {
       if (data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
       this.hl.write(data);
     }
+    this.ends.sync(device, this.models(), data, this._capacity);
     this.count = data.count;
     this.model.setInstanceCount(data.count);
     this.pickModel?.setInstanceCount(data.count);
@@ -898,6 +1035,7 @@ export class InstancedArrows {
     this.radius.destroy();
     this.color.destroy();
     this.bend.destroy();
+    this.ends.destroy();
     this.hl.destroy();
   }
 }
@@ -954,6 +1092,8 @@ export class InstancedHalfArrows {
   private widths: Buffer;
   private bend: Buffer;
   private color: Buffer;
+  /** The ends' offsets (#509); the constant zero without them. */
+  private readonly ends = new EndOffsets();
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -981,7 +1121,6 @@ export class InstancedHalfArrows {
       u_screen: 0,
       u_viewport: [width, height],
       u_pickBase: 0,
-      u_radiusWorld: data.radiiWorld ? 1 : 0, // #494: world radii on a screen layer
       ...highlightUniforms(1), // half-arrows recolour toward the highlight hue
     };
     const bufferLayout = [
@@ -992,6 +1131,7 @@ export class InstancedHalfArrows {
       { name: "a_widths", format: "float32x2" as const, stepMode: "instance" as const },
       { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+      ...this.ends.layout,
       ...this.hl.layout,
     ];
     const attributes = {
@@ -1028,6 +1168,12 @@ export class InstancedHalfArrows {
         instanceCount: this.count,
       });
     }
+    this.ends.init(device, this.models(), data, this._capacity);
+  }
+
+  /** The fill model and its pick twin, which share the instance attributes. */
+  private models(): Model[] {
+    return this.pickModel ? [this.model, this.pickModel] : [this.model];
   }
 
   setTransform(m: Float32Array): void {
@@ -1058,7 +1204,6 @@ export class InstancedHalfArrows {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
-    this.uniforms["u_radiusWorld"] = data.radiiWorld ? 1 : 0;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
@@ -1110,6 +1255,7 @@ export class InstancedHalfArrows {
       this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
       this.hl.write(data);
     }
+    this.ends.sync(device, this.models(), data, this._capacity);
     this.count = data.count;
     this.model.setInstanceCount(data.count);
     this.pickModel?.setInstanceCount(data.count);
@@ -1133,6 +1279,7 @@ export class InstancedHalfArrows {
     this.widths.destroy();
     this.bend.destroy();
     this.color.destroy();
+    this.ends.destroy();
     this.hl.destroy();
   }
 }

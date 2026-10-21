@@ -20,16 +20,16 @@ const palette = (path: readonly number[]): string | undefined =>
  *
  * - **Physical** — the derived physical network (flow-sized nodes, bent links). A physical node whose
  *   state nodes span several modules is a **pie chart** (a wedge per module, sized by flow); a
- *   single-module node is a solid disc.
+ *   single-module node is a plain circle.
  * - **State** — the state graph as an ordinary network with its modules, exactly what
  *   `net.data(stateGraph, { modules })` gives: laid out on its own (**State layout: Nested** lays it out by
  *   module), and `net.lod()` (the **LOD** control) cuts its module tree, with a ring around each open module.
- * - **Both** — state nodes confined **inside** each physical node's container disc, with state-level
- *   links: the memory structure in its physical context. Hover, click or drag a container: it acts as
- *   its state nodes.
+ * - **Both** — state nodes packed **inside** each physical node, at the state view's size (`nodeRadius` and
+ *   `sizeMode`), with state-level links: the memory structure in its physical context. Each physical node
+ *   encloses its state nodes. Hover, click or drag a physical node: it acts as its state nodes.
  *
  * **Colours** — with no palette, the engine colours modules itself; `style({ moduleColor })` takes your own
- * (a colour per module path) for state nodes, pie wedges, physical discs and containers in every view, and the
+ * (a colour per module path) for state nodes, pie wedges and physical nodes in every view, and the
  * pie wedges keep it when `nodeFill` colours the nodes by a metric. **Modules: Off** loads the raw state
  * network (no Infomap yet): the views still switch, without pies.
  * A view switch carries the selection over (a physical node ↔ its state nodes), and every hit, selection
@@ -66,7 +66,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       if (!data) return null;
       const hit = datum as NetworkHit;
       if (hit.level === "state") return data.stateNames[id as number] ?? null;
-      const p = hit.physical ?? (id as number); // a physical node, or a both-view container
+      const p = hit.physical ?? (id as number); // a physical node, in the physical or the both view
       if (net.stateView === "physical" && wedges) {
         const flow = data.graph.physical.flow?.[p] ?? 0;
         const rows: string[] = [];
@@ -106,9 +106,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       let hiFlow = 0;
       for (const f of g.graph.physical.flow!) if (f > hiFlow) hiFlow = f;
       // Without a palette the engine colours modules itself; `moduleColor` gives the app's palette to every view's
-      // nodes, containers and pie wedges (and keeps the pies and containers in it when `nodeFill` colours nodes
+      // state nodes, physical nodes and pie wedges (and keeps the pies and physical nodes in it when `nodeFill` colours nodes
       // by a metric).
-      // The "both" view sizes its state dots to their containers itself (in world units).
+      // The "both" view draws its state nodes at this nodeRadius and sizeMode, packed in physical nodes that enclose them.
       net.style({
         moduleColor: options.colors === "Palette" ? palette : undefined,
         directed: true,
@@ -156,7 +156,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       );
 
       // Labels: physical (1,2,…) in the physical + both views, state ((i,j)) in the state + both views.
-      // In the both view physical labels sit just outside each container (≈1:30); state labels on the dots.
+      // In the both view physical labels sit just outside each physical node (≈1:30); state labels on the state nodes.
       // The built-in label style covers font/colour; `style` thins the default halo a touch.
       const physOn = options.physLabels === "On";
       const stateOn = options.stateLabels === "On";
