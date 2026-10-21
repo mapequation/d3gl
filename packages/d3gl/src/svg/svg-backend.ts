@@ -33,6 +33,9 @@ export class SvgBackend implements Backend {
   private overlays: readonly RenderLayer[] = [];
   /** Some overlay is screen sizeMode, so a move must re-serialize the overlays too. */
   private overlayHasScreen = false;
+  /** `overlayView` holds world content. Only then does a zoom write its transform: with nothing
+   *  highlighted a zoom stays ONE attribute write on `view` (the retained-document guard, #264). */
+  private overlayHasWorld = false;
   private overlayDirty = false;
   /** True when some layer is screen sizeMode → `view`/strokes depend on the transform,
    *  so a move must re-serialize (no O(1) transform fast path). */
@@ -118,7 +121,13 @@ export class SvgBackend implements Backend {
    *  overlay also writes its clip silhouette (O(that clip layer)). */
   renderOverlays(): void {
     const { defs, world, screen, hasScreen } = svgBody(this.overlays, this.transform, this.layers);
-    this.overlayView.innerHTML = world; // its transform attribute follows setTransform
+    this.overlayView.innerHTML = world;
+    // Its transform follows setTransform only while it has world content, so (re)point it here; an
+    // emptied group drops it, back to the pristine element a zoom never touches.
+    const hadWorld = this.overlayHasWorld;
+    this.overlayHasWorld = world !== "";
+    if (this.overlayHasWorld) this.overlayView.setAttribute("transform", viewTransform(this.transform));
+    else if (hadWorld) this.overlayView.removeAttribute("transform");
     this.overlayRest.innerHTML = defs ? `<defs>${defs}</defs>${screen}` : screen;
     this.overlayHasScreen = hasScreen;
     this.overlayDirty = false;
@@ -126,7 +135,7 @@ export class SvgBackend implements Backend {
 
   setTransform(t: ViewTransform): void {
     this.transform = t;
-    this.overlayView.setAttribute("transform", viewTransform(t));
+    if (this.overlayHasWorld) this.overlayView.setAttribute("transform", viewTransform(t));
     if (this.overlayHasScreen) this.overlayDirty = true;
     // O(1) for the common (all-world) case: just re-point the view group, and DON'T mark
     // dirty — the engine's following render() then no-ops (the retained DOM stands). With
