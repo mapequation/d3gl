@@ -117,6 +117,18 @@ describe("self-link loops (#505)", () => {
     net.destroy();
   });
 
+  it("webgl: selection keeps the selected node's loop and dims another node's loop (selection.others)", async () => {
+    const net = await draw({ backend: "webgl", sizeMode: "world", directed: false });
+    net.interactive({ selectable: true }); // default selection.others: opacity 0.3
+    net.select("nodes", [0]);
+    const kept = await loopRed(net.toPNG());
+    net.select("nodes", [1]);
+    const dimmed = await loopRed(net.toPNG());
+    net.destroy();
+    expect(kept).toBeGreaterThan(20);
+    expect(dimmed).toBeLessThan(kept / 4); // the dimmed loop is no longer full red
+  });
+
   for (const backend of ["canvas", "svg"] as const)
     it(`${backend}: picking the loop reports its self-link`, async () => {
       const net = await draw({ backend, sizeMode: "screen", directed: false });
