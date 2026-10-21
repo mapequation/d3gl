@@ -1,5 +1,12 @@
 # @d3gl/website
 
+## 0.0.17
+
+### Patch Changes
+
+- Updated dependencies [[`e5a6fba`](https://github.com/mapequation/d3gl/commit/e5a6fbab505bfcaaa8375192e83b6aa98ccce5ba), [`cecde66`](https://github.com/mapequation/d3gl/commit/cecde6604ea0941ea7383d51a09b166c4c641b72), [`096ec94`](https://github.com/mapequation/d3gl/commit/096ec94a3b7f19557e21971320c50fc24dacec47), [`c38bfb4`](https://github.com/mapequation/d3gl/commit/c38bfb48e500e8c3ea30d888e7bfede87de1d516), [`58c8437`](https://github.com/mapequation/d3gl/commit/58c8437d3b463f58c7572c6b38f0339a75f6cfd9), [`7359489`](https://github.com/mapequation/d3gl/commit/7359489cf22dff107963534c7b32939c13f2c101)]:
+  - @mapequation/d3gl@0.12.0
+
 ## 0.0.16
 
 ### Patch Changes
