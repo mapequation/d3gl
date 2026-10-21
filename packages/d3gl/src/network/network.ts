@@ -304,7 +304,9 @@ export interface NetworkStyle {
    * `scale`. LOD aggregates sum their members' flow, unless a module of the engine's hierarchy has its
    * own value from `moduleFlow(path)` (#445). With `moduleFlow` alone — no `flow`, as for an Infomap
    * `.ftree`, which has each module's flow but none per node (#471) — only the modules with a value are
-   * ringed. Fill/size still come
+   * ringed. With `share: true` (#510) the border covers the share of each node's flow that leaves it
+   * instead — its exit flow (`flow`) over its flow (the graph's node flow), as a share of its area — with no
+   * `scale`. Fill/size still come
    * from `nodeFill`/`nodeRadius` (size by total flow with `nodeRadius: { by: "flow", scale }`). Omit
    * for plain filled nodes. @see {@link FlowBorderSpec}
    */
@@ -2607,7 +2609,7 @@ export class Network extends BaseEngine {
     }
     const links = drawsLinks(graph, r); // the worker builds super-edge rows only for drawn links (#433)
     const crowding = { screenSized: r.sizeMode === "screen", expandPx };
-    return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, colors: r.nodeColors, links, crowding }, version: this.lodStyleVersion };
+    return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, borderFlow: r.flowBorder?.flow, colors: r.nodeColors, links, crowding }, version: this.lodStyleVersion };
   }
 
   /**
@@ -5125,6 +5127,7 @@ export class Network extends BaseEngine {
     const resolved = this.resolvedStyleCached(this.graph);
     const nodeRadii = resolved.nodeRadii;
     const leafBorder = resolved.flowBorder?.metric; // per-leaf flow metric; sum-aggregated onto the tree
+    const leafBorderFlow = resolved.flowBorder?.flow; // share mode (#510): the leaf flow, summed likewise
     const leafColors = resolved.nodeColors; // per-leaf RGBA; averaged onto aggregates
     // When sizing by an additive metric, aggregates size by the leaf scale on their summed value
     // (flow-sized modules); else null ⇒ the area-additive √Σr² fallback.
@@ -5157,7 +5160,7 @@ export class Network extends BaseEngine {
         // has none once the layout has settled (a relayed GPU frame, or a run stopped mid-way).
         const header = this.lodStreamed?.header;
         if (header && header.styleVersion !== version) {
-          computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors);
+          computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, undefined, undefined, leafBorderFlow);
           header.styleVersion = version;
           header.crowding = false;
         }
@@ -5166,7 +5169,7 @@ export class Network extends BaseEngine {
           header.crowding = true;
         }
       } else {
-        computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodFillAggregate(this.lodWorkerTree, resolved));
+        computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodFillAggregate(this.lodWorkerTree, resolved), leafBorderFlow);
         this.applyLODBorderStyle(this.lodWorkerTree, resolved);
         // A streaming worker writes no crowding (#426); once it has settled (idle, writing nothing) the
         // crowding is computed here, once — at the settle, and for a new style.
@@ -5216,7 +5219,7 @@ export class Network extends BaseEngine {
       const box = mortonRootBox(graph.positions, graph.nodeCount, this.lodBox);
       this.lodBox = box;
       const tree = buildMortonLODTree(graph.positions, graph.nodeCount, { ...this.lodOptions.spatial, box }, this.mortonScratch);
-      computeLODGeometry(tree, graph, nodeRadii, leafWeight, leafBorder, leafColors, undefined, undefined, this.lodBounds);
+      computeLODGeometry(tree, graph, nodeRadii, leafWeight, leafBorder, leafColors, undefined, undefined, this.lodBounds, undefined, leafBorderFlow);
       this.updateLODCrowding(tree);
       this.lodTree = tree;
       this.lodSpatial = true;
@@ -5229,7 +5232,7 @@ export class Network extends BaseEngine {
       this.lodSpatial = false;
       this.lodModules = false;
     }
-    computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds, this.lodFillAggregate(this.lodTree, resolved));
+    computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds, this.lodFillAggregate(this.lodTree, resolved), leafBorderFlow);
     this.applyLODBorderStyle(this.lodTree, resolved);
     this.updateLODCrowding(this.lodTree);
     this.lodHasGeometry = true;
@@ -5482,7 +5485,7 @@ export class Network extends BaseEngine {
           ? (i: number) => `rgba(${flowColors[i * 4]},${flowColors[i * 4 + 1]},${flowColors[i * 4 + 2]},${flowColors[i * 4 + 3]! / 255})`
           : () => borderColorCss;
     const innerRadii = flow
-      ? flowBorderInnerRadii(style.nodeRadii, flow.metric, flow.scale)
+      ? flowBorderInnerRadii(style.nodeRadii, flow.metric, flow.scale, flow.flow)
       : cb
         ? Float32Array.from(style.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width)))
         : style.nodeRadii;

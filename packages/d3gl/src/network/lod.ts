@@ -241,6 +241,13 @@ export interface LODTree extends LODTopology {
    */
   border: Float32Array;
   /**
+   * Summed leaf flow under a share-mode flow border (#510): each leaf its node flow, each aggregate the sum
+   * of its descendants', so a glyph's border covers the share `border / borderFlow` of its area. Present only
+   * when {@link computeLODStyle} was given the leaf flow (the share mode); absent otherwise, so the absolute
+   * mode holds no extra array.
+   */
+  borderFlow?: Float32Array;
+  /**
    * Per-node fill colour as RGBA bytes, length `4 · size` (#104 N6 rework). Each leaf takes its
    * provided colour; each aggregate the (count-)averaged colour of its descendants — so a module
    * drawn from a categorical palette keeps its colour when collapsed, and its leaves share it. Zero
@@ -1226,7 +1233,7 @@ export function findMortonCell(tree: LODTopology, box: MortonBox, level: number,
 export function lodTreeFromTopology(
   topo: LODTopology,
   geometry?: { cx: Float32Array; cy: Float32Array; extent: Float32Array; clearZoom?: Float32Array },
-  computed?: { count: Uint32Array; radius: Float32Array; weight: Float32Array; border: Float32Array; color: Uint8Array; leafBranching?: number },
+  computed?: { count: Uint32Array; radius: Float32Array; weight: Float32Array; border: Float32Array; borderFlow?: Float32Array; color: Uint8Array; leafBranching?: number },
 ): LODTree {
   const { size } = topo;
   return {
@@ -1239,6 +1246,7 @@ export function lodTreeFromTopology(
     count: computed?.count ?? leafDescendantCounts(topo),
     weight: computed?.weight ?? new Float32Array(size),
     border: computed?.border ?? new Float32Array(size),
+    borderFlow: computed?.borderFlow,
     color: computed?.color ?? new Uint8Array(size * 4),
     clearZoom: geometry?.clearZoom ?? new Float32Array(size).fill(Infinity),
   };
@@ -1560,7 +1568,9 @@ function hclToRgb(h: number, c: number, l: number, out: Float64Array): void {
  * per-leaf flow-border metric (e.g. enter/exit flow); each aggregate gets the **sum** of its
  * descendants' (so a module's border reflects its members' total). Omitted ⇒ `border` stays zero.
  * `fillAggregate` (with `leafColors`) fills each aggregate with the fill scale on its summed metric, or
- * with its module's own colour, instead of its children's hue mean — see {@link FillAggregate}.
+ * with its module's own colour, instead of its children's hue mean — see {@link FillAggregate}. `leafBorderFlow`
+ * (a share-mode flow border, #510) is each leaf's flow, summed the same way into {@link LODTree.borderFlow}
+ * (allocated once per tree, reused by later passes); omitted ⇒ the tree holds no `borderFlow`.
  */
 export function computeLODStyle(
   tree: LODTree,
@@ -1570,9 +1580,17 @@ export function computeLODStyle(
   leafColors?: ArrayLike<number>,
   radiusAggregate?: RadiusAggregate,
   fillAggregate?: FillAggregate,
+  leafBorderFlow?: ArrayLike<number>,
 ): void {
   lodStylePasses++;
   const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border, color } = tree;
+  // Share-mode flow border (#510): the summed flow beside the summed exit flow. A tree keeps the array it
+  // has (a spatial frame's lives in the frame's buffer); the absolute mode drops it.
+  let borderFlow: Float32Array | null = null;
+  if (leafBorderFlow) {
+    borderFlow = tree.borderFlow && tree.borderFlow.length === tree.size ? tree.borderFlow : new Float32Array(tree.size);
+    tree.borderFlow = borderFlow;
+  } else tree.borderFlow = undefined;
   // Summed additive metric per node, only when sizing aggregates by the leaf scale (else null → the
   // area-additive √Σr² fallback). One temp array per style recompute, never per frame.
   const value = radiusAggregate ? new Float64Array(tree.size) : null;
@@ -1587,6 +1605,7 @@ export function computeLODStyle(
     radius[i] = leafRadii[i]!;
     weight[i] = leafWeight[i]!;
     border[i] = leafBorder ? leafBorder[i]! : 0;
+    if (borderFlow && leafBorderFlow) borderFlow[i] = leafBorderFlow[i]!;
     if (value) value[i] = radiusAggregate!.leafValue[i]!;
     if (fillValue) fillValue[i] = fill!.leafValue[i]!;
     if (leafColors) {
@@ -1603,6 +1622,7 @@ export function computeLODStyle(
       let sumR2 = 0;
       let sv = 0;
       let sb = 0;
+      let sbf = 0;
       let sf = 0;
       // Colour: a chroma-weighted circular-hue mean in HCL, so a module's aggregate takes its hue
       // family's representative hue (crisp) rather than a muddy RGB average across the family.
@@ -1613,6 +1633,7 @@ export function computeLODStyle(
         if (value) sv += value[c]!;
         else sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
+        if (borderFlow) sbf += borderFlow[c]!;
         if (fillValue) sf += fillValue[c]!;
         else if (leafColors && !own) {
           hueTerms(color[c * 4] ?? 0, color[c * 4 + 1] ?? 0, color[c * 4 + 2] ?? 0, hclOut);
@@ -1632,6 +1653,7 @@ export function computeLODStyle(
         radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
       }
       border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
+      if (borderFlow) borderFlow[g] = sbf; // and its flow, for the share mode (#510)
       if (fillValue) {
         fillValue[g] = sf;
         const c = fill!.rgbaOf(sf); // the leaf fill scale on the summed metric (a module's total flow)
@@ -1679,9 +1701,10 @@ export function computeLODGeometry(
   discs?: BoundaryDiscs,
   bounds?: LODBoundsScratch,
   fillAggregate?: FillAggregate,
+  leafBorderFlow?: ArrayLike<number>,
 ): void {
   computeLODPositions(tree, graph.positions, discs, bounds);
-  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate);
+  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate, leafBorderFlow);
 }
 
 /**

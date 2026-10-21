@@ -379,11 +379,45 @@ function fillColors(count: number, css: string): Uint8Array {
  * (e.g. Infomap enter/exit flow). The app supplies the flow; d3gl renders the ring. For LOD aggregates
  * the metric is summed over members (see {@link computeLODStyle}), unless a module has its own value
  * ({@link FlowBorderSpec.moduleFlow}).
+ *
+ * Two modes:
+ * - **absolute** (default): the ring is `scale(flow)` wide, whatever the node's size.
+ * - **share** (`share: true`, #510): the ring covers the share of the node's flow that leaves it, as a share
+ *   of its area — see {@link FlowBorderShare}.
  */
-export interface FlowBorderSpec {
+export type FlowBorderSpec = FlowBorderAbsolute | FlowBorderShare;
+
+/** The absolute flow-border mode (the default): the ring is `scale(flow)` wide. @see {@link FlowBorderSpec} */
+export interface FlowBorderAbsolute extends FlowBorderBase {
+  share?: false;
+  /** Maps the (summed) flow → ring width in the active `sizeMode`'s units, e.g. `scaleSqrt().range([0, 6])`. */
+  scale: (value: number) => number;
+}
+
+/**
+ * The share flow-border mode (#510): the flow border covers the node's **exit-flow share** — its exit flow
+ * `e` ({@link FlowBorderBase.flow}) over its flow `f` (the graph's node flow, {@link NetworkGraph.flow}) — as
+ * a share of its area. A node of radius `r` keeps an inner disc of radius `r · √(1 − e/f)`, with `e/f`
+ * clamped to `[0, 1]`: `e = f` covers the whole node, `e = f/2` half its area, `e = 0` draws no border, and
+ * `f = 0` or a missing value (no node flow, `NaN`) draws none. The share does not depend on the radius, so
+ * it reads the same in both size modes and on a capped aggregate.
+ *
+ * An LOD aggregate takes its members' summed exit flow over their summed flow; a module of the engine's
+ * hierarchy with a {@link FlowBorderBase.moduleFlow} value takes that exit flow over its summed flow. In a
+ * state network each view takes its own graph's node flow: a physical node's share is its exit flow over its
+ * flow (the sum of its state nodes' flow).
+ */
+export interface FlowBorderShare extends FlowBorderBase {
+  share: true;
+  scale?: undefined;
+}
+
+/** What both {@link FlowBorderSpec} modes share. */
+export interface FlowBorderBase {
   /**
    * Per-node enter/exit flow driving the border width: a caller `Float32Array` (length `nodeCount`)
-   * or a built-in {@link NodeMetric}. Summed over members for module aggregates.
+   * or a built-in {@link NodeMetric}. Summed over members for module aggregates. In the share mode it is
+   * the exit flow, divided by the node's flow.
    *
    * Optional when {@link moduleFlow} is given (#471) — for input that has each module's flow but no
    * per-node value, such as an Infomap `.ftree`. Then a node draws **no** ring, a module draws its
@@ -391,8 +425,6 @@ export interface FlowBorderSpec {
    * exist. One of `flow` and `moduleFlow` is required.
    */
   flow?: Float32Array | NodeMetric;
-  /** Maps the (summed) flow → ring width in the active `sizeMode`'s units, e.g. `scaleSqrt().range([0, 6])`. */
-  scale: (value: number) => number;
   /**
    * Ring colour: a single CSS colour, or a per-node `(value, index, graph) => cssColour` accessor so
    * the ring colour can also encode the per-node metric (a bare d3 colour scale fits — `value` is the
@@ -422,7 +454,17 @@ export interface ResolvedFlowBorder {
    * too, so a module draws a ring only from its own {@link FlowBorderSpec.moduleFlow} value.
    */
   metric: Float32Array;
-  scale: (value: number) => number;
+  /**
+   * Absolute mode: maps the (summed) metric to the ring width. `null` in the share mode (#510), where the
+   * width follows from each glyph's exit-flow share instead ({@link shareBorderWidth}, over {@link flow}).
+   */
+  scale: ((value: number) => number) | null;
+  /**
+   * Share mode (#510): each node's flow, the denominator of its share `metric / flow` (`NaN` when the graph
+   * has no node flow, so no node draws a border); sum-aggregated onto the LOD tree as
+   * {@link LODTree.borderFlow}. Absent in the absolute mode.
+   */
+  flow?: Float32Array;
   /** Representative ring colour (the single colour, or a fallback for LOD aggregates). */
   color: [number, number, number, number];
   colorCss: string;
@@ -457,6 +499,10 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
     metric = new Float32Array(n);
     for (let i = 0; i < n; i++) metric[i] = value(i);
   }
+  // Share mode (#510): the ring follows the exit-flow share metric / flow, so it has no scale; the flow is the
+  // graph's node flow, by reference (none: `NaN`, so no node draws a border).
+  const scale = spec.share ? null : spec.scale;
+  const flow = spec.share ? (graph.flow ?? new Float32Array(n).fill(NaN)) : undefined;
   if (typeof spec.color === "function") {
     const colorOf = spec.color;
     const colors = new Uint8Array(n * 4);
@@ -475,15 +521,15 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
     for (let i = 1; i < n; i++) if (metric[i]! > metric[rep]!) rep = i;
     const colorCss = Number.isNaN(metric[rep] ?? NaN) ? colorOf(0, -1, graph) : colorOf(metric[rep] ?? 0, rep, graph);
     const aggregateColor = (v: number) => toRGBA(colorOf(v, -1, graph));
-    return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, colors, aggregateColor, moduleFlow };
+    return { metric, scale, flow, color: toRGBA(colorCss), colorCss, colors, aggregateColor, moduleFlow };
   }
   if (spec.color === undefined) {
     // No explicit colour → each glyph's ring is a darker shade of its OWN fill (per-module under LOD).
     // The renderers derive it from the glyph colours via `darken`; colorCss is a representative fallback.
-    return { metric, scale: spec.scale, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: BORDER_DARKEN, moduleFlow };
+    return { metric, scale, flow, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: BORDER_DARKEN, moduleFlow };
   }
   const colorCss = spec.color;
-  return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, moduleFlow };
+  return { metric, scale, flow, color: toRGBA(colorCss), colorCss, moduleFlow };
 }
 
 /**
@@ -803,17 +849,62 @@ export function resolveNodeColors(graph: NetworkGraph, color: (index: number, gr
 }
 
 /**
+ * The width of a share-mode flow border (#510) on a glyph of radius `r`, exit flow `e` and flow `f`: it keeps
+ * an inner disc of radius `r · √(1 − e/f)`, with `e/f` clamped to `[0, 1]`, so the border covers the share
+ * `e/f` of the glyph's area (`e = f`: all of it, width `r`). `NaN` (no border) when `f` is not positive or
+ * either value is missing (`NaN`, #471).
+ */
+export function shareBorderWidth(r: number, e: number, f: number): number {
+  if (!(f > 0) || Number.isNaN(e)) return NaN;
+  const share = e / f;
+  return share >= 1 ? r : share <= 0 ? 0 : r - r * Math.sqrt(1 - share);
+}
+
+/**
+ * Per-glyph flow-border widths as the `(valueOf, scale)` pair {@link buildBorders} reads, for glyph `i` of
+ * radius `radii[i]` drawing value `at[i]` (or `i`, without `at`): the absolute mode passes the exit flow through
+ * the scale; the share mode (#510) gives the width itself ({@link shareBorderWidth} of the exit flow over
+ * `flow`; none ⇒ no border), through the identity. O(1) per glyph either way.
+ */
+function flowBorderWidths(
+  scale: ((v: number) => number) | null,
+  radii: ArrayLike<number>,
+  exit: ArrayLike<number>,
+  flow: ArrayLike<number> | undefined,
+  at?: Uint32Array,
+): { valueOf: (i: number) => number; scale: (v: number) => number } {
+  if (scale) return { valueOf: at ? (i) => exit[at[i]!]! : (i) => exit[i]!, scale };
+  if (!flow) return { valueOf: () => NaN, scale: identity };
+  const valueOf = at
+    ? (i: number) => {
+        const g = at[i]!;
+        return shareBorderWidth(radii[i]!, exit[g]!, flow[g]!);
+      }
+    : (i: number) => shareBorderWidth(radii[i]!, exit[i]!, flow[i]!);
+  return { valueOf, scale: identity };
+}
+
+const identity = (v: number): number => v;
+
+/**
  * Inner-disc radii (`radius − ring width`) for rendering a flow border as two stacked discs (a
  * border-colour disc under a smaller fill disc) on the SVG/Canvas export path, which has no
- * per-element ring primitive. `metric` is the raw per-node flow.
+ * per-element ring primitive. `metric` is the raw per-node flow; with `scale` `null`, the share mode (#510),
+ * the width is the exit-flow share `metric / flow` of the area ({@link shareBorderWidth}).
  */
-export function flowBorderInnerRadii(radii: ArrayLike<number>, metric: ArrayLike<number>, scale: (v: number) => number): Float32Array {
+export function flowBorderInnerRadii(
+  radii: ArrayLike<number>,
+  metric: ArrayLike<number>,
+  scale: ((v: number) => number) | null,
+  flow?: ArrayLike<number>,
+): Float32Array {
   const n = radii.length;
   const inner = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const r = radii[i]!;
     const v = metric[i]!;
-    inner[i] = Number.isNaN(v) ? r : Math.max(0, r - Math.min(r, scale(v))); // `NaN`: no value, no ring (#471)
+    const w = scale ? (Number.isNaN(v) ? NaN : scale(v)) : shareBorderWidth(r, v, flow ? flow[i]! : NaN);
+    inner[i] = Number.isNaN(w) ? r : Math.max(0, r - Math.min(r, w)); // `NaN`: no value, no ring (#471)
   }
   return inner;
 }
@@ -829,10 +920,11 @@ export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): Inst
   const colors = style.colors ?? fillColors(count, style.fill);
   const base = { centers: graph.positions, radii: style.radii, colors, count };
   if (style.border) {
-    const { metric, scale, color, colors: explicit, darken } = style.border;
+    const { metric, scale, flow, color, colors: explicit, darken } = style.border;
     // `darken` (no explicit ring colour) ⇒ each node's ring = its own fill darkened.
     const borderNodeColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
-    return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color, borderNodeColors) };
+    const widths = flowBorderWidths(scale, style.radii, metric, flow);
+    return { ...base, ...buildBorders(count, style.radii, widths.valueOf, widths.scale, color, borderNodeColors) };
   }
   if (style.constBorder) {
     return { ...base, ...constBorderArrays(count, style.radii, style.constBorder, colors) };
@@ -961,7 +1053,9 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     // collapsed module's ring is a darker shade of that module's hue, not one shared colour.
     const borderColors =
       darken !== undefined ? darkenColors(colors, count, darken) : explicit ? frontierRingColors(tree, frontier, explicit, style.borderColors, color) : undefined;
-    result = { ...result, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors, borderColors !== undefined) };
+    // Share mode (#510): each glyph's summed exit flow over its summed flow (`borderFlow`; none ⇒ no ring).
+    const widths = flowBorderWidths(scale, radii, tree.border, tree.borderFlow, frontier);
+    result = { ...result, ...buildBorders(count, radii, widths.valueOf, widths.scale, color, borderColors, borderColors !== undefined) };
   } else if (style.constBorder) {
     // A node border without a colour (#506): each glyph's ring is its own (module) colour darkened.
     result = { ...result, ...constBorderArrays(count, radii, style.constBorder, colors) };
