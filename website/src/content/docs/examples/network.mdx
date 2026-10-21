@@ -299,7 +299,9 @@ What it composes:
   zoom-dependent, so more resolve as you zoom in. Importance is summed up the tree (a module's is its
   members' total) and set by `style({ importance })` — a metric (`"degree"`/`"strength"`/`"flow"`), an
   accessor, a `Float32Array`, or `"order"`. It **defaults to the node-size metric**, so the biggest
-  glyph wins an overlap.
+  glyph wins an overlap. A glyph is hidden when its centre lies within `declutterSpacing·(rᵢ + rⱼ)` of a
+  kept glyph: the default `declutterSpacing: 1` hides only real overlaps; `2` also hides near neighbours
+  for a sparser view.
 - **Super-edges** draw connectivity between visible nodes (a leaf↔leaf graph edge, or an
   aggregate↔aggregate coarse edge); a visible node keeps its edges even when a neighbour is
   off-screen. By default they connect *same-level* pairs (and, in a ragged module tree, a leaf to a

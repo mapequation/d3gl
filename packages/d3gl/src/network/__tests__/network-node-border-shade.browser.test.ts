@@ -76,7 +76,7 @@ async function draw(backend: (typeof BACKENDS)[number], lod: boolean, nodeBorder
   await net.whenReady();
   net
     .data(buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true }))
-    .style({ nodeRadius: lod ? 8 : 16, nodeFill: (i) => FILLS[i]!, nodeBorder, linkStyle: "none" });
+    .style({ nodeRadius: 16, nodeFill: (i) => FILLS[i]!, nodeBorder, linkStyle: "none" });
   if (lod) net.lod({ modules: MODULES, expandPx: 20 });
   net.layout({ backend: "positions", positions: lod ? CLUSTERED : SPREAD });
   net.setTransform({ k: 1, x: 0, y: 0 });
@@ -116,7 +116,7 @@ describe("#506 node border without a colour: a darker shade of each node's fill"
         await net.whenReady();
         net
           .data(buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true }))
-          .style({ nodeRadius: lod ? 8 : 16, nodeFill: () => "rgba(31, 119, 180, 0.5)", nodeBorder: { width: 4 }, linkStyle: "none" });
+          .style({ nodeRadius: 16, nodeFill: () => "rgba(31, 119, 180, 0.5)", nodeBorder: { width: 4 }, linkStyle: "none" });
         if (lod) net.lod({ modules: MODULES, expandPx: 20 });
         net.layout({ backend: "positions", positions: lod ? CLUSTERED : SPREAD });
         net.setTransform({ k: 1, x: 0, y: 0 });

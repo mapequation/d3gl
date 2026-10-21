@@ -983,3 +983,21 @@ rules when extending it:
 Bordered nodes are deliberately kept out of that diff (the ring-vs-stacked-discs divergence above);
 fold them in when #269 converges the two encodings.
 
+
+## LOD declutter hides only real overlaps by default (#512)
+
+**Rule.** LOD declutter (`declutterFrontier` → `declutterScreen`, shared by WebGL, Canvas and SVG) hides a
+frontier glyph when its centre lies within `spacing·(rᵢ + rⱼ)` of a kept glyph. The default
+`declutterSpacing` is **1**: only glyphs that really overlap a kept one are hidden. Anything larger also hides
+glyphs that merely sit near a kept one.
+
+**Why.** The default used to be 2. In a 4-node graph with two modules, each collapsed to one aggregate
+(radius `sqrt(Σ r²)` = r·√2), one whole module vanished from `nodeRadius` ≈ 8.7 up although the two
+aggregates were ≈ 15 px apart at r = 12. A missing module reads as missing data, not as declutter. On the 20k
+`modular-map` example at the fit view, spacing 2 kept 5 of 52 module aggregates; spacing 1 keeps 17, with no
+overlaps (at 4× zoom: 339 leaves vs 102).
+
+**Consequences.** LOD views are denser, so the per-frame draw grows, bounded by the culled frontier (the
+declutter stays O(frontier), no new memory). A test that counts LOD glyphs must not assume the old
+2× exclusion; pass `declutterSpacing: 2` explicitly when it needs the sparser look. A perf-guard reference
+implementation that mirrors `declutterFrontier` must mirror the default too (`frontier-perf.test.ts`).
