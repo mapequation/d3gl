@@ -3205,6 +3205,13 @@ export function traceSuperArrows(g: GroupBuilder, arrows: InstancedArrowsData, i
 // nodeCircles lane, so only ≥2-module ("overlapping") physical nodes get a pie.
 // ---------------------------------------------------------------------------
 
+/** A bordered node's inner radius — the edge of its fill, where the border starts — from its radius and its
+ *  border width as a fraction of it (the instanced-circle `borders` column, `clamp01(width / radius)`). The
+ *  same `radius − min(radius, width)` the vector path takes from {@link flowBorderInnerRadii} (#507). */
+export function borderInnerRadius(radius: number, fraction: number): number {
+  return radius * (1 - fraction);
+}
+
 /** Radius input for pie glyphs (active `sizeMode` units): a constant, or one radius per physical node. */
 export type PieRadius = number | ArrayLike<number>;
 
@@ -3227,6 +3234,10 @@ export function physicalPieInstances(
   /** Per-wedge RGBA (length `4·wedges`, wedge index order), resolved once per style (#494); default: each
    *  wedge's `color`, parsed per call. */
   rgba?: Uint8Array,
+  /** Per-physical border width as a fraction of `radius` — the node lane's own `borders` column (flow border
+   *  or node border, #507). The pie is drawn at the node's inner radius {@link borderInnerRadius}, so the
+   *  border shows around it; default: no border, the full radius. */
+  borders?: ArrayLike<number>,
 ): InstancedPieData {
   const { offset, end, color, wedgeCount } = wedges;
   const physicalCount = wedgeCount.length;
@@ -3244,7 +3255,7 @@ export function physicalPieInstances(
     if (wedgeCount[p]! < 2) continue;
     const cx = positions[2 * p]!;
     const cy = positions[2 * p + 1]!;
-    const r = radiusAt(p);
+    const r = borders ? borderInnerRadius(radiusAt(p), borders[p]!) : radiusAt(p);
     let a0 = 0;
     for (let k = offset[p]!; k < offset[p + 1]!; k++) {
       const a1 = end[k]!;

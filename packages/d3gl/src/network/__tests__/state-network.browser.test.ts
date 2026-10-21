@@ -5,7 +5,7 @@ import { buildGraph } from "../graph.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedLayer, InstancedHighlight } from "../../core/backend.js";
-import { decodeImage } from "../../map/__tests__/backend-equivalence-harness.js";
+import { decodeImage, rasterizeSVG } from "../../map/__tests__/backend-equivalence-harness.js";
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -457,4 +457,49 @@ describe("physical-view pie highlight (#175)", () => {
     net.destroy();
     h.remove();
   });
+});
+
+// #507: the pie sits at the node's INNER radius, so the node's border shows around it — the flow border
+// first, else the node border, by the same rule on every backend. The WebGL pie lane used to read the node
+// border only, so with a flow border its pie was drawn at the full radius and covered the flow border.
+describe("physical-view pie inside the border (#507)", () => {
+  const BORDER: [number, number, number] = [255, 0, 255];
+  const BORDER_PX = 6;
+  /** `r` px from physical `p`'s centre, in the same direction as {@link pieSample} (the second wedge). */
+  const along = (p: number, r: number): [number, number] => {
+    const d = r * Math.SQRT1_2;
+    return [(PIE_POS[2 * p] ?? 0) - d, (PIE_POS[2 * p + 1] ?? 0) + d];
+  };
+  const isBorder = ([r, g, b]: number[]) => Math.abs(r - BORDER[0]) < 24 && Math.abs(g - BORDER[1]) < 24 && Math.abs(b - BORDER[2]) < 24;
+  const borders = {
+    flowBorder: { scale: () => BORDER_PX, flow: new Float32Array([1, 1, 1]), color: "#ff00ff" },
+    nodeBorder: { width: BORDER_PX, color: "#ff00ff" },
+  } as const;
+
+  for (const backend of ["webgl", "canvas", "svg"] as const) {
+    for (const kind of ["flowBorder", "nodeBorder"] as const) {
+      it(`${backend}: a ${kind === "flowBorder" ? "flow border" : "node border"} stays visible around the pie`, async () => {
+        const h = host();
+        const { graph, modules } = pieStateNetwork();
+        const net = network(h, { width: 200, height: 200, backend });
+        await net.whenReady();
+        net
+          .style(kind === "flowBorder" ? { nodeRadius: PIE_R, flowBorder: borders.flowBorder } : { nodeRadius: PIE_R, nodeBorder: borders.nodeBorder })
+          .stateNetwork(graph, { modules, view: "physical" })
+          .layout({ backend: "positions", positions: PIE_POS });
+        net.setTransform({ k: 1, x: 0, y: 0 });
+        net.render();
+        const px = backend === "svg" ? await rasterizeSVG(net.toSVG(), 200, 200) : await decodeImage(net.toPNG(), 200, 200);
+        const mid = PIE_R - BORDER_PX / 2; // the border's centreline
+        // The single-module disc (physical 2) shows the border (sampled straight up, clear of its links).
+        expect(isBorder(rgbaAt(px, [PIE_POS[4] ?? 0, (PIE_POS[5] ?? 0) - mid])), "no border on the plain disc").toBe(true);
+        for (const p of [0, 1]) {
+          expect(isBorder(rgbaAt(px, along(p, mid))), `the pie of physical ${p} covers its border`).toBe(true);
+          expect(isBorder(rgbaAt(px, along(p, PIE_R / 3))), `no pie inside the border of physical ${p}`).toBe(false);
+        }
+        net.destroy();
+        h.remove();
+      });
+    }
+  }
 });

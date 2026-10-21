@@ -3247,13 +3247,12 @@ export class Network extends BaseEngine {
 
   /** The physical-view pie layer (#171): overlapping (≥2-module) physical nodes as instanced pie wedges,
    *  drawn on top of the node discs. Null off the physical view, without pie wedges, or when none overlap. */
-  private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer | null {
+  private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle, nodeBorders: Float32Array | undefined): InstancedLayer | null {
     if (this.activeView !== "physical" || !this.pieWedges) return null;
-    // Draw the pie at the node's INNER radius (inside any constant border), so the "nodes" circle's
-    // border ring shows around the pie exactly as it does around a single-module disc (#171 review).
-    const cb = resolved.constBorder;
-    const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width))) : resolved.nodeRadii;
-    const pie = physicalPieInstances(this.pieWedges, graph.positions, radii, this.pieColors() ?? undefined);
+    // Draw the pie at the node's INNER radius, so the "nodes" circle's border (the flow border, else the node
+    // border) shows around the pie exactly as it does around a single-module disc (#171 review, #507). The
+    // widths are the node layer's own `borders` column of this emit: no copy, and one rule with the disc's.
+    const pie = physicalPieInstances(this.pieWedges, graph.positions, resolved.nodeRadii, this.pieColors() ?? undefined, nodeBorders);
     if (pie.count === 0) return null;
     // Unchanged columns go out as the arrays last emitted (one compare pass each, O(wedges), on an emit that is
     // O(wedges) already), so the GPU layer re-uploads only what changed.
@@ -3269,6 +3268,13 @@ export class Network extends BaseEngine {
     // back the same array and its upload is skipped.
     pie.selected = this.noLodSelectedFor(this.PIE_LAYER);
     return { name: this.PIE_LAYER, primitive: "pie", pie, sizeMode: resolved.sizeMode };
+  }
+
+  /** The node layer's per-node border widths as fractions of the radius (the flow border, else the node
+   *  border), as the instanced-circle shader reads them; undefined without a border (#507). */
+  private nodeBorderFractions(layers: InstancedLayer[]): Float32Array | undefined {
+    for (const l of layers) if (l.name === this.NODE_LAYER && l.primitive === "circles" && !l.circles.bordersPx) return l.circles.borders;
+    return undefined;
   }
 
   /** The `both`-view container layer (#171): faint world-sized discs at each physical node, sized to hold
@@ -3787,7 +3793,7 @@ export class Network extends BaseEngine {
         // State-network overlays (#171), build-once per emit: the `both`-view physical **container** discs
         // draw UNDER the nodes/links (backdrop), the physical-view **pie** wedges draw ON TOP (cover the disc).
         const container = this.containerLayer();
-        const pie = this.pieInstancedLayer(graph, resolved);
+        const pie = this.pieInstancedLayer(graph, resolved, this.nodeBorderFractions(base));
         return [...(container ? [container] : []), ...base, ...(pie ? [pie] : [])];
       });
       this.registerInstancedLane(this.NET_LANE, {
