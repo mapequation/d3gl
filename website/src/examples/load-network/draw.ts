@@ -13,7 +13,8 @@ let loaded = { text: SAMPLE_PAJEK, name: "sample.net" };
  * edge-list parser (`source target [weight]`, `#` comments). The off-thread worker lays it out with
  * `layout({ fit: true })`, so it opens **framed** and converges live; nodes are **sized by degree** (a
  * d3 `scaleSqrt`) so hubs stand out. Vertex names are drawn with engine-managed **frontier labels**
- * (`net.labels({ labelOf })`) — they track pan/zoom (and the fit reframe) with no overlay bookkeeping.
+ * (`net.labels({ labelOf, maxWidth })`) — they track pan/zoom (and the fit reframe) with no overlay bookkeeping;
+ * a long name is trimmed with an ellipsis and shows in full on hover.
  * Pick a file, or load a built-in sample.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
@@ -37,7 +38,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // Vertex names as engine-managed frontier labels: `labelOf` maps a node id → its parsed label, and
       // the engine re-places them on every pan/zoom + layout frame — no manual overlay/transform tracking.
       // The built-in label style (dark 11px sans-serif + white halo) covers every backend, export included.
-      .labels({ labelOf: (id) => names?.[id] ?? null, offset: [7, -4] })
+      // `maxWidth` trims a long name to 80 px with an ellipsis (placement uses the trimmed box); hovering the
+      // node shows it in full.
+      .labels({ labelOf: (id) => names?.[id] ?? null, offset: [7, -4], maxWidth: 80 })
+      .interactive({ hover: true })
       // The worker seeds a disc centred on the viewport at the layout's own final scale (radius ≈ 32·√N at
       // the default forces), so a small network like the sample opens framed at k=1 and converges in place.
       // For large files add `fit: true` to keep the camera framed on the layout (see the network example).

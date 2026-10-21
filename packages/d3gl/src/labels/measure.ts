@@ -52,6 +52,29 @@ export function canvasFont(font: string): string {
   return font.replace(/(\d+(?:\.\d+)?px)\/\S+/, "$1");
 }
 
+/** The trim marker (#496): U+2026 HORIZONTAL ELLIPSIS, one glyph. */
+export const ELLIPSIS = "\u2026";
+
+/**
+ * Trim `text` to at most `maxWidth` px with a trailing {@link ELLIPSIS} (#496). `widthOf` measures a
+ * string's px width. A text that already fits comes back as the same string. Otherwise it is the
+ * longest prefix that fits together with the ellipsis (binary search: O(log length) measurements),
+ * cut on a whole character (never between the halves of a surrogate pair) and without whitespace
+ * before the ellipsis. When not even one character fits it is the ellipsis alone.
+ */
+export function trimToWidth(text: string, maxWidth: number, widthOf: (s: string) => number): string {
+  if (widthOf(text) <= maxWidth) return text;
+  let lo = 0, hi = text.length - 1; // longest prefix length n in [0, len-1] with width(prefix + …) <= maxWidth
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (widthOf(text.slice(0, mid) + ELLIPSIS) <= maxWidth) lo = mid; else hi = mid - 1;
+  }
+  let n = lo;
+  const last = text.charCodeAt(n - 1);
+  if (n > 0 && last >= 0xd800 && last <= 0xdbff) n--; // do not split a surrogate pair
+  return text.slice(0, n).trimEnd() + ELLIPSIS;
+}
+
 /**
  * Hard cap on distinct cached label texts — see {@link TextMeasurer}. Deliberately far above any set
  * that can be *visible* at once (a viewport holds ~2000 label boxes): the cap exists only so a pan
@@ -78,6 +101,9 @@ export class TextMeasurer {
   /** The row-box height for this font, in px (constant — text width is what varies). */
   readonly height: number;
   private readonly widths = new Map<string, number>();
+  /** Trimmed texts (#496), valid for {@link trimmedFor}; cleared when the max width changes or on overflow. */
+  private readonly trimmed = new Map<string, string>();
+  private trimmedFor = NaN;
 
   constructor(
     private readonly font: string,
@@ -94,5 +120,24 @@ export class TextMeasurer {
     if (this.widths.size >= this.limit) this.widths.clear();
     this.widths.set(text, w);
     return w;
+  }
+
+  /**
+   * `text` trimmed to `maxWidth` px with an ellipsis (#496), memoized like {@link width}: each distinct
+   * text is trimmed once (O(log length) measurements), every later frame is a Map lookup. A text that
+   * fits is returned as is. Changing `maxWidth` drops the memo. The prefix probes are measured directly,
+   * not cached in {@link width}'s map, so they cannot evict the working set.
+   */
+  trim(text: string, maxWidth: number): string {
+    if (maxWidth !== this.trimmedFor) { this.trimmed.clear(); this.trimmedFor = maxWidth; }
+    const hit = this.trimmed.get(text);
+    if (hit !== undefined) return hit;
+    // The text's own width is the cached one (a label that fits is measured once, for both its box and
+    // this check); only the prefix probes of a cut text are measured directly.
+    const full = this.width(text);
+    const out = full <= maxWidth ? text : trimToWidth(text, maxWidth, (s) => (s === text ? full : measureText(s, this.font).width));
+    if (this.trimmed.size >= this.limit) this.trimmed.clear();
+    this.trimmed.set(text, out);
+    return out;
   }
 }

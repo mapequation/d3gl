@@ -1,5 +1,5 @@
-import type { Backend, RenderLayer, ViewTransform, StyleTables, DrawableVector, TextData } from "../core/index.js";
-import { svgBody, svgFromLayers, serializeTexts, viewTransform } from "./serialize.js";
+import type { Backend, RenderLayer, ViewTransform, StyleTables, DrawableVector, TextData, HoverText } from "../core/index.js";
+import { svgBody, svgFromLayers, serializeTexts, serializeHoverText, viewTransform } from "./serialize.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -20,6 +20,10 @@ export class SvgBackend implements Backend {
   /** Screen-space `<text>` labels (#105 N7b-2), drawn on top in their own group (coords are screen px). */
   private text: SVGGElement;
   private textData: readonly TextData[] = [];
+  /** The one hovered label shown in full (#496), in a group of its own above the placed text, so a hover
+   *  change rewrites this one element and never the placed set. */
+  private hoverG: SVGGElement;
+  private hoverText: HoverText | null = null;
   /** True when some layer is screen sizeMode → `view`/strokes depend on the transform,
    *  so a move must re-serialize (no O(1) transform fast path). */
   private hasScreen = false;
@@ -43,7 +47,8 @@ export class SvgBackend implements Backend {
     this.view = document.createElementNS(SVG_NS, "g");
     this.screen = document.createElementNS(SVG_NS, "g");
     this.text = document.createElementNS(SVG_NS, "g");
-    this.root.append(this.defs, this.view, this.screen, this.text);
+    this.hoverG = document.createElementNS(SVG_NS, "g");
+    this.root.append(this.defs, this.view, this.screen, this.text, this.hoverG);
     host.appendChild(this.root);
   }
 
@@ -83,6 +88,12 @@ export class SvgBackend implements Backend {
     this.text.innerHTML = serializeTexts(texts);
   }
 
+  /** The one-label hover slot (#496): one element written, the placed text group untouched. */
+  setHoverText(hover: HoverText | null): void {
+    this.hoverText = hover;
+    this.hoverG.innerHTML = serializeHoverText(hover);
+  }
+
   setTransform(t: ViewTransform): void {
     this.transform = t;
     // O(1) for the common (all-world) case: just re-point the view group, and DON'T mark
@@ -116,7 +127,7 @@ export class SvgBackend implements Backend {
     this.dirty = false;
   }
 
-  toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform, this.textData); }
+  toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform, this.textData); } // the hover is transient, not exported (as on WebGL)
   toPNG(): string {
     throw new Error("SvgBackend.toPNG: rasterize via a raster backend (canvas/webgl); SVG export is toSVG()");
   }
