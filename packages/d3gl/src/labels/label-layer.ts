@@ -42,20 +42,9 @@ export interface LabelAnchor {
   opacity?: number;
 }
 
-/**
- * Project label anchors to screen px (`screen = k·ref + (x,y)` + the constant offset) and resolve
- * collisions, returning the survivors as {@link LabelBox}es (carrying `text`/`opacity`). Shared by the
- * HTML overlay ({@link LabelLayer.update}) and the backend-native text path (#105 N7b-2) so both place
- * and cull labels identically — they differ only in how they render the survivors.
- */
-export function placeLabels(
-  anchors: readonly LabelAnchor[],
-  transform: ViewTransform,
-  viewport: { width: number; height: number },
-  /** Reusable cull buffers — pass the caller's retained one on the per-frame path (#204). */
-  scratch?: LabelCullScratch,
-): LabelBox[] {
-  const boxes: LabelBox[] = anchors.map((a) => ({
+/** Project one anchor to its screen {@link LabelBox} (`screen = k·ref + (x,y)` + the constant offset). */
+export function anchorBox(a: LabelAnchor, transform: ViewTransform): LabelBox {
+  return {
     id: a.id,
     x: transform.k * a.refX + transform.x + (a.offset?.[0] ?? 0),
     y: transform.k * a.refY + transform.y + (a.offset?.[1] ?? 0),
@@ -70,7 +59,23 @@ export function placeLabels(
     keepUpright: a.keepUpright,
     transform: a.transform,
     transformOrigin: a.transformOrigin,
-  }));
+  };
+}
+
+/**
+ * Project label anchors to screen px (`screen = k·ref + (x,y)` + the constant offset) and resolve
+ * collisions, returning the survivors as {@link LabelBox}es (carrying `text`/`opacity`). Shared by the
+ * HTML overlay ({@link LabelLayer.update}) and the backend-native text path (#105 N7b-2) so both place
+ * and cull labels identically — they differ only in how they render the survivors.
+ */
+export function placeLabels(
+  anchors: readonly LabelAnchor[],
+  transform: ViewTransform,
+  viewport: { width: number; height: number },
+  /** Reusable cull buffers — pass the caller's retained one on the per-frame path (#204). */
+  scratch?: LabelCullScratch,
+): LabelBox[] {
+  const boxes: LabelBox[] = anchors.map((a) => anchorBox(a, transform));
   return cullLabels(boxes, { viewport, scratch });
 }
 
@@ -143,6 +148,42 @@ export class LabelLayer {
     private readonly style?: LabelStyle,
   ) {}
 
+  /** The label shown in full while hovered (#496), and the text its placed node returns to afterwards. */
+  private hover: { anchor: LabelAnchor; restore: string } | null = null;
+  /** Key of a node that exists only for {@link hover} (its label was not placed), else null. */
+  private hoverOnly: string | null = null;
+
+  private makeNode(key: string): HTMLDivElement {
+    const node = document.createElement("div");
+    node.dataset.labelId = key;
+    node.style.position = "absolute";
+    node.style.pointerEvents = "none";
+    node.style.whiteSpace = "nowrap";
+    if (this.className) node.className = this.className;
+    // Styling lands ONCE here, in the creation branch — reused elements are never restyled on
+    // the per-transform update path (only left/top/transform/opacity below are per-update).
+    if (this.style) Object.assign(node.style, this.style);
+    this.container.appendChild(node);
+    this.nodes.set(key, node);
+    return node;
+  }
+
+  /** Write one box's text and placement to its node. */
+  private paint(node: HTMLDivElement, box: LabelBox, text: string): void {
+    node.textContent = this.text({ id: box.id, refX: 0, refY: 0, text });
+    node.style.left = `${Math.round(box.x)}px`;
+    node.style.top = `${Math.round(box.y)}px`;
+    // The library generates the transform from the same box used for collision (so render and
+    // culling agree) whenever the placement is declared — rotation, or textAnchor/baseline. A
+    // plain top-left label declares none, so `labelTransform` returns "" and the caller's own
+    // transform applies.
+    const derived = labelTransform(box);
+    node.style.transform = derived || ((box.transform as string) ?? "");
+    node.style.transformOrigin = (box.transformOrigin as string) ?? "0 0";
+    const op = box.opacity as number | undefined;
+    node.style.opacity = op == null ? "" : String(op);
+  }
+
   update(
     anchors: readonly LabelAnchor[],
     transform: ViewTransform,
@@ -151,41 +192,21 @@ export class LabelLayer {
     // Project + cull (shared with the backend-native text path), then render the survivors to DOM.
     const visible = placeLabels(anchors, transform, viewport, this.cullScratch);
     const seen = new Set<string>();
+    const hover = this.hover;
+    const hoverKey = hover ? String(hover.anchor.id) : null;
 
     for (const box of visible) {
       const key = String(box.id);
       seen.add(key);
-      let node = this.nodes.get(key);
-      if (!node) {
-        node = document.createElement("div");
-        node.dataset.labelId = key;
-        node.style.position = "absolute";
-        node.style.pointerEvents = "none";
-        node.style.whiteSpace = "nowrap";
-        if (this.className) node.className = this.className;
-        // Styling lands ONCE here, in the creation branch — reused elements are never restyled on
-        // the per-transform update path (only left/top/transform/opacity below are per-update).
-        if (this.style) Object.assign(node.style, this.style);
-        this.container.appendChild(node);
-        this.nodes.set(key, node);
-      }
-      node.textContent = this.text({
-        id: box.id,
-        refX: 0,
-        refY: 0,
-        text: String(box.text),
-      });
-      node.style.left = `${Math.round(box.x)}px`;
-      node.style.top = `${Math.round(box.y)}px`;
-      // The library generates the transform from the same box used for collision (so render and
-      // culling agree) whenever the placement is declared — rotation, or textAnchor/baseline. A
-      // plain top-left label declares none, so `labelTransform` returns "" and the caller's own
-      // transform applies.
-      const derived = labelTransform(box);
-      node.style.transform = derived || ((box.transform as string) ?? "");
-      node.style.transformOrigin = (box.transformOrigin as string) ?? "0 0";
-      const op = box.opacity as number | undefined;
-      node.style.opacity = op == null ? "" : String(op);
+      const node = this.nodes.get(key) ?? this.makeNode(key);
+      if (key === hoverKey && hover) { this.paint(node, box, hover.anchor.text); node.style.zIndex = "1"; }
+      else this.paint(node, box, String(box.text));
+    }
+    // The hovered label is shown even when collision culling dropped its trimmed twin: one extra node.
+    this.hoverOnly = null;
+    if (hover && hoverKey !== null && !seen.has(hoverKey)) {
+      seen.add(hoverKey);
+      this.showHoverOnly(hoverKey, hover.anchor, transform);
     }
 
     for (const [key, node] of this.nodes) {
@@ -196,8 +217,43 @@ export class LabelLayer {
     }
   }
 
+  private showHoverOnly(key: string, anchor: LabelAnchor, transform: ViewTransform): void {
+    const node = this.nodes.get(key) ?? this.makeNode(key);
+    this.paint(node, anchorBox(anchor, transform), anchor.text);
+    node.style.zIndex = "1";
+    this.hoverOnly = key;
+  }
+
+  /**
+   * Show `anchor`'s text (the label in full) in place of its trimmed twin while hovered (#496), or
+   * clear it (`null`). `restore` is the text the label returns to on the next call. O(1): one node
+   * lookup (a new node is made only when the label was not placed), no placement pass, so a hover
+   * sweep costs the same per pointer move whatever number of labels is placed. The stored anchor also
+   * applies on every later {@link update}.
+   */
+  setHover(anchor: LabelAnchor | null, restore: string, transform: ViewTransform): void {
+    const prev = this.hover;
+    if (prev) {
+      const key = String(prev.anchor.id);
+      const node = this.nodes.get(key);
+      if (node) {
+        if (this.hoverOnly === key) { node.remove(); this.nodes.delete(key); }
+        else { node.textContent = prev.restore; node.style.zIndex = ""; }
+      }
+      this.hoverOnly = null;
+    }
+    this.hover = anchor ? { anchor, restore } : null;
+    if (!anchor) return;
+    const key = String(anchor.id);
+    const node = this.nodes.get(key);
+    if (node) { node.textContent = anchor.text; node.style.zIndex = "1"; }
+    else this.showHoverOnly(key, anchor, transform);
+  }
+
   destroy(): void {
     for (const node of this.nodes.values()) node.remove();
     this.nodes.clear();
+    this.hover = null;
+    this.hoverOnly = null;
   }
 }

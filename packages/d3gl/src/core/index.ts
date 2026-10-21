@@ -26,7 +26,7 @@ export { expandStroke, DEFAULT_MITER_LIMIT } from "./stroke.js";
 export type { StrokeGeometry, StrokeOptions, LineJoin, LineCap } from "./stroke.js";
 export { Scene } from "./scene.js";
 export type { GroupBuffers, GroupBufferDelta, GroupBuilder, GroupOptions, DrawableRange, DrawableOpts, DrawableVector, StyleTables } from "./scene.js";
-export type { Backend, RenderLayer, VectorLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem, InstancedLayer, InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight, TextData } from "./backend.js";
+export type { Backend, RenderLayer, VectorLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem, InstancedLayer, InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight, TextData, HoverText } from "./backend.js";
 export { instancedVectorLayers, circlesToDrawables, pieToDrawables, linesToDrawables, arrowsToDrawables, halfArrowsToDrawables } from "./instanced-vector.js";
 export { halfLinkGeometry, halfLinkPathString, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit } from "./half-link.js";
 export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "./half-link.js";
