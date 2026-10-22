@@ -770,8 +770,9 @@ export interface StateNetworkOptions {
   view?: "state" | "physical" | "both";
   /**
    * Lump each physical node's state nodes in one leaf module into one node in the state and both views (#529), as
-   * the map equation codes them. The physical view is the same either way. Toggle it with {@link Network.lump}.
-   * Default false. Ignored without `modules`. @see {@link lumpStateGraph}
+   * the map equation codes them. Without `modules` every state node is in the root module, so each physical node's
+   * state nodes are one node: the state view draws the physical network. The physical view is the same either way.
+   * Toggle it with {@link Network.lump}. Default false. @see {@link lumpStateGraph}
    */
   lump?: boolean;
   /** Radius (world units) of the rosette of state nodes around their physical node that the state view's
@@ -1595,7 +1596,7 @@ export class Network extends BaseEngine {
     this.clearStateNetwork();
     this.stateSource = { graph, modules: opts.modules ?? null };
     // Lumped (#529): the state and both views draw the lumps; the physical view, its pies included, is the same.
-    this.lumpedNet = opts.lump && opts.modules ? lumpStateGraph(graph, opts.modules) : null;
+    this.lumpedNet = opts.lump ? lumpStateGraph(graph, opts.modules) : null;
     this.lumpActive = this.lumpedNet !== null;
     const level = this.lumpedNet ? newStateLevel(this.lumpedNet.graph, this.lumpedNet.modules) : newStateLevel(graph, opts.modules ?? null, recordOf);
     this.stateData = level.data;
@@ -1653,7 +1654,8 @@ export class Network extends BaseEngine {
   /**
    * Lump the state network's state nodes (#529), or draw them as given: with `on`, the state and both views draw one
    * node per (leaf module, physical node), as the map equation codes them ({@link lumpStateGraph}). The physical
-   * view, its layout and its pies are the same either way. No-op without a {@link stateNetwork} with modules.
+   * view, its layout and its pies are the same either way. Without modules every state node is in the root module,
+   * so each physical node's state nodes are one node. No-op without a {@link stateNetwork}.
    *
    * The state view keeps one picture across the toggle: once it has been laid out, the new form starts where the
    * current one's nodes are — each lump at its state nodes' centroid, or a lump's state nodes on a rosette around it —
@@ -1669,7 +1671,7 @@ export class Network extends BaseEngine {
     const layouts = this.viewLayouts;
     const sg = this.stateData;
     const both = this.bothGraph;
-    if (!source?.modules || !layouts || !sg || !both || on === this.lumpActive) return this;
+    if (!source || !layouts || !sg || !both || on === this.lumpActive) return this;
     const lumped = (this.lumpedNet ??= lumpStateGraph(source.graph, source.modules));
     const next = this.otherLevel ?? (on ? newStateLevel(lumped.graph, lumped.modules) : newStateLevel(source.graph, source.modules));
     const view = this.activeView;

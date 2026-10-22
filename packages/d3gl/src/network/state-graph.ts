@@ -182,8 +182,9 @@ export interface LumpedStateNetwork {
    * object: lumping only splits the physical grouping further, so merging the lumps by physical node gives it back.
    */
   graph: StateNetworkGraph;
-  /** Each lump's module record: its leaf module's path, then its rank in that module (by flow, then by id). */
-  modules: ModulePathNode[];
+  /** Each lump's module record: its leaf module's path, then its rank in that module (by flow, then by id). Null
+   *  when lumped without modules. */
+  modules: ModulePathNode[] | null;
   /** state node id → its lump id, length `stateCount`. */
   stateToLump: Uint32Array;
   /** lump id → its state node ids (CSR). */
@@ -192,14 +193,16 @@ export interface LumpedStateNetwork {
 
 /**
  * Lump `sg`'s state nodes by (leaf module, physical node) (#529), with `modules` a record per state node (Infomap's
- * `nodes` shape; the leaf module is the record's path less its last entry). A lump's links are the summed links of
- * its state nodes to other lumps, its flow the sum of theirs: the same merge as the physical graph's. O(state
- * nodes + state links + lumps · log lumps).
+ * `nodes` shape; the leaf module is the record's path less its last entry). Without `modules` every state node is
+ * in the root module, so each physical node's state nodes are one lump: the lumped network is the physical one. A
+ * lump's links are the summed links of its state nodes to other lumps, its flow the sum of theirs: the same merge as
+ * the physical graph's. O(state nodes + state links + lumps · log lumps).
  */
-export function lumpStateGraph(sg: StateNetworkGraph, modules: ArrayLike<ModulePathNode>): LumpedStateNetwork {
+export function lumpStateGraph(sg: StateNetworkGraph, modules?: ArrayLike<ModulePathNode> | null): LumpedStateNetwork {
   const stateCount = sg.state.nodeCount;
-  const leafOf = new Array<string>(stateCount);
-  for (let r = 0; r < modules.length; r++) {
+  // Each state node's leaf-module key: "" (the root) for all without modules, else from its record.
+  const leafOf = new Array<string | undefined>(stateCount).fill(modules ? undefined : "");
+  for (let r = 0; modules && r < modules.length; r++) {
     const { id, path } = modules[r]!;
     if (!(id >= 0 && id < stateCount)) throw new Error(`lumpStateGraph: module record id ${id} out of range`);
     let leaf = "";
@@ -238,22 +241,8 @@ export function lumpStateGraph(sg: StateNetworkGraph, modules: ArrayLike<ModuleP
   const state = mergeGroups(sg.state, stateToLump, lumpCount);
   const lumpToState = groupMembers(stateToLump, lumpCount);
 
-  // Rank the lumps of each leaf module by flow (by state-node count without flow), ties by id, as Infomap ranks a
-  // module's nodes: a lump's record is its leaf module's path, then its 1-based rank.
-  const byLeaf = new Map<string, number[]>();
-  for (let l = 0; l < lumpCount; l++) {
-    const leaf = lumpLeaf[l]!;
-    const members = byLeaf.get(leaf);
-    if (members) members.push(l);
-    else byLeaf.set(leaf, [l]);
-  }
   const size = (l: number): number => state.flow ? state.flow[l]! : lumpToState.offsets[l + 1]! - lumpToState.offsets[l]!;
-  const records = new Array<ModulePathNode>(lumpCount);
-  for (const [leaf, lumps] of byLeaf) {
-    const prefix = leaf === "" ? [] : leaf.split(":").map(Number);
-    lumps.sort((a, b) => size(b) - size(a) || a - b);
-    for (let r = 0; r < lumps.length; r++) records[lumps[r]!] = { id: lumps[r]!, path: [...prefix, r + 1] };
-  }
+  const records = modules ? lumpRecords(lumpLeaf, size) : null;
 
   const graph: StateNetworkGraph = {
     state,
@@ -263,4 +252,26 @@ export function lumpStateGraph(sg: StateNetworkGraph, modules: ArrayLike<ModuleP
     physicalCount,
   };
   return { graph, modules: records, stateToLump, lumpToState };
+}
+
+/**
+ * The lumps' module records (#529): the lumps of each leaf module ranked by `size` (flow, else state-node count), ties
+ * by id, as Infomap ranks a module's nodes; a lump's record is its leaf module's path, then its 1-based rank.
+ * `leafOf` is each lump's leaf-module key. O(lumps · log lumps).
+ */
+function lumpRecords(leafOf: readonly string[], size: (lump: number) => number): ModulePathNode[] {
+  const byLeaf = new Map<string, number[]>();
+  for (let l = 0; l < leafOf.length; l++) {
+    const leaf = leafOf[l]!;
+    const lumps = byLeaf.get(leaf);
+    if (lumps) lumps.push(l);
+    else byLeaf.set(leaf, [l]);
+  }
+  const records = new Array<ModulePathNode>(leafOf.length);
+  for (const [leaf, lumps] of byLeaf) {
+    const prefix = leaf === "" ? [] : leaf.split(":").map(Number);
+    lumps.sort((a, b) => size(b) - size(a) || a - b);
+    for (let r = 0; r < lumps.length; r++) records[lumps[r]!] = { id: lumps[r]!, path: [...prefix, r + 1] };
+  }
+  return records;
 }

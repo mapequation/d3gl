@@ -224,15 +224,19 @@ describe("lumped state networks (#529)", () => {
     net.destroy();
   });
 
-  it("is a no-op without modules", async () => {
+  it("without modules every state node is in the root module: each physical node's state nodes are one node", async () => {
     const { graph } = fixture();
     const net = await engine();
     net.stateNetwork(graph, { view: "state", lump: true });
     place(net);
-    expect(net.lumped).toBeNull();
+    expect(drawn(net), "a lump per physical node").toBe(P);
+    expect(net.lumped?.modules).toBeNull();
+    expect(Array.from(net.lumped?.stateToLump ?? [])).toEqual([0, 0, 1, 2, 1, 0]);
+    net.lump(false);
+    expect(drawn(net), "the state nodes as given").toBe(S);
+    net.view("both");
     net.lump(true);
-    expect(net.lumped).toBeNull();
-    expect(drawn(net)).toBe(S);
+    expect(drawn(net), "the both view's lumps").toBe(P);
     net.destroy();
   });
 

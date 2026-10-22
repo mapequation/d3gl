@@ -23,7 +23,7 @@ export default function StateNetwork() {
         { type: "segmented", key: "links", label: "Links", options: ["Half-arrow", "Line"] },
         { type: "segmented", key: "colors", label: "Colours", options: ["Engine", "Palette"] },
         { type: "segmented", key: "modules", label: "Modules", options: ["On", "Off"] },
-        { type: "segmented", key: "lump", label: "Lump", options: ["Off", "On"], disabled: (o) => o.view === "Physical" || o.modules === "Off" },
+        { type: "segmented", key: "lump", label: "Lump", options: ["Off", "On"] },
         { type: "segmented", key: "physLabels", label: "Physical labels", options: ["Off", "On"] },
         { type: "segmented", key: "stateLabels", label: "State labels", options: ["Off", "On"] },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"], disabled: (o) => o.view === "Both" },

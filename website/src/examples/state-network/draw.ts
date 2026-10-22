@@ -33,7 +33,8 @@ const palette = (path: readonly number[]): string | undefined =>
  * pie wedges keep it when `nodeFill` colours the nodes by a metric. **Modules: Off** loads the raw state
  * network (no Infomap yet): the views still switch, without pies. **Lump: On** (`stateNetwork(…, { lump })`,
  * `net.lump(on)`) draws each physical node's state nodes in one leaf module as one node in the State and Both
- * views, as the map equation codes them; `net.lumped` maps a lump to its physical node and state nodes.
+ * views, as the map equation codes them (with **Modules: Off** every state node is in the root module: a node per
+ * physical node); `net.lumped` maps a lump to its physical node and state nodes.
  * A view switch carries the selection over (a physical node ↔ its state nodes), and every hit, selection
  * and label names its `level` ("physical" or "state"), so the tooltip and labels below need no id mapping.
  *
@@ -100,7 +101,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const backend = options.backend === "GPU" ? "gpu" : options.backend === "Worker" ? "worker" : "force";
       const withModules = options.modules !== "Off";
       const nested = withModules && options.stateLayout === "Nested";
-      const lump = withModules && options.lump === "On";
+      const lump = options.lump === "On";
       const dataChanged = !data || builtN !== n;
       // Backend and Modules also re-load the network and re-lay it out.
       const layoutChanged = dataChanged || builtBackend !== backend || builtModules !== withModules;

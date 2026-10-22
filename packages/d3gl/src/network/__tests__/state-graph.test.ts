@@ -127,8 +127,8 @@ describe("lumpStateGraph (#529)", () => {
 
   it("ranks each leaf module's lumps by flow, ties by id, after the module's path", () => {
     const { modules: lumped } = lumpStateGraph(sg, modules);
-    expect(lumped.map((r) => Array.from(r.path))).toEqual([[1, 1], [2, 1], [1, 2], [2, 2]]);
-    expect(lumped.map((r) => r.id)).toEqual([0, 1, 2, 3]);
+    expect(lumped?.map((r) => Array.from(r.path))).toEqual([[1, 1], [2, 1], [1, 2], [2, 2]]);
+    expect(lumped?.map((r) => r.id)).toEqual([0, 1, 2, 3]);
   });
 
   it("ranks by state-node count without flow, and lumps nodes in no module by physical node", () => {
@@ -136,7 +136,15 @@ describe("lumpStateGraph (#529)", () => {
     const { graph, modules: lumped } = lumpStateGraph(plain, [{ id: 0, path: [1] }, { id: 1, path: [2] }, { id: 2, path: [3] }]);
     expect(graph.state.nodeCount).toBe(2);
     expect(graph.state.flow).toBeNull();
-    expect(lumped.map((r) => Array.from(r.path))).toEqual([[1], [2]]);
+    expect(lumped?.map((r) => Array.from(r.path))).toEqual([[1], [2]]);
+  });
+
+  it("without modules lumps each physical node's state nodes into one: the physical network, with no records", () => {
+    const { graph, stateToLump, modules: records } = lumpStateGraph(sg);
+    expect(graph.state.nodeCount).toBe(sg.physicalCount);
+    expect(Array.from(stateToLump)).toEqual([0, 0, 0, 1, 1]);
+    expect(records).toBeNull();
+    expect(physEdges(graph.state)).toEqual(physEdges(sg.physical));
   });
 
   it("throws on a record out of range or a state node with no record", () => {
