@@ -6,7 +6,8 @@ import type { HoverHit } from "../../map/base-engine.js";
 
 /**
  * Lumped state networks (#529): the state and both views draw one node per (leaf module, physical node), the physical
- * view the same either way, and `lump()` toggles it keeping the physical layout and mapping the selection.
+ * view the same either way, and `lump()` toggles it keeping the physical layout and the state view's picture, and
+ * mapping the selection.
  *
  * Fixture (6 state nodes over 3 physical nodes, 5 lumps):
  *  - physical 0: states 0, 1 (leaf module [1]) → lump 0; state 5 (leaf module [2]) → lump 1
@@ -109,7 +110,7 @@ describe("lumped state networks (#529)", () => {
     net.destroy();
   });
 
-  it("the first lumped state layout starts with each lump at its state nodes' centroid", async () => {
+  it("the state view keeps one picture across the toggle: lumps at their state nodes' centroid, and back", async () => {
     const { graph, modules } = fixture();
     const net = await engine();
     net.stateNetwork(graph, { modules, view: "state" });
@@ -117,15 +118,43 @@ describe("lumped state networks (#529)", () => {
     const states = Float32Array.from(net.positions ?? []);
     expect(states.length).toBe(2 * S);
     net.lump(true);
-    const lumps = net.positions ?? new Float32Array(0);
+    const lumps = Float32Array.from(net.positions ?? []);
     // Lump 0 is states 0 and 1; lump 4 is state 3 alone.
     expect(lumps[0]).toBeCloseTo((states[0]! + states[2]!) / 2, 4);
     expect(lumps[1]).toBeCloseTo((states[1]! + states[3]!) / 2, 4);
     expect(lumps[8]).toBeCloseTo(states[6]!, 4);
     expect(lumps[9]).toBeCloseTo(states[7]!, 4);
-    // Back to the state nodes as given: their own layout, where it was.
+    // Back to the state nodes: on a rosette around their lump, where the lumps are now (a lone one on it).
     net.lump(false);
-    expect(Array.from(net.positions ?? [])).toEqual(Array.from(states));
+    const back = net.positions ?? new Float32Array(0);
+    expect(back[6]).toBeCloseTo(lumps[8]!, 4);
+    expect(back[7]).toBeCloseTo(lumps[9]!, 4);
+    const spread = Math.hypot(back[0]! - back[2]!, back[1]! - back[3]!);
+    expect(spread, "lump 0's two state nodes unfold").toBeGreaterThan(0);
+    for (const s of [0, 1]) expect(Math.hypot(back[2 * s]! - lumps[0]!, back[2 * s + 1]! - lumps[1]!)).toBeLessThan(100);
+    net.destroy();
+  });
+
+  it("a warm layout settles the toggled form from the carried-over picture, never the form's earlier run", async () => {
+    const { graph, modules } = fixture();
+    const net = await engine();
+    net.stateNetwork(graph, { modules, view: "state" });
+    place(net);
+    net.layout({ backend: "force" });
+    await net.whenSettled();
+    const states = Float32Array.from(net.positions ?? []);
+    net.lump(true);
+    await net.whenSettled();
+    const lumps = Float32Array.from(net.positions ?? []);
+    expect(lumps.every(Number.isFinite)).toBe(true);
+    // Lump 4 (state 3 alone) starts on state 3 and a warm run moves it only a little.
+    expect(Math.hypot(lumps[8]! - states[6]!, lumps[9]! - states[7]!)).toBeLessThan(60);
+    net.lump(false);
+    await net.whenSettled();
+    const back = Float32Array.from(net.positions ?? []);
+    // Not the state nodes' earlier layout restored: a picture carried from the lumps, settled again.
+    expect(Array.from(back)).not.toEqual(Array.from(states));
+    expect(Math.hypot(back[6]! - lumps[8]!, back[7]! - lumps[9]!)).toBeLessThan(60);
     net.destroy();
   });
 

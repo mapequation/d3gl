@@ -137,7 +137,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         builtModules = withModules;
         builtNested = nested;
       } else {
-        net.lump(lump).view(view); // each view, and each lumping, keeps its layout; one never shown is laid out now
+        net.lump(lump).view(view); // a toggle keeps each view's picture; a view never shown is laid out now
         // The state layout changed: lay out the state view again (the physical graph has no modules to nest).
         if (nested !== builtNested && view === "state") net.layout({ backend, fit: true, nested });
         if (view === "state") builtNested = nested;

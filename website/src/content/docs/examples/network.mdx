@@ -946,7 +946,9 @@ module palette a collapsed module takes its own colour from it.
 codeword: within that module they are one node. `stateNetwork(graph, { modules, lump: true })`, or `net.lump(on)`
 at any time, draws the state and both views that way, one node per (leaf module, physical node), its flow and links
 the sums of its state nodes' (`lumpStateGraph` gives the same network on its own). The physical view is the same
-either way, and keeps its layout across the toggle; the state view keeps a layout per form. While lumped, a
+either way, and keeps its layout across the toggle. The state view keeps its picture: the other form starts where the
+current one's nodes are (each lump at its state nodes' centroid, or a lump's state nodes around it), and a warm
+layout settles it. While lumped, a
 state-level hit's id is a lump's: `net.lumped` maps it to its physical node and its state nodes, and back.
 
 The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
