@@ -311,7 +311,8 @@ function lumpRecords(leafOf: readonly string[], size: (lump: number) => number):
     else byLeaf.set(leaf, [l]);
   }
   // The branch numbers each module's sub-modules take (#533): a ragged module (sub-modules and leaves side by side)
-  // ranks its lumps after them, so a lump's path never names a sub-module too.
+  // ranks its lumps after them, so a lump's path never names a sub-module too. Infomap never writes one, but a
+  // hierarchy from another source can (`data()` accepts it, #199).
   const taken = new Map<string, Set<number>>();
   for (const leaf of byLeaf.keys()) {
     const parts = leaf === "" ? [] : leaf.split(":");
