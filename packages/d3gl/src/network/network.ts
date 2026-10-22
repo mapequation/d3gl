@@ -864,6 +864,9 @@ interface ViewLayout {
    *  layout is. Null until its views are first left. The physical and both views share it, as they share the
    *  positions it frames. */
   camera: ViewTransform | null;
+  /** Its positions were carried over from the other state level by a lump toggle (#529): its next run settles them
+   *  where they are and keeps the camera, whatever the app's `fit`. */
+  carried: boolean;
 }
 
 /** Which layout a state-network view draws (#495): the physical and both views share the physical one. */
@@ -894,7 +897,7 @@ function newStateLevel(data: StateNetworkGraph, modules: ArrayLike<ModulePathNod
 
 /** A state-network layout that has not run yet (#495). */
 function newViewLayout(graph: NetworkGraph, hierarchy: Hierarchy | null): ViewLayout {
-  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null, camera: null };
+  return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null, camera: null, carried: false };
 }
 
 /** `opts` continued from where the nodes are (#495): a warm flat or nested start, for a view laid out on first show
@@ -1704,6 +1707,7 @@ export class Network extends BaseEngine {
       layout.resume = null;
       layout.nestedDiscs = null;
       layout.placed = true;
+      layout.carried = true;
       layout.camera = view === "state" ? null : left.camera; // the state view's camera carries over too
     }
     this.otherLevel = { data: sg, modules: this.stateModules, layout: left, both };
@@ -1868,7 +1872,10 @@ export class Network extends BaseEngine {
       // An interrupted run goes on at the heat it had reached, over the ticks it had left (a flat streaming run).
       this.layoutResume = layout.interrupted ? layout.resume : null;
       layout.resume = null;
-      this.runLayout(layout.placed ? warmLayout(last) : last); // rebuilds
+      const opts = layout.placed ? warmLayout(last) : last;
+      // A lump toggle's picture, carried over (#529): settled where it is, the camera where the user left it.
+      this.runLayout(layout.carried ? { ...opts, fit: false } : opts); // rebuilds
+      layout.carried = false;
       this.layoutResume = null;
       return;
     }

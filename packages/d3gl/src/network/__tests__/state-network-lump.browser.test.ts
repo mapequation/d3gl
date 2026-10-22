@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { network, type Network, type NetworkHit } from "../network.js";
+import { network, Network, type NetworkHit } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
 import type { ModulePathNode } from "../module-colors.js";
 import type { HoverHit } from "../../map/base-engine.js";
@@ -71,6 +71,13 @@ const drawn = (net: Network): number => (net.positions?.length ?? 0) / 2;
 const dots = (svg: string): number => [...svg.matchAll(/<circle([^>]*)>/g)].filter((m) => !(Number(/\bstroke-width="([^"]+)"/.exec(m[1] ?? "")?.[1] ?? 0) > 0)).length;
 const ids = (hits: readonly HoverHit[]): number[] => hits.map((h) => h.id as number).sort((a, b) => a - b);
 const last = <T,>(xs: readonly T[]): T | undefined => xs[xs.length - 1];
+
+/** Reads the camera, which the engine keeps to itself. */
+class CameraProbe extends Network {
+  get camera(): { k: number; x: number; y: number } {
+    return { ...this.transform };
+  }
+}
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -155,6 +162,33 @@ describe("lumped state networks (#529)", () => {
     // Not the state nodes' earlier layout restored: a picture carried from the lumps, settled again.
     expect(Array.from(back)).not.toEqual(Array.from(states));
     expect(Math.hypot(back[6]! - lumps[8]!, back[7]! - lumps[9]!)).toBeLessThan(60);
+    net.destroy();
+  });
+
+  it("a toggle keeps the camera where the user left it, in the state view and when it is next shown, under fit", async () => {
+    const { graph, modules } = fixture();
+    const net = new CameraProbe(host(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    net.enableZoom();
+    net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "force", iterations: 40, fit: true });
+    await net.whenSettled();
+    const zoomed = { k: 3, x: -120, y: 40 };
+    net.setTransform(zoomed);
+    net.lump(true);
+    await net.whenSettled();
+    expect(net.camera, "lumping reframed the zoomed-in state view").toEqual(zoomed);
+    net.lump(false);
+    await net.whenSettled();
+    expect(net.camera, "unlumping reframed the zoomed-in state view").toEqual(zoomed);
+    // Toggled in the both view: it keeps its camera, and the state view comes back at its own.
+    net.view("both");
+    const both = { k: 2, x: 10, y: 10 };
+    net.setTransform(both);
+    net.lump(true);
+    expect(net.camera, "the both view moved its camera").toEqual(both);
+    net.view("state");
+    await net.whenSettled();
+    expect(net.camera, "the state view did not come back at its camera").toEqual(zoomed);
     net.destroy();
   });
 
