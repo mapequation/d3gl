@@ -31,7 +31,9 @@ const palette = (path: readonly number[]): string | undefined =>
  * **Colours** — with no palette, the engine colours modules itself; `style({ moduleColor })` takes your own
  * (a colour per module path) for state nodes, pie wedges and physical nodes in every view, and the
  * pie wedges keep it when `nodeFill` colours the nodes by a metric. **Modules: Off** loads the raw state
- * network (no Infomap yet): the views still switch, without pies.
+ * network (no Infomap yet): the views still switch, without pies. **Lump: On** (`stateNetwork(…, { lump })`,
+ * `net.lump(on)`) draws each physical node's state nodes in one leaf module as one node in the State and Both
+ * views, as the map equation codes them; `net.lumped` maps a lump to its physical node and state nodes.
  * A view switch carries the selection over (a physical node ↔ its state nodes), and every hit, selection
  * and label names its `level` ("physical" or "state"), so the tooltip and labels below need no id mapping.
  *
@@ -47,6 +49,11 @@ const palette = (path: readonly number[]): string | undefined =>
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
+  // A state-level id names a state node, or while lumped a lump: its physical node's name.
+  const stateName = (g: SyntheticStateNetwork, id: number): string | null => {
+    const lumped = net.lumped;
+    return lumped ? (g.physicalNames[lumped.graph.stateToPhysical[id] ?? -1] ?? null) : (g.stateNames[id] ?? null);
+  };
   net.enableZoom([0.05, 60]);
 
   let data: SyntheticStateNetwork | null = null;
@@ -65,7 +72,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     tooltip: (datum, id) => {
       if (!data) return null;
       const hit = datum as NetworkHit;
-      if (hit.level === "state") return data.stateNames[id as number] ?? null;
+      if (hit.level === "state") return stateName(data, id as number);
       const p = hit.physical ?? (id as number); // a physical node, in the physical or the both view
       if (net.stateView === "physical" && wedges) {
         const flow = data.graph.physical.flow?.[p] ?? 0;
@@ -93,6 +100,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const backend = options.backend === "GPU" ? "gpu" : options.backend === "Worker" ? "worker" : "force";
       const withModules = options.modules !== "Off";
       const nested = withModules && options.stateLayout === "Nested";
+      const lump = withModules && options.lump === "On";
       const dataChanged = !data || builtN !== n;
       // Backend and Modules also re-load the network and re-lay it out.
       const layoutChanged = dataChanged || builtBackend !== backend || builtModules !== withModules;
@@ -124,12 +132,12 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       if (layoutChanged) {
         // fit: true (#238, #427) frames the layout with the camera: as it converges on worker/gpu, once as
         // it lands on force. Opens framed, no top-left flash.
-        net.stateNetwork(g.graph, { modules: withModules ? g.stateModules : undefined, view }).layout({ backend, fit: true, nested });
+        net.stateNetwork(g.graph, { modules: withModules ? g.stateModules : undefined, view, lump }).layout({ backend, fit: true, nested });
         builtBackend = backend;
         builtModules = withModules;
         builtNested = nested;
       } else {
-        net.view(view); // each view keeps its layout; one never shown is laid out now
+        net.lump(lump).view(view); // each view, and each lumping, keeps its layout; one never shown is laid out now
         // The state layout changed: lay out the state view again (the physical graph has no modules to nest).
         if (nested !== builtNested && view === "state") net.layout({ backend, fit: true, nested });
         if (view === "state") builtNested = nested;
@@ -169,7 +177,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
               style: { textShadow: "0 0 3px #fff, 0 0 3px #fff" },
               max: Number.isFinite(cap) ? cap : undefined,
               // `info.level` names the id's graph: no per-view id mapping in the app.
-              labelOf: (id, info) => (info.level === "physical" ? (physOn ? g.physicalNames[id] ?? null : null) : stateOn ? g.stateNames[id] ?? null : null),
+              labelOf: (id, info) => (info.level === "physical" ? (physOn ? g.physicalNames[id] ?? null : null) : stateOn ? stateName(g, id) : null),
               physical: view === "both" && physOn ? { labelOf: (p) => g.physicalNames[p] ?? null } : undefined,
             }
           : false,

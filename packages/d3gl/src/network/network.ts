@@ -15,7 +15,7 @@ import { dominantWedges, physicalPieWedges, type PhysicalPieWedges, type PieWedg
 import { rosettePositions } from "./rosette.js";
 import { packStateNodes, pickBothNodes, regionBothNodes, instanceRuns, type BothStateNodes } from "./both-layout.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
-import type { StateNetworkGraph } from "./state-graph.js";
+import { lumpStateGraph, type LumpedStateNetwork, type StateNetworkGraph } from "./state-graph.js";
 import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type LayoutContinuation, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
@@ -768,6 +768,12 @@ export interface StateNetworkOptions {
   color?: ModuleColorOptions;
   /** Which view to show first. Default `"physical"` (so the overlapping-module pie glyphs are visible). */
   view?: "state" | "physical" | "both";
+  /**
+   * Lump each physical node's state nodes in one leaf module into one node in the state and both views (#529), as
+   * the map equation codes them. The physical view is the same either way. Toggle it with {@link Network.lump}.
+   * Default false. Ignored without `modules`. @see {@link lumpStateGraph}
+   */
+  lump?: boolean;
   /** Radius (world units) of the rosette of state nodes around their physical node that the state view's
    *  layout starts from when the state view is first shown after the physical layout (#495). Default: auto —
    *  a third of the physical layout's spacing. (The `"both"` view's rosette fills its containers instead.)
@@ -863,6 +869,26 @@ interface ViewLayout {
 /** Which layout a state-network view draws (#495): the physical and both views share the physical one. */
 function layoutFamily(view: "state" | "physical" | "both"): "state" | "physical" {
   return view === "state" ? "state" : "physical";
+}
+
+/**
+ * A state network's state level in one of its two forms (#529): its state nodes as given, or lumped. The state and
+ * both views draw the active one, held in the engine's fields; the other is parked here with its own layout.
+ */
+interface StateLevel {
+  readonly data: StateNetworkGraph;
+  readonly modules: ArrayLike<ModulePathNode> | null;
+  /** The state view's layout of this level. */
+  readonly layout: ViewLayout;
+  /** The both view's graph of this level ({@link Network.bothGraph}). */
+  readonly both: NetworkGraph;
+}
+
+/** The {@link StateLevel} of `data`, with no layout run yet; `recordOf` is `modules`' record index, when known. */
+function newStateLevel(data: StateNetworkGraph, modules: ArrayLike<ModulePathNode> | null, recordOf = modules ? moduleRecordIndex(data.state.nodeCount, modules) : null): StateLevel {
+  const hierarchy = modules && recordOf ? { modules, moduleLinks: undefined, recordOf } : null;
+  // The both view draws the state graph at positions of its own: each state node at its place in its container.
+  return { data, modules, layout: newViewLayout(data.state, hierarchy), both: { ...data.state, positions: new Float32Array(2 * data.state.nodeCount) } };
 }
 
 /** A state-network layout that has not run yet (#495). */
@@ -1330,6 +1356,14 @@ export class Network extends BaseEngine {
   /** State-network mode (#171): the ingested state network, or null for a plain graph. When set, the
    *  engine renders one of its three views ({@link activeView}), each with the layout it draws ({@link viewLayouts}). */
   private stateData: StateNetworkGraph | null = null;
+  /** The state network as given to {@link stateNetwork}, with its modules (#529): what {@link lump} lumps. */
+  private stateSource: { graph: StateNetworkGraph; modules: ArrayLike<ModulePathNode> | null } | null = null;
+  /** The lumped network (#529), built the first time it is drawn and kept for the state network. */
+  private lumpedNet: LumpedStateNetwork | null = null;
+  /** Whether the state and both views draw {@link lumpedNet} (#529). */
+  private lumpActive = false;
+  /** The state level not drawn now (#529), parked with its layout: null until lumping is first toggled. */
+  private otherLevel: StateLevel | null = null;
   /** The state network's two layouts (#495): the physical graph's (the physical and both views) and the state
    *  view's own. The active one's state is in the engine's fields; the other's is parked here. */
   private viewLayouts: { physical: ViewLayout; state: ViewLayout } | null = null;
@@ -1449,6 +1483,10 @@ export class Network extends BaseEngine {
     this.bothBaked = null;
     this.lastStateLayout = null;
     this.stateData = null;
+    this.stateSource = null;
+    this.lumpedNet = null;
+    this.lumpActive = false;
+    this.otherLevel = null;
     this.pieWedges = null;
     this.stateModules = null;
     this.stateNodeModules = null;
@@ -1551,7 +1589,12 @@ export class Network extends BaseEngine {
     // Interaction state belongs to the previous network's ids: drop it before the new graph draws.
     if (this.stateData) this.dropNodeInteraction();
     this.clearStateNetwork();
-    this.stateData = graph;
+    this.stateSource = { graph, modules: opts.modules ?? null };
+    // Lumped (#529): the state and both views draw the lumps; the physical view, its pies included, is the same.
+    this.lumpedNet = opts.lump && opts.modules ? lumpStateGraph(graph, opts.modules) : null;
+    this.lumpActive = this.lumpedNet !== null;
+    const level = this.lumpedNet ? newStateLevel(this.lumpedNet.graph, this.lumpedNet.modules) : newStateLevel(graph, opts.modules ?? null, recordOf);
+    this.stateData = level.data;
     this.activeView = opts.view ?? "physical";
     this.rosetteRadius = opts.rosetteRadius ?? null;
     // The app's LOD request holds (#495), as data() keeps it; an explicit `modules` alias in it was keyed to the
@@ -1561,13 +1604,12 @@ export class Network extends BaseEngine {
     this.lodOptions = null;
     this.hierarchy = null;
     // Without modules (#494): no pies and no module colours; every view still draws.
-    this.stateModules = opts.modules ?? null;
+    this.stateModules = level.modules;
     this.stateColorOpts = opts.color;
+    // The pies from the state nodes as given: lumped or not, each wedge's share is the same.
     this.pieWedges = opts.modules ? physicalPieWedges(graph, opts.modules, opts.pie) : null;
-    const hierarchy = opts.modules && recordOf ? { modules: opts.modules, moduleLinks: undefined, recordOf } : null;
-    this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: newViewLayout(graph.state, hierarchy) };
-    // The both view draws the state graph at positions of its own: each state node at its place in its container.
-    this.bothGraph = { ...graph.state, positions: new Float32Array(2 * graph.state.nodeCount) };
+    this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: level.layout };
+    this.bothGraph = level.both;
     // Packed when the both view is first shown ({@link syncBoth}), and again on a style change of its radii (#509).
     this.bothPack = null;
     this.bothBaked = null;
@@ -1602,6 +1644,103 @@ export class Network extends BaseEngine {
     this.applyView(from);
     if (mapped) this.select(this.NODE_LAYER, mapped.length > 0 ? mapped : null);
     return this;
+  }
+
+  /**
+   * Lump the state network's state nodes (#529), or draw them as given: with `on`, the state and both views draw one
+   * node per (leaf module, physical node), as the map equation codes them ({@link lumpStateGraph}). The physical
+   * view, its layout and its pies are the same either way. No-op without a {@link stateNetwork} with modules.
+   *
+   * Each form keeps a state-view layout of its own, as each view does (#495): the first lumped one starts from its
+   * state nodes' centroids once the state view has been laid out, else from a rosette around the physical nodes, as
+   * the state view's first layout does. The selection follows the toggle (a state node becomes its lump, a lump its
+   * state nodes, a container stays), and `on("select")` hears it; the hover is cleared. The state and both views'
+   * hits carry lump ids while lumped: {@link lumped} maps them to state nodes. O(state nodes + state links) the
+   * first time, O(nodes) after.
+   */
+  lump(on: boolean): this {
+    const source = this.stateSource;
+    const layouts = this.viewLayouts;
+    const sg = this.stateData;
+    const both = this.bothGraph;
+    if (!source?.modules || !layouts || !sg || !both || on === this.lumpActive) return this;
+    const lumped = (this.lumpedNet ??= lumpStateGraph(source.graph, source.modules));
+    const next = this.otherLevel ?? (on ? newStateLevel(lumped.graph, lumped.modules) : newStateLevel(source.graph, source.modules));
+    const view = this.activeView;
+    const statesShown = view !== "physical";
+    const sel = statesShown ? this.selectedIds(this.NODE_LAYER) : null;
+    const mapped = sel && sel.size > 0 ? this.mapLumpSelection(sel, on) : null;
+    if (statesShown) this.dropNodeInteraction();
+    const left = layouts.state;
+    if (on && !next.layout.placed && left.placed) {
+      // Each lump where its state nodes are: at their centroid.
+      const from = left.graph.positions;
+      const to = next.layout.graph.positions;
+      const { offsets, states } = lumped.lumpToState;
+      for (let l = 0; l + 1 < offsets.length; l++) {
+        const start = offsets[l]!, end = offsets[l + 1]!;
+        let x = 0, y = 0;
+        for (let i = start; i < end; i++) { const st = states[i]!; x += from[2 * st]!; y += from[2 * st + 1]!; }
+        to[2 * l] = x / (end - start);
+        to[2 * l + 1] = y / (end - start);
+      }
+      next.layout.placed = true;
+    }
+    this.otherLevel = { data: sg, modules: this.stateModules, layout: left, both };
+    this.stateData = next.data;
+    this.stateModules = next.modules;
+    layouts.state = next.layout;
+    this.bothGraph = next.both;
+    this.lumpActive = on;
+    // Derived from the level drawn: rebuilt as they are next needed.
+    this.bothPack = null;
+    this.bothBaked = null;
+    this.pendingOffsetChanges = null;
+    this.containerRadii = null;
+    this.containerColumns = null;
+    this.containerSelected = null;
+    this.bothNodeGroups2 = null;
+    this.stateNodeModules = null;
+    this.stateFills = null;
+    if (!statesShown) return this; // the physical view draws the same
+    this.applyView(view, view === "state" ? left : layouts.physical);
+    if (mapped) this.select(this.NODE_LAYER, mapped.length > 0 ? mapped : null);
+    return this;
+  }
+
+  /** The lumped network the state and both views draw while lumped (#529, {@link lump}): their hits' ids are its
+   *  lump ids, which its `lumpToState` maps to state nodes and `stateToLump` back. Null while they draw the state
+   *  nodes as given, and without a state network. */
+  get lumped(): LumpedStateNetwork | null {
+    return this.lumpActive ? this.lumpedNet : null;
+  }
+
+  /**
+   * The selection `sel` of the state or both view in the ids of the other state level (#529): a state node → its
+   * lump, a lump → its state nodes, a both-view container (`stateCount + p`) → the same physical node's, a state-view
+   * LOD aggregate → its leaves first. O(selected + their state nodes), on a toggle only.
+   */
+  private mapLumpSelection(sel: ReadonlySet<string | number>, toLumped: boolean): number[] {
+    const sg = this.stateData;
+    const lumped = this.lumpedNet;
+    if (!sg || !lumped) return [];
+    const S = sg.state.nodeCount;
+    const nextS = toLumped ? lumped.graph.state.nodeCount : lumped.stateToLump.length;
+    const { offsets, states } = lumped.lumpToState;
+    const tree = this.activeView === "state" && this.lodReady() ? this.lodTree : null;
+    const out = new Set<number>();
+    const add = (id: number): void => {
+      if (toLumped) out.add(lumped.stateToLump[id]!);
+      else for (let i = offsets[id]!; i < offsets[id + 1]!; i++) out.add(states[i]!);
+    };
+    for (const raw of sel) {
+      const id = Number(raw);
+      if (!(id >= 0)) continue;
+      if (id < S) add(id);
+      else if (this.activeView === "both" && id < S + sg.physicalCount) out.add(nextS + id - S);
+      else if (tree && id < tree.size) for (const s of leavesUnder(tree, id)) add(s);
+    }
+    return [...out];
   }
 
   /** Drop the node layer's selection, hover and tooltip without re-announcing anything (#494): their ids
@@ -1673,19 +1812,20 @@ export class Network extends BaseEngine {
    * never placed starts from the other view's ({@link seedView}); one never laid out, or whose run a switch
    * stopped, is laid out with the app's last options. `from` is null for a new state network. One rebuild.
    */
-  private applyView(from: Network["activeView"] | null): void {
+  private applyView(from: Network["activeView"] | null, left: ViewLayout | null = from === null ? null : (this.viewLayouts?.[layoutFamily(from)] ?? null)): void {
     const sg = this.stateData;
     const layouts = this.viewLayouts;
     const both = this.bothGraph;
     if (!sg || !layouts || !both) return;
     const to = this.activeView;
     const layout = layouts[layoutFamily(to)];
-    const switching = from === null || layoutFamily(from) !== layoutFamily(to);
+    // The layout drawn changes: a switch to the other view family, or a lump toggle in the state view (#529), whose
+    // `left` is the other level's layout.
+    const switching = from === null || (left !== null && left !== layout);
     this.stopDragLoop?.(); // a drag still re-cooling belongs to the view being left
     this.dragReapply = null;
     if (from === null) this.haltLayout(); // whatever ran belongs to the previous network
-    else if (switching) {
-      const left = layouts[layoutFamily(from)];
+    else if (switching && left) {
       left.camera = { ...this.latestTransform() }; // its views' camera, for when they are shown again
       this.parkLayout(left);
     }
@@ -1755,7 +1895,7 @@ export class Network extends BaseEngine {
   private stopParkedLayouts(): void {
     const layouts = this.viewLayouts;
     if (!layouts) return;
-    for (const layout of [layouts.physical, layouts.state]) {
+    for (const layout of [layouts.physical, layouts.state, ...(this.otherLevel ? [this.otherLevel.layout] : [])]) {
       layout.handle?.stop();
       layout.handle = null;
       layout.interrupted = false;
@@ -6070,6 +6210,7 @@ export class Network extends BaseEngine {
     // A state network's parked layout (#495) runs on the same device: it moves too, and stays idle for a drag.
     const layouts = this.viewLayouts;
     if (layouts) for (const layout of [layouts.physical, layouts.state]) layout.handle?.moveDevice?.(device());
+    this.otherLevel?.layout.handle?.moveDevice?.(device()); // the other state level's (#529)
   }
 
   /** Re-push instanced layers after a backend swap (the first install doesn't fire this). */
