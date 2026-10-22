@@ -41,8 +41,8 @@ export type { ModulePathNode, ModuleColorOptions } from "./module-colors.js";
 export { buildGraph, buildCSR } from "./graph.js";
 export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";
 
-export { buildStateGraph } from "./state-graph.js";
-export type { BuildStateGraphInput, StateNetworkGraph, PhysicalToState } from "./state-graph.js";
+export { buildStateGraph, lumpStateGraph } from "./state-graph.js";
+export type { BuildStateGraphInput, StateNetworkGraph, PhysicalToState, LumpedStateNetwork } from "./state-graph.js";
 
 export { rosettePositions } from "./rosette.js";
 export type { RosetteOptions } from "./rosette.js";

@@ -942,6 +942,16 @@ links all follow your `sizeMode`. Call `lod()` once: it holds across view switch
 to the state view; the physical view draws in full, every pie with it, until pies are LOD-aware. Under a
 module palette a collapsed module takes its own colour from it.
 
+**Lumped state nodes.** The map equation codes the state nodes of one physical node in one leaf module with one
+codeword: within that module they are one node. `stateNetwork(graph, { modules, lump: true })`, or `net.lump(on)`
+at any time, draws the state and both views that way, one node per (leaf module, physical node), its flow and links
+the sums of its state nodes' (`lumpStateGraph` gives the same network on its own). Without `modules` every state
+node is in the root module, so each physical node's state nodes are one node. The physical view is the same
+either way, and keeps its layout across the toggle. The state view keeps its picture: the other form starts where the
+current one's nodes are (each lump at its state nodes' centroid, or a lump's state nodes around it), and a warm
+layout settles it. While lumped, a
+state-level hit's id is a lump's: `net.lumped` maps it to its physical node and its state nodes, and back.
+
 The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
 of a disc — no wedge texture, no per-fragment loop), so a physical view with many overlapping nodes draws
 as efficiently as the circle lane and updates in place on pan/zoom. On Canvas/SVG the same wedges trace as
