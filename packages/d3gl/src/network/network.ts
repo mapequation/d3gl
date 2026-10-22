@@ -766,6 +766,17 @@ export interface StateNetworkOptions {
    *  colours (every view) and the physical view's overlapping-module pie wedges. Optional (#494): a raw
    *  state network (before Infomap) still switches views, with no pies and the plain node fill. */
   modules?: ArrayLike<ModulePathNode>;
+  /**
+   * **Module-level links** of the state-node module hierarchy {@link modules} (#533), addressed by path, as
+   * `data(graph, { modules, moduleLinks })` takes them ({@link NetworkDataOptions.moduleLinks}): an Infomap state
+   * `.ftree` stores its leaf links only inside bottom modules and every coarser link once, in its `*Links` sections.
+   * The **state view** draws exactly these links between its modules, and its layouts pull along them, as for a plain
+   * network. The physical and both views have none: their modules overlap, so a module link has no single physical
+   * endpoint there. Lumped ({@link lump}), a module endpoint keeps its path and a leaf endpoint, a state node, becomes
+   * the lump that holds it. Requires `modules`; `stateNetwork()` checks up front that every endpoint is a module or
+   * leaf of that hierarchy and throws otherwise. @see {@link ModuleLink}
+   */
+  moduleLinks?: ArrayLike<ModuleLink>;
   /** Pie-wedge derivation options (grouping level, flow vs count sizing). @see {@link physicalPieWedges} */
   pie?: PieWedgeOptions;
   /** The engine's own module colour scheme (shared by node colours and pie wedges), used while the style
@@ -895,9 +906,15 @@ interface StateLevel {
   readonly both: NetworkGraph;
 }
 
-/** The {@link StateLevel} of `data`, with no layout run yet; `recordOf` is `modules`' record index, when known. */
-function newStateLevel(data: StateNetworkGraph, modules: ArrayLike<ModulePathNode> | null, recordOf = modules ? moduleRecordIndex(data.state.nodeCount, modules) : null): StateLevel {
-  const hierarchy = modules && recordOf ? { modules, moduleLinks: undefined, recordOf } : null;
+/** The {@link StateLevel} of `data`, with no layout run yet; `moduleLinks` are its state view's module links (#533),
+ *  `recordOf` is `modules`' record index, when known. */
+function newStateLevel(
+  data: StateNetworkGraph,
+  modules: ArrayLike<ModulePathNode> | null,
+  moduleLinks: ArrayLike<ModuleLink> | null,
+  recordOf = modules ? moduleRecordIndex(data.state.nodeCount, modules) : null,
+): StateLevel {
+  const hierarchy = modules && recordOf ? { modules, moduleLinks: moduleLinks ?? undefined, recordOf } : null;
   // The both view draws the state graph at positions of its own: each state node at its place in its container.
   return { data, modules, layout: newViewLayout(data.state, hierarchy), both: { ...data.state, positions: new Float32Array(2 * data.state.nodeCount) } };
 }
@@ -1371,8 +1388,9 @@ export class Network extends BaseEngine {
   /** State-network mode (#171): the ingested state network, or null for a plain graph. When set, the
    *  engine renders one of its three views ({@link activeView}), each with the layout it draws ({@link viewLayouts}). */
   private stateData: StateNetworkGraph | null = null;
-  /** The state network as given to {@link stateNetwork}, with its modules (#529): what {@link lump} lumps. */
-  private stateSource: { graph: StateNetworkGraph; modules: ArrayLike<ModulePathNode> | null } | null = null;
+  /** The state network as given to {@link stateNetwork}, with its modules and module links (#529, #533): what
+   *  {@link lump} lumps. */
+  private stateSource: { graph: StateNetworkGraph; modules: ArrayLike<ModulePathNode> | null; moduleLinks: ArrayLike<ModuleLink> | null } | null = null;
   /** The lumped network (#529), built the first time it is drawn and kept for the state network. */
   private lumpedNet: LumpedStateNetwork | null = null;
   /** Whether the state and both views draw {@link lumpedNet} (#529). */
@@ -1595,20 +1613,26 @@ export class Network extends BaseEngine {
    * container radii are derived once here.
    *
    * `modules` are checked against the state graph here, as `data()` checks its hierarchy: a record for every
-   * state node, exactly once, or this throws with the engine unchanged. The app's {@link lod} request holds
+   * state node, exactly once, and every `moduleLinks` endpoint a module or leaf of it (#533), or this throws with
+   * the engine unchanged. The app's {@link lod} request holds
    * (`data()` keeps it too); an explicit `modules` in it named the previous network's, so the new network's own
    * modules take its place.
    */
   stateNetwork(graph: StateNetworkGraph, opts: StateNetworkOptions = {}): this {
-    const recordOf = opts.modules ? moduleRecordIndex(graph.state.nodeCount, opts.modules) : null;
+    const { modules, moduleLinks } = opts;
+    if (moduleLinks && !modules) throw new Error("network.stateNetwork: moduleLinks requires modules");
+    const recordOf = modules ? moduleRecordIndex(graph.state.nodeCount, modules) : null;
+    if (modules && moduleLinks) checkModuleLinks(graph.state.nodeCount, modules, moduleLinks);
     // Interaction state belongs to the previous network's ids: drop it before the new graph draws.
     if (this.stateData) this.dropNodeInteraction();
     this.clearStateNetwork();
-    this.stateSource = { graph, modules: opts.modules ?? null };
+    this.stateSource = { graph, modules: modules ?? null, moduleLinks: moduleLinks ?? null };
     // Lumped (#529): the state and both views draw the lumps; the physical view, its pies included, is the same.
-    this.lumpedNet = opts.lump ? lumpStateGraph(graph, opts.modules) : null;
+    this.lumpedNet = opts.lump ? lumpStateGraph(graph, modules, moduleLinks) : null;
     this.lumpActive = this.lumpedNet !== null;
-    const level = this.lumpedNet ? newStateLevel(this.lumpedNet.graph, this.lumpedNet.modules) : newStateLevel(graph, opts.modules ?? null, recordOf);
+    const level = this.lumpedNet
+      ? newStateLevel(this.lumpedNet.graph, this.lumpedNet.modules, this.lumpedNet.moduleLinks)
+      : newStateLevel(graph, modules ?? null, moduleLinks ?? null, recordOf);
     this.stateData = level.data;
     this.activeView = opts.view ?? "physical";
     this.rosetteRadius = opts.rosetteRadius ?? null;
@@ -1682,8 +1706,8 @@ export class Network extends BaseEngine {
     const sg = this.stateData;
     const both = this.bothGraph;
     if (!source || !layouts || !sg || !both || on === this.lumpActive) return this;
-    const lumped = (this.lumpedNet ??= lumpStateGraph(source.graph, source.modules));
-    const next = this.otherLevel ?? (on ? newStateLevel(lumped.graph, lumped.modules) : newStateLevel(source.graph, source.modules));
+    const lumped = (this.lumpedNet ??= lumpStateGraph(source.graph, source.modules, source.moduleLinks));
+    const next = this.otherLevel ?? (on ? newStateLevel(lumped.graph, lumped.modules, lumped.moduleLinks) : newStateLevel(source.graph, source.modules, source.moduleLinks));
     const view = this.activeView;
     const statesShown = view !== "physical";
     const sel = statesShown ? this.selectedIds(this.NODE_LAYER) : null;

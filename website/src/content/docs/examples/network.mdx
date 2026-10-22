@@ -955,6 +955,14 @@ current one's nodes are (each lump at its state nodes' centroid, or a lump's sta
 layout settles it. While lumped, a
 state-level hit's id is a lump's: `net.lumped` maps it to its physical node and its state nodes, and back.
 
+**Module links.** An Infomap state `.ftree` stores its leaf links only inside bottom modules and every coarser link
+once, in its `*Links` sections. Pass those as `stateNetwork(graph, { modules, moduleLinks })`, addressed by path in
+the state-node modules, as for a [plain network's module links](#a-directed-map-of-modules): the **state** view draws
+exactly them between its modules, and its layouts pull along them. Lumped, a module link keeps its module endpoints,
+and a leaf endpoint becomes the lump that holds that state node. The physical and both views have no module links:
+their modules overlap, so a module link has no single physical endpoint there. `moduleLinks` requires `modules`, and
+`stateNetwork()` throws on an endpoint outside the hierarchy.
+
 The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
 of a disc — no wedge texture, no per-fragment loop), so a physical view with many overlapping nodes draws
 as efficiently as the circle lane and updates in place on pan/zoom. On Canvas/SVG the same wedges trace as
