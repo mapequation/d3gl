@@ -1700,6 +1700,15 @@ export class Network extends BaseEngine {
         const L = lumped.graph.state.nodeCount;
         const around: StateNetworkGraph = { state: next.data.state, physical: left.graph, stateToPhysical: lumped.stateToLump, physicalToState: lumped.lumpToState, physicalCount: L };
         to.set(rosettePositions(around, { radius: this.rosetteRadius ?? 0.33 * physicalSpacing(from, L) }));
+        // Each lump's rosette moved so its centroid is where the lump was: lumping puts a lump at its state nodes'
+        // centroid, so a toggle off and on puts every lump back (a rosette's own centroid is off its centre).
+        for (let l = 0; l < L; l++) {
+          const start = offsets[l]!, end = offsets[l + 1]!;
+          let x = 0, y = 0;
+          for (let i = start; i < end; i++) { const st = states[i]!; x += to[2 * st]!; y += to[2 * st + 1]!; }
+          const dx = from[2 * l]! - x / (end - start), dy = from[2 * l + 1]! - y / (end - start);
+          for (let i = start; i < end; i++) { const st = states[i]!; to[2 * st] = to[2 * st]! + dx; to[2 * st + 1] = to[2 * st + 1]! + dy; }
+        }
       }
       const layout = next.layout;
       layout.handle?.stop();

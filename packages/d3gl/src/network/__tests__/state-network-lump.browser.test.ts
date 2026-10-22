@@ -139,6 +139,15 @@ describe("lumped state networks (#529)", () => {
     const spread = Math.hypot(back[0]! - back[2]!, back[1]! - back[3]!);
     expect(spread, "lump 0's two state nodes unfold").toBeGreaterThan(0);
     for (const s of [0, 1]) expect(Math.hypot(back[2 * s]! - lumps[0]!, back[2 * s + 1]! - lumps[1]!)).toBeLessThan(100);
+    // Centred on their lump: toggled on again, every lump is back where it was, however many times (no drift).
+    expect((back[0]! + back[2]!) / 2, "lump 0's state nodes' centroid").toBeCloseTo(lumps[0]!, 4);
+    expect((back[1]! + back[3]!) / 2).toBeCloseTo(lumps[1]!, 4);
+    for (let round = 0; round < 3; round++) {
+      net.lump(true);
+      const again = net.positions ?? new Float32Array(0);
+      for (let i = 0; i < 2 * L; i++) expect(again[i], `round ${round}, coordinate ${i}`).toBeCloseTo(lumps[i]!, 3);
+      net.lump(false);
+    }
     net.destroy();
   });
 
