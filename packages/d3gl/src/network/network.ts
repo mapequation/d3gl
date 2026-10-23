@@ -612,11 +612,17 @@ export interface NetworkLODOptions {
   maxAggregateRadius?: number;
   /**
    * Thin overlapping frontier glyphs in screen space, keeping the most important (by strength) and
-   * dropping those covered by a kept glyph — so dense regions stay readable instead of a solid mass.
-   * Zoom-dependent (more resolve as you zoom in). Default `true`.
+   * hiding a glyph whose centre is within `declutterSpacing·(rᵢ + rⱼ)` of a kept glyph — so dense
+   * regions stay readable instead of a solid mass. Zoom-dependent (more resolve as you zoom in).
+   * Default `true`; `false` hides nothing.
    */
   declutter?: boolean;
-  /** Spacing multiplier for {@link declutter} (>1 sparser, <1 denser). Default 2. */
+  /**
+   * Spacing multiplier for {@link declutter}: a glyph is hidden when its centre is within
+   * `declutterSpacing·(rᵢ + rⱼ)` of a kept glyph. Default 2: kept glyphs keep a gap around them, so
+   * the links between them stay visible. The cost: in a small graph a whole non-overlapping module
+   * aggregate can be hidden (#512). 1 hides only real overlaps; <1 lets glyphs overlap partly.
+   */
   declutterSpacing?: number;
   /**
    * Mark **aggregate** glyphs (collapsed modules/subtrees, not leaves) with a thin outline **ring** set

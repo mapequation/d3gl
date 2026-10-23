@@ -984,3 +984,20 @@ rules when extending it:
 Bordered nodes are deliberately kept out of that diff (the ring-vs-stacked-discs divergence above);
 fold them in when #269 converges the two encodings.
 
+
+## LOD declutter can hide a non-overlapping module aggregate in a small graph, by design (#512)
+
+**Rule.** LOD declutter (`declutterFrontier` → `declutterScreen`, shared by WebGL, Canvas and SVG) hides a
+frontier glyph when its centre lies within `spacing·(rᵢ + rⱼ)` of a kept glyph. The default
+`declutterSpacing` is **2**, so kept glyphs keep a gap around them and the links between them stay visible.
+`declutterSpacing: 1` hides only real overlaps; `declutter: false` hides nothing.
+
+**Cost.** In a small graph a whole module aggregate that overlaps nothing can be hidden. The #512 case: a
+4-node graph with two modules, each collapsed to one aggregate (radius `sqrt(Σ r²)` = r·√2); one aggregate
+is hidden from `nodeRadius` ≈ 8.7 up although the two are ≈ 15 px apart at r = 12. This was kept on purpose
+(the default stays 2).
+
+**Consequence for tests.** A test that needs every LOD glyph drawn sets `declutter: false` (or
+`declutterSpacing: 1`) explicitly rather than picking a radius small enough to dodge the exclusion
+(`network-node-border-shade.browser.test.ts`). A perf-guard reference implementation that mirrors
+`declutterFrontier` must mirror the default too (`frontier-perf.test.ts`).
