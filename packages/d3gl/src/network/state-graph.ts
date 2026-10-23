@@ -8,8 +8,9 @@
  *
  * `buildStateGraph` mirrors {@link buildGraph}: the **state-level** graph is a full {@link NetworkGraph}
  * (nodes = state nodes, edges = state edges), and the **physical-level** graph is derived by aggregating
- * state edges across physical boundaries (directed, flow-summed) — the same super-edge aggregation the
- * LOD path already does, applied at the physical boundary. Both are plain SoA/CSR so they cross a worker
+ * state edges per physical pair (directed, flow-summed) — the same super-edge aggregation the LOD path
+ * already does, applied at the physical level; state edges inside one physical node become its self-link
+ * (#535). Both are plain SoA/CSR so they cross a worker
  * boundary without copying.
  */
 import { buildGraph, type NetworkGraph } from "./graph.js";
@@ -59,9 +60,10 @@ export interface StateNetworkGraph {
   /** State-level graph: nodes = state nodes, edges = state edges. A full {@link NetworkGraph}. */
   state: NetworkGraph;
   /**
-   * Derived physical-level graph: nodes = distinct physical ids; edges = state edges aggregated across
-   * physical boundaries (directed, flow-summed). Intra-physical state edges collapse (they are not
-   * physical links). `physical.flow` is the per-physical sum of state flow (or null if none supplied).
+   * Derived physical-level graph: nodes = distinct physical ids; edges = state edges aggregated per
+   * physical pair (directed, flow-summed). State edges inside one physical node sum into that node's
+   * self-link (#535), drawn as a loop in the physical view. `physical.flow` is the per-physical sum of
+   * state flow (or null if none supplied).
    */
   physical: NetworkGraph;
   /** state node id → physical node id (dense), length `state.nodeCount`. */
@@ -74,7 +76,7 @@ export interface StateNetworkGraph {
 /**
  * Assemble a {@link StateNetworkGraph} from a state-level edge list + a per-state-node physical id.
  * The physical network is derived once (its links are the directed, flow-summed aggregation of state
- * edges that cross a physical boundary). Positions in both graphs are left zeroed for layout to fill.
+ * edges per physical pair, a pair of one physical node being its self-link). Positions in both graphs are left zeroed for layout to fill.
  */
 export function buildStateGraph(input: BuildStateGraphInput): StateNetworkGraph {
   const { stateCount } = input;
@@ -124,15 +126,15 @@ export function buildStateGraph(input: BuildStateGraphInput): StateNetworkGraph 
     cursor[p] = cursor[p]! + 1;
   }
 
-  // Aggregate cross-physical state edges into directed, flow-summed physical links. Intra-physical
-  // edges (both endpoints in the same physical node) collapse — they are not physical links. Insertion
-  // order into the Map is deterministic, so the physical edge order is stable across runs.
+  // Aggregate state edges into directed, flow-summed physical links. A state edge inside one physical node
+  // (both endpoints in the same physical node) is flow that stays in that node: it sums into the node's
+  // physical self-link (#535), which the physical view draws as a loop. Insertion order into the Map is
+  // deterministic, so the physical edge order is stable across runs.
   const edgeCount = state.edgeCount;
   const pairFlow = new Map<number, number>(); // key = p·physicalCount + q → summed flow
   for (let e = 0; e < edgeCount; e++) {
     const p = stateToPhysical[state.source[e]!]!;
     const q = stateToPhysical[state.target[e]!]!;
-    if (p === q) continue;
     const key = p * physicalCount + q;
     pairFlow.set(key, (pairFlow.get(key) ?? 0) + state.weight[e]!);
   }
