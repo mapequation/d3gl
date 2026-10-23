@@ -155,6 +155,18 @@ function haloCount(layers: readonly InstancedLayer[]): number | null {
   return null;
 }
 
+/** Faint selection rings over a sweep's frames (#538): ring instances whose border is translucent. */
+function faintRings(frames: readonly (readonly InstancedLayer[])[]): number {
+  let n = 0;
+  for (const layers of frames)
+    for (const l of layers) {
+      if (l.primitive !== "circles" || l.name !== "network-highlight:ring") continue;
+      const c = l.circles.borderColors;
+      for (let i = 0; c && i < l.circles.count; i++) if ((c[i * 4 + 3] ?? 255) < 255) n++;
+    }
+  return n;
+}
+
 /** Instances in the gathered layers alone (`links` / `arrows`): the links that touch an aggregate (#447). */
 function gatheredLinks(layers: readonly InstancedLayer[]): number {
   let n = 0;
@@ -276,6 +288,14 @@ let lodSpatialHold: HoldLeg;
 let spatialHeldStats: { hits: number; misses: number; visits: number; entries: number; leafRows: number } | null = null;
 let spatialSweepStats: { hits: number; misses: number; visits: number } | null = null;
 let lodOffSelected: Leg;
+/** LOD on with the same selection (#538): the first sweep, then the same sweep again (buffer counts). */
+let lodOnSelected: Leg;
+let lodOnSelectedRepeat: Leg;
+/** Holder markings during the two sweeps (must be 0: marked once, at the select), holders marked, and the
+ *  faint rings the sweeps drew (non-vacuity: the cut really drew modules holding a selected node). */
+let holderBuildsInSweeps = -1;
+let holdersMarked = 0;
+let faintRingsDrawn = 0;
 /** Pans across a view that gathers no link, per link style; `gathered` is each pan step's gathered-link count. */
 const emptyViewLegs: [string, { leg: Leg; gathered: number[] }][] = [];
 /** The same pan with the aggregate outline on (#482); `halos` is each pan step's halo count (null: no `node-halos` layer). */
@@ -468,6 +488,20 @@ beforeAll(async () => {
     const haloLeg = runLeg(widePan);
     const haloReps = layerSpy.frames.length / widePan.length;
     haloPan = { leg: haloLeg, halos: widePan.map((_, s) => haloCount(layerSpy.frames[s * haloReps] ?? [])) };
+    // LOD on with a managed selection (#538): every 97th node selected, most of them collapsed into the modules the
+    // cut draws, which ring faintly and stay undimmed. The holders are marked once at the select() (a registration
+    // event, outside the sweep); a zoom frame reads one flag per frontier glyph. Twice, as the spatial legs: the
+    // first sweep may grow the ring layer once (its count follows the frontier), a layer rebuilt per frame shows
+    // on the second.
+    // The sweep runs zoomed out (k 0.1 to 1), where the cut draws modules: from k = 1 in, it draws leaves.
+    const outSteps = zoomSteps(W, H, [0.1, 0.15, 0.2, 0.3, 0.45, 0.7, 1]);
+    net.lod({ declutter: true, maxAggregateRadius: 24 }).interactive({ selectable: true }).select("nodes", SELECTED);
+    const holderBuilds = net.holderStats.builds;
+    lodOnSelected = runLeg(outSteps);
+    faintRingsDrawn = faintRings(layerSpy.frames);
+    lodOnSelectedRepeat = runLeg(outSteps);
+    holderBuildsInSweeps = net.holderStats.builds - holderBuilds;
+    holdersMarked = net.holderStats.holders;
     // Full detail again, with a managed selection (#428): the no-LOD selected-flag cache is keyed on the
     // selection set, so a key that stopped matching per frame would rebuild and re-upload the flags on
     // every zoom step. The toggle and the select() are registration events, outside the sweep.
@@ -657,6 +691,22 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
       // A held view resolves no link colour at all (every weight is already memoised).
       expect(leg.linkStrokeCalls, `${name}: link colours re-resolved on an unchanged view`).toBe(0);
     }
+  });
+
+  it("LOD ON with a selection: holders are marked once, not per frame, and the re-cut stays O(visible) (#538)", () => {
+    // Non-vacuity: the selection really sat collapsed in modules the sweep drew.
+    expect(holdersMarked, "the selection marked no holder — nothing selected sits under a module").toBeGreaterThan(0);
+    expect(faintRingsDrawn, "the sweep drew no faint ring — no module holding a selected node was on the frontier").toBeGreaterThan(0);
+    // The signature: the holders are marked at the select(), never by a zoom frame.
+    expect(holderBuildsInSweeps, "a zoom frame re-marked the holders").toBe(0);
+    for (const [name, leg] of [["first sweep", lodOnSelected], ["second sweep", lodOnSelectedRepeat]] as const) {
+      expect(leg.nodeFillAfter, `${name}: nodeFill re-ran during the selected LOD sweep`).toBe(leg.nodeFillBefore);
+      const perFrame = leg.uploadedBytes / leg.frames;
+      expect(perFrame, `${name}: ${(perFrame / 1024).toFixed(0)} KB uploaded per frame — must stay screen-bounded, not O(N)`).toBeLessThan(LOD_UPLOAD_BYTES_PER_FRAME);
+      expect(leg.worstFrameMs, `${name}: LOD on, ${SELECTED.length.toLocaleString()} nodes selected: worst frame ${leg.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_LOD);
+    }
+    expect(lodOnSelectedRepeat.buffersCreated, "GPU buffers were created during the second selected LOD sweep").toBe(0);
+    expect(lodOnSelectedRepeat.buffersDeleted, "GPU buffers were destroyed during the second selected LOD sweep").toBe(0);
   });
 
   it("LOD OFF with a selection: a zoom frame uploads O(selected), not the selected flags (#428)", () => {

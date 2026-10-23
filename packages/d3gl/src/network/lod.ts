@@ -387,6 +387,29 @@ export function ancestorAwareSelected(parent: Int32Array, isSelected: (g: number
 }
 
 /**
+ * Mark the **holders** of a selection (#538): every strict ancestor of a selected tree node, so a cut that
+ * draws a module in place of the selected node it holds can still show the selection there — the upward
+ * twin of {@link ancestorAwareSelected}. Sets `flags[h] = 1` for each holder and lists it in `marked`, after
+ * clearing the previous call's marks through that list (never the whole array). Each selected node climbs
+ * its parent chain only until it meets a holder already marked, whose own ancestors are marked too, so the
+ * call is O(selected + holders) — at most O(tree size), independent of the frontier. Ids that are not tree
+ * nodes are skipped. `flags` must hold at least `parent.length` entries, all zero outside `marked`.
+ */
+export function markHolders(parent: Int32Array, selected: Iterable<string | number>, flags: Uint8Array, marked: number[]): void {
+  for (const h of marked) flags[h] = 0;
+  marked.length = 0;
+  for (const id of selected) {
+    if (typeof id !== "number") continue;
+    let p = parent[id] ?? -1;
+    while (p >= 0 && flags[p] === 0) {
+      flags[p] = 1;
+      marked.push(p);
+      p = parent[p] ?? -1;
+    }
+  }
+}
+
+/**
  * Enumerate the leaf descendants of tree node `g` (its global ids `< leafCount`, which equal the
  * original graph node ids). A leaf returns `[itself]`; an aggregate is a DFS over the children CSR.
  * O(subtree leaves), run lazily on a hit (`members()`) — never per frame. Sorted ascending so the
