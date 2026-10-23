@@ -189,6 +189,10 @@ function writeIfChanged<T extends ArrayBufferView>(buffer: Buffer, arr: T, last:
   return arr;
 }
 
+/** Border-column uploads of the instanced circles (#513), for the per-frame guards: one per `borders` or
+ *  `borderColors` array written to its buffer. A frame whose border columns are the arrays last written adds 0. */
+export const borderColumnStats = { writes: 0 };
+
 /** The value a vec2 offset attribute reads without a buffer: a WebGL constant attribute, shared and never written. */
 const ZERO_OFFSET = new Float32Array(2);
 
@@ -317,6 +321,10 @@ export class InstancedCircles {
   private color: Buffer;
   private border: Buffer;
   private borderColor: Buffer;
+  /** Last-uploaded border columns (#513), the {@link writeIfChanged} skip: the network's no-LOD cache hands out
+   *  the same flow-border / node-border arrays on every position frame, so they upload once per style version. */
+  private lastBorders: Float32Array | undefined;
+  private lastBorderColors: Uint8Array | undefined;
   /** Per-instance offset from the centre (#509); the constant zero without one. */
   private readonly offset = new OffsetColumn("a_offset");
   private hl: HighlightBuffers;
@@ -334,6 +342,9 @@ export class InstancedCircles {
     // zero-filled, so a_border = 0 and the shader draws a plain filled disc (unchanged appearance).
     this.border = device.createBuffer({ data: data.borders ?? new Float32Array(data.count) });
     this.borderColor = device.createBuffer({ data: data.borderColors ?? new Uint8Array(data.count * 4) });
+    this.lastBorders = data.borders;
+    this.lastBorderColors = data.borderColors;
+    borderColumnStats.writes += data.borders ? 2 : 0;
     this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
@@ -420,6 +431,9 @@ export class InstancedCircles {
       this.color = grownBuffer(device, data.colors, data.count, this._capacity);
       this.border = grownBuffer(device, data.borders ?? new Float32Array(data.count), data.count, this._capacity);
       this.borderColor = grownBuffer(device, data.borderColors ?? new Uint8Array(data.count * 4), data.count, this._capacity);
+      this.lastBorders = data.borders;
+      this.lastBorderColors = data.borderColors;
+      borderColumnStats.writes += data.borders ? 2 : 0;
       // Re-bind all attributes on the model (the buffer objects changed).
       this.model.setAttributes({
         a_center: this.center,
@@ -435,9 +449,12 @@ export class InstancedCircles {
       this.center.write(data.centers);
       this.radius.write(data.radii);
       this.color.write(data.colors);
-      if (hasBorders) {
-        this.border.write(data.borders!);
-        this.borderColor.write(data.borderColors!);
+      if (data.borders && data.borderColors) {
+        // Skipped while the arrays are the ones last uploaded (#513): a position frame's cached border columns.
+        if (data.borders !== this.lastBorders) borderColumnStats.writes++;
+        if (data.borderColors !== this.lastBorderColors) borderColumnStats.writes++;
+        this.lastBorders = writeIfChanged(this.border, data.borders, this.lastBorders);
+        this.lastBorderColors = writeIfChanged(this.borderColor, data.borderColors, this.lastBorderColors);
       }
       this.hl.write(data); // #162 refresh group/selected for the new frame's instances
     }
