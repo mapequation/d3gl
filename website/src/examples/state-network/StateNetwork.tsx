@@ -9,7 +9,7 @@ const notState = (o: Record<string, unknown>) => o.view !== "State";
  *  (Force / Worker / GPU — #182) for the layouts, a **View** toggle (Physical pies / State / Both), a **State
  *  layout** toggle (Force / Nested by module, #495), a **Links** toggle (half-arrow / line, both bent), **Colours** (the engine's module
  *  colours / an app palette via `style({ moduleColor })`), **Modules** (on / off: a raw state network,
- *  #494), **Physical** / **State** label
+ *  #494), **Lump** (one node per leaf module and physical node in the State and Both views, #529), **Physical** / **State** label
  *  toggles, and the "directed map of modules" option set. The LOD cut only applies to the State view, so
  *  LOD + its sub-controls are **disabled** (greyed, no reflow) in the other views. */
 export default function StateNetwork() {
@@ -23,6 +23,7 @@ export default function StateNetwork() {
         { type: "segmented", key: "links", label: "Links", options: ["Half-arrow", "Line"] },
         { type: "segmented", key: "colors", label: "Colours", options: ["Engine", "Palette"] },
         { type: "segmented", key: "modules", label: "Modules", options: ["On", "Off"] },
+        { type: "segmented", key: "lump", label: "Lump", options: ["Off", "On"] },
         { type: "segmented", key: "physLabels", label: "Physical labels", options: ["Off", "On"] },
         { type: "segmented", key: "stateLabels", label: "State labels", options: ["Off", "On"] },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"], disabled: (o) => o.view === "Both" },

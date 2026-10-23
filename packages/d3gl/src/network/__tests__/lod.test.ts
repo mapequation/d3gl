@@ -325,11 +325,24 @@ describe("declutterFrontier", () => {
     const tree = treeOnLine();
     // screen-sized radius 4, default spacing 2 (centres must be >= 16px apart): every pair here is closer
     // (0,1: 2px; 1,2: 8px; 2,3: 2px), so only the strongest glyph survives. 1 and 2 tie on strength 3; 1 comes first.
+    // 1 and 2 only touch (8px), so the default hides a glyph that doesn't overlap anything (#512, by design).
     const kept = declutterFrontier(tree, new Uint32Array([0, 1, 2, 3]), { k: 1, x: 0, y: 0 }, 200, 200, {
       screenSized: true,
       k: 1,
     });
     expect(Array.from(kept)).toEqual([1]);
+  });
+
+  it("spacing 1 drops only real overlaps", () => {
+    const tree = treeOnLine();
+    // spacing 1: centres must be >= 8px apart. 0 overlaps 1 (2px) and 3 overlaps 2 (2px), but 1 and 2
+    // only touch (8px), so the two strongest stay.
+    const kept = declutterFrontier(tree, new Uint32Array([0, 1, 2, 3]), { k: 1, x: 0, y: 0 }, 200, 200, {
+      screenSized: true,
+      k: 1,
+      spacing: 1,
+    });
+    expect(Array.from(kept)).toEqual([1, 2]);
   });
 
   it("keeps every glyph when nothing overlaps", () => {

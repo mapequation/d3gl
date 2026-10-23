@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildStateGraph } from "../state-graph.js";
+import { buildStateGraph, lumpStateGraph } from "../state-graph.js";
 
 /** Directed physical edge → weight, for order-independent assertions on the aggregation. */
 function physEdges(g: { source: Uint32Array; target: Uint32Array; weight: Float32Array }): Map<string, number> {
@@ -68,5 +68,87 @@ describe("buildStateGraph", () => {
   it("validates lengths and physical-id bounds", () => {
     expect(() => buildStateGraph({ ...input, stateToPhysical: [0, 0, 1] })).toThrow(/stateToPhysical length/);
     expect(() => buildStateGraph({ ...input, physicalCount: 1 })).toThrow(/out of range/);
+  });
+});
+
+describe("lumpStateGraph (#529)", () => {
+  // Physical A(0) holds state nodes 0,1,2; B(1) holds 3,4. Leaf module 1 holds 0,1,3; leaf module 2 holds 2,4.
+  // Lumps: A·1 = {0,1}, A·2 = {2}, B·1 = {3}, B·2 = {4}.
+  const sg = buildStateGraph({
+    stateCount: 5,
+    stateToPhysical: [0, 0, 0, 1, 1],
+    // 0->1 inside a lump; 0->3 and 1->3 both A·1 -> B·1; 2->4 A·2 -> B·2; 4->0 B·2 -> A·1; 2->0 A·2 -> A·1.
+    source: [0, 0, 1, 2, 4, 2],
+    target: [1, 3, 3, 4, 0, 0],
+    weight: [7, 2, 1, 4, 5, 6],
+    nodeFlow: [0.1, 0.2, 0.3, 0.15, 0.25],
+    directed: true,
+  });
+  const modules = [
+    { id: 0, path: [1, 1] },
+    { id: 1, path: [1, 2] },
+    { id: 2, path: [2, 1] },
+    { id: 3, path: [1, 3] },
+    { id: 4, path: [2, 2] },
+  ];
+
+  it("lumps the state nodes of one physical node in one leaf module, a physical node's lumps consecutive", () => {
+    const { graph, stateToLump, lumpToState } = lumpStateGraph(sg, modules);
+    expect(graph.state.nodeCount).toBe(4);
+    expect(Array.from(stateToLump)).toEqual([0, 0, 1, 2, 3]);
+    expect(Array.from(lumpToState.offsets)).toEqual([0, 2, 3, 4, 5]);
+    expect(Array.from(lumpToState.states)).toEqual([0, 1, 2, 3, 4]);
+    expect(Array.from(graph.stateToPhysical)).toEqual([0, 0, 1, 1]);
+    expect(Array.from(graph.physicalToState.offsets)).toEqual([0, 2, 4]);
+    expect(Array.from(graph.physicalToState.states)).toEqual([0, 1, 2, 3]);
+  });
+
+  it("sums the links between lumps and drops the links inside one, as the physical graph's merge does", () => {
+    const { graph } = lumpStateGraph(sg, modules);
+    expect(physEdges(graph.state)).toEqual(new Map([["0->2", 3], ["1->3", 4], ["3->0", 5], ["1->0", 6]]));
+    expect(graph.state.directed).toBe(true);
+    expect(Array.from(graph.state.flow ?? [])).toEqual(Array.from(Float32Array.from([0.3, 0.3, 0.15, 0.25])));
+  });
+
+  it("shares the source's physical graph, which merging the lumps by physical node gives again", () => {
+    const { graph } = lumpStateGraph(sg, modules);
+    expect(graph.physical).toBe(sg.physical);
+    expect(graph.physicalCount).toBe(sg.physicalCount);
+    const remerged = buildStateGraph({
+      stateCount: graph.state.nodeCount,
+      stateToPhysical: graph.stateToPhysical,
+      source: graph.state.source,
+      target: graph.state.target,
+      weight: graph.state.weight,
+      directed: true,
+    });
+    expect(physEdges(remerged.physical)).toEqual(physEdges(sg.physical));
+  });
+
+  it("ranks each leaf module's lumps by flow, ties by id, after the module's path", () => {
+    const { modules: lumped } = lumpStateGraph(sg, modules);
+    expect(lumped?.map((r) => Array.from(r.path))).toEqual([[1, 1], [2, 1], [1, 2], [2, 2]]);
+    expect(lumped?.map((r) => r.id)).toEqual([0, 1, 2, 3]);
+  });
+
+  it("ranks by state-node count without flow, and lumps nodes in no module by physical node", () => {
+    const plain = buildStateGraph({ stateCount: 3, stateToPhysical: [0, 0, 1], source: [0], target: [2] });
+    const { graph, modules: lumped } = lumpStateGraph(plain, [{ id: 0, path: [1] }, { id: 1, path: [2] }, { id: 2, path: [3] }]);
+    expect(graph.state.nodeCount).toBe(2);
+    expect(graph.state.flow).toBeNull();
+    expect(lumped?.map((r) => Array.from(r.path))).toEqual([[1], [2]]);
+  });
+
+  it("without modules lumps each physical node's state nodes into one: the physical network, with no records", () => {
+    const { graph, stateToLump, modules: records } = lumpStateGraph(sg);
+    expect(graph.state.nodeCount).toBe(sg.physicalCount);
+    expect(Array.from(stateToLump)).toEqual([0, 0, 0, 1, 1]);
+    expect(records).toBeNull();
+    expect(physEdges(graph.state)).toEqual(physEdges(sg.physical));
+  });
+
+  it("throws on a record out of range or a state node with no record", () => {
+    expect(() => lumpStateGraph(sg, [...modules, { id: 5, path: [1, 4] }])).toThrow(/out of range/);
+    expect(() => lumpStateGraph(sg, modules.slice(1))).toThrow(/no module record for state node 0/);
   });
 });

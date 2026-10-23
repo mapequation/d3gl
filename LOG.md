@@ -77,6 +77,11 @@ directions of the rings enclosing it, and the ring is an outer where the fill tu
   `network-hierarchy.browser.test.ts` can mock `buildModuleLODTree` in `modules.js`), or run the worker's
   real code in-process on a timer (#377: `gpu/__tests__/_in-process-lod-worker.ts`) and keep every test that
   needs the real worker in a mock-free file.
+- **A `MutationObserver` count needs `takeRecords()` before `disconnect()`** (#519): records are delivered
+  in a microtask, so a guard that mutates, then disconnects synchronously, drops every pending record and
+  counts 0. The SVG leg of `network-labels-hover-vector-perf` asserted on such a count and passed vacuously
+  until #526. Read `observer.takeRecords()` (plus anything already delivered) after each step, and prove a
+  count-based guard can fail by breaking the counted path once on purpose.
 ## Perf-guard coverage map (#258 — check here before claiming a cell is covered)
 
 Which guard covers which cell of the per-frame rule (`docs/agents/performance.md`). **A cell that runs but asserts nothing is not covered** — that
@@ -121,6 +126,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | plot lane, per-frame | **WebGL** | `map/plot-points-perf.browser.test.ts` | 5k | `PERF_BROWSER_N` |
 | declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
+| hover overlay **slot** (#519): a hover change repaints only the highlight — zero `clearRect`, ≤ 8 `fill`+`stroke` per change (Canvas); scene groups untouched, ≤ 8 elements written per change (SVG); median ms per change | Canvas, SVG | `network/__tests__/network-hover-slot-perf.browser.test.ts` | 50k nodes + links, LOD off, 120 hover changes | `perfN` (max 200k) |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band — on a flat **and** a `multilevel` solver (#353: every seeded run ticks the graph's level on the latter), whose graph-level ticks are also pinned bitwise equal to the flat solver's (pyramid with hub rows, and all-pairs) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
@@ -182,6 +188,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`network()` fitted position transition** (#427), zoom enabled, LOD on **and** off, vs the unfitted transition: one Scene rebuild per frame, camera re-seeded once per fitted frame, no `syncScreenGeometry` re-cut, no gesture boundary; wall clock at an equal (still) view, moving camera under a ceiling; each frame laid out before the next, as a paint would | Canvas + SVG | `network/__tests__/network-vector-transition-perf.browser.test.ts` | Canvas 20k / SVG 10k nodes | `PERF_BROWSER_N` (Canvas max 40k, SVG max 20k — ~50 retained rebuilds per reduction state) |
 | **`network()` `nodeFill { by }` + `moduleFlow`** (#445), LOD on, every module open, and off; zero accessor calls per frame; `nodeFill { by: "module" }` (#494): exactly one `color` call per module, the module tree's aggregates included (their own module's colour), zero per frame on all three legs | **WebGL** | `network/__tests__/network-fill-by-metric-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | **`network()` share-mode flow border** (#510), LOD on, every module open, and off, share vs absolute; zero LOD style passes per frame, O(visible) in-place uploads with LOD on, nothing uploaded with LOD off | **WebGL** | `network/__tests__/network-flow-border-share-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 1M) |
+| **`network()` LOD off, a position frame** (#513): the node layer's flow-border / node-border columns (`borders`, `borderColors`) built once per style version (`nodeBorderColumnStats`) and not re-uploaded (`borderColumnStats`); a frame uploads ≤ 16 B per node (centres, radii, fill colours); new node colours or a new flow border rebuild and re-upload them once | **WebGL** | `network/__tests__/network-border-columns-perf.browser.test.ts` | 1M nodes | `PERF_BROWSER_N` (max 1M) |
 | multi pass-through: FBO count + gesture skip + resize surface/one cycle (#293) | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off, + capped LOD top-k (`importanceOf` once per candidate) | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped + `max: 50` | `PERF_BROWSER_N` (max 50k) |
@@ -810,6 +817,15 @@ correct:
 - Guards: `map/zoom-coalesce.browser.test.ts` (base engine), `network/__tests__/network-input-coalesce.browser.test.ts`
   (WebGL/Canvas/SVG) and the ≈1M per-frame guard `network-input-coalesce-perf.browser.test.ts`.
 
+- **A hover change on Canvas/SVG repaints only the overlay slot (#519)**, never the scene: the engine hands
+  hover/`highlight()` overlays to `Backend.setOverlays` (not `setLayers`) and calls `renderOverlays()`. Canvas
+  keeps the pixels under each overlay's bounding box (`overlayBounds`, a `drawImage` copy, not `getImageData`)
+  and puts them back on the next change; SVG rewrites one group between the scene and the labels. Anything
+  that paints onto the live Canvas without a clear (`appendToLayer`, `drawPassThrough`) must `liftTop()`
+  before and `paintTop()` after, or the next hover change puts stale pixels back over the new shapes.
+  On Canvas the overlay sits over the placed labels (WebGL's HTML labels sit over it): keeping them on top
+  would mean repainting every placed label per change. Guard: `network-hover-slot-perf.browser.test.ts`.
+
 ## Curve bake tolerance is per DRAWABLE (#45, #283)
 
 Curves are flattened once, at `Scene.group()`, and the view only scales the result — so the right
@@ -983,3 +999,20 @@ rules when extending it:
 Bordered nodes are deliberately kept out of that diff (the ring-vs-stacked-discs divergence above);
 fold them in when #269 converges the two encodings.
 
+
+## LOD declutter can hide a non-overlapping module aggregate in a small graph, by design (#512)
+
+**Rule.** LOD declutter (`declutterFrontier` → `declutterScreen`, shared by WebGL, Canvas and SVG) hides a
+frontier glyph when its centre lies within `spacing·(rᵢ + rⱼ)` of a kept glyph. The default
+`declutterSpacing` is **2**, so kept glyphs keep a gap around them and the links between them stay visible.
+`declutterSpacing: 1` hides only real overlaps; `declutter: false` hides nothing.
+
+**Cost.** In a small graph a whole module aggregate that overlaps nothing can be hidden. The #512 case: a
+4-node graph with two modules, each collapsed to one aggregate (radius `sqrt(Σ r²)` = r·√2); one aggregate
+is hidden from `nodeRadius` ≈ 8.7 up although the two are ≈ 15 px apart at r = 12. This was kept on purpose
+(the default stays 2).
+
+**Consequence for tests.** A test that needs every LOD glyph drawn sets `declutter: false` (or
+`declutterSpacing: 1`) explicitly rather than picking a radius small enough to dodge the exclusion
+(`network-node-border-shade.browser.test.ts`). A perf-guard reference implementation that mirrors
+`declutterFrontier` must mirror the default too (`frontier-perf.test.ts`).

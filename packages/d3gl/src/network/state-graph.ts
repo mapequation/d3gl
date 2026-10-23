@@ -13,6 +13,7 @@
  * boundary without copying.
  */
 import { buildGraph, type NetworkGraph } from "./graph.js";
+import type { ModulePathNode } from "./module-colors.js";
 
 export interface BuildStateGraphInput {
   /** Number of state nodes. */
@@ -111,58 +112,166 @@ export function buildStateGraph(input: BuildStateGraphInput): StateNetworkGraph 
     directed: input.directed,
   });
 
-  // physical → state CSR (count → prefix-sum → scatter), mirroring buildCSR.
-  const counts = new Uint32Array(physicalCount);
-  for (let s = 0; s < stateCount; s++) counts[stateToPhysical[s]!] = counts[stateToPhysical[s]!]! + 1;
-  const offsets = new Uint32Array(physicalCount + 1);
-  for (let p = 0; p < physicalCount; p++) offsets[p + 1] = offsets[p]! + counts[p]!;
-  const states = new Uint32Array(stateCount);
-  const cursor = offsets.slice(0, physicalCount);
-  for (let s = 0; s < stateCount; s++) {
-    const p = stateToPhysical[s]!;
-    states[cursor[p]!] = s;
-    cursor[p] = cursor[p]! + 1;
-  }
+  const physical = mergeGroups(state, stateToPhysical, physicalCount);
+  return { state, physical, stateToPhysical, physicalToState: groupMembers(stateToPhysical, physicalCount), physicalCount };
+}
 
-  // Aggregate cross-physical state edges into directed, flow-summed physical links. Intra-physical
-  // edges (both endpoints in the same physical node) collapse — they are not physical links. Insertion
-  // order into the Map is deterministic, so the physical edge order is stable across runs.
-  const edgeCount = state.edgeCount;
-  const pairFlow = new Map<number, number>(); // key = p·physicalCount + q → summed flow
-  for (let e = 0; e < edgeCount; e++) {
-    const p = stateToPhysical[state.source[e]!]!;
-    const q = stateToPhysical[state.target[e]!]!;
-    if (p === q) continue;
-    const key = p * physicalCount + q;
-    pairFlow.set(key, (pairFlow.get(key) ?? 0) + state.weight[e]!);
+/**
+ * Each group's members as CSR (count → prefix-sum → scatter, mirroring buildCSR): group `g`'s members are
+ * `states[offsets[g] .. offsets[g + 1]]`, in id order.
+ */
+function groupMembers(groupOf: Uint32Array, groupCount: number): PhysicalToState {
+  const n = groupOf.length;
+  const counts = new Uint32Array(groupCount);
+  for (let s = 0; s < n; s++) counts[groupOf[s]!] = counts[groupOf[s]!]! + 1;
+  const offsets = new Uint32Array(groupCount + 1);
+  for (let g = 0; g < groupCount; g++) offsets[g + 1] = offsets[g]! + counts[g]!;
+  const states = new Uint32Array(n);
+  const cursor = offsets.slice(0, groupCount);
+  for (let s = 0; s < n; s++) {
+    const g = groupOf[s]!;
+    states[cursor[g]!] = s;
+    cursor[g] = cursor[g]! + 1;
   }
-  const physEdgeCount = pairFlow.size;
-  const pSource = new Uint32Array(physEdgeCount);
-  const pTarget = new Uint32Array(physEdgeCount);
-  const pWeight = new Float32Array(physEdgeCount);
+  return { offsets, states };
+}
+
+/**
+ * Merge `graph`'s nodes into their groups: the links between two groups are summed into one directed link per
+ * (group, group) pair, the links inside a group collapse, and a group's flow is the sum of its members' (null
+ * when `graph` has none). The physical graph merges the state nodes by physical node, the lumped graph by
+ * (leaf module, physical node) (#529). `groupCount²` must be a safe integer: the callers check it.
+ */
+function mergeGroups(graph: NetworkGraph, groupOf: Uint32Array, groupCount: number): NetworkGraph {
+  // Insertion order into the Map is deterministic, so the merged edge order is stable across runs.
+  const pairFlow = new Map<number, number>(); // key = p·groupCount + q → summed flow
+  for (let e = 0; e < graph.edgeCount; e++) {
+    const p = groupOf[graph.source[e]!]!;
+    const q = groupOf[graph.target[e]!]!;
+    if (p === q) continue;
+    const key = p * groupCount + q;
+    pairFlow.set(key, (pairFlow.get(key) ?? 0) + graph.weight[e]!);
+  }
+  const edgeCount = pairFlow.size;
+  const source = new Uint32Array(edgeCount);
+  const target = new Uint32Array(edgeCount);
+  const weight = new Float32Array(edgeCount);
   let i = 0;
   for (const [key, w] of pairFlow) {
-    pSource[i] = Math.floor(key / physicalCount);
-    pTarget[i] = key % physicalCount;
-    pWeight[i] = w;
+    source[i] = Math.floor(key / groupCount);
+    target[i] = key % groupCount;
+    weight[i] = w;
     i++;
   }
-
-  // Physical node flow = the per-physical sum of state-node flow (only when state flow was supplied).
-  let physFlow: Float32Array | undefined;
-  if (state.flow) {
-    physFlow = new Float32Array(physicalCount);
-    for (let s = 0; s < stateCount; s++) physFlow[stateToPhysical[s]!] = physFlow[stateToPhysical[s]!]! + state.flow[s]!;
+  let flow: Float32Array | undefined;
+  if (graph.flow) {
+    flow = new Float32Array(groupCount);
+    for (let s = 0; s < graph.nodeCount; s++) flow[groupOf[s]!] = flow[groupOf[s]!]! + graph.flow[s]!;
   }
+  return buildGraph({ nodeCount: groupCount, source, target, weight, nodeFlow: flow, directed: graph.directed });
+}
 
-  const physical = buildGraph({
-    nodeCount: physicalCount,
-    source: pSource,
-    target: pTarget,
-    weight: pWeight,
-    nodeFlow: physFlow,
-    directed: input.directed,
-  });
+/**
+ * A state network with each physical node's state nodes in one leaf module **lumped** into one node (#529): the
+ * map equation codes them with one codeword in that module, and Infomap's physical tree merges them the same way.
+ */
+export interface LumpedStateNetwork {
+  /**
+   * The lumped network. Its state level has one node, a **lump**, per (leaf module, physical node); a physical
+   * node's lumps have consecutive ids. Its physical level is the source network's `physical` graph, the same
+   * object: lumping only splits the physical grouping further, so merging the lumps by physical node gives it back.
+   */
+  graph: StateNetworkGraph;
+  /** Each lump's module record: its leaf module's path, then its rank in that module (by flow, then by id). Null
+   *  when lumped without modules. */
+  modules: ModulePathNode[] | null;
+  /** state node id → its lump id, length `stateCount`. */
+  stateToLump: Uint32Array;
+  /** lump id → its state node ids (CSR). */
+  lumpToState: PhysicalToState;
+}
 
-  return { state, physical, stateToPhysical, physicalToState: { offsets, states }, physicalCount };
+/**
+ * Lump `sg`'s state nodes by (leaf module, physical node) (#529), with `modules` a record per state node (Infomap's
+ * `nodes` shape; the leaf module is the record's path less its last entry). Without `modules` every state node is
+ * in the root module, so each physical node's state nodes are one lump: the lumped network is the physical one. A
+ * lump's links are the summed links of its state nodes to other lumps, its flow the sum of theirs: the same merge as
+ * the physical graph's. O(state nodes + state links + lumps · log lumps).
+ */
+export function lumpStateGraph(sg: StateNetworkGraph, modules?: ArrayLike<ModulePathNode> | null): LumpedStateNetwork {
+  const stateCount = sg.state.nodeCount;
+  // Each state node's leaf-module key: "" (the root) for all without modules, else from its record.
+  const leafOf = new Array<string | undefined>(stateCount).fill(modules ? undefined : "");
+  for (let r = 0; modules && r < modules.length; r++) {
+    const { id, path } = modules[r]!;
+    if (!(id >= 0 && id < stateCount)) throw new Error(`lumpStateGraph: module record id ${id} out of range`);
+    let leaf = "";
+    for (let k = 0; k < path.length - 1; k++) leaf += k === 0 ? `${path[k]}` : `:${path[k]}`;
+    leafOf[id] = leaf;
+  }
+  // Lumps numbered physical node by physical node, as the pies group them (#171): a physical node's lumps are
+  // consecutive, so the lumped network's physical → lump CSR is a running count.
+  const { offsets, states } = sg.physicalToState;
+  const physicalCount = sg.physicalCount;
+  const stateToLump = new Uint32Array(stateCount);
+  const lumpOffsets = new Uint32Array(physicalCount + 1);
+  const lumpLeaf: string[] = [];
+  const lumpPhysical: number[] = [];
+  for (let p = 0; p < physicalCount; p++) {
+    const lumps = new Map<string, number>();
+    for (let i = offsets[p]!; i < offsets[p + 1]!; i++) {
+      const s = states[i]!;
+      const leaf = leafOf[s];
+      if (leaf === undefined) throw new Error(`lumpStateGraph: no module record for state node ${s} (must cover every state node)`);
+      let lump = lumps.get(leaf);
+      if (lump === undefined) {
+        lump = lumpLeaf.length;
+        lumps.set(leaf, lump);
+        lumpLeaf.push(leaf);
+        lumpPhysical.push(p);
+      }
+      stateToLump[s] = lump;
+    }
+    lumpOffsets[p + 1] = lumpLeaf.length;
+  }
+  const lumpCount = lumpLeaf.length;
+  if (lumpCount * lumpCount > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`lumpStateGraph: ${lumpCount} lumps too large for pair-keyed aggregation`);
+  }
+  const state = mergeGroups(sg.state, stateToLump, lumpCount);
+  const lumpToState = groupMembers(stateToLump, lumpCount);
+
+  const size = (l: number): number => state.flow ? state.flow[l]! : lumpToState.offsets[l + 1]! - lumpToState.offsets[l]!;
+  const records = modules ? lumpRecords(lumpLeaf, size) : null;
+
+  const graph: StateNetworkGraph = {
+    state,
+    physical: sg.physical,
+    stateToPhysical: Uint32Array.from(lumpPhysical),
+    physicalToState: { offsets: lumpOffsets, states: Uint32Array.from({ length: lumpCount }, (_, l) => l) },
+    physicalCount,
+  };
+  return { graph, modules: records, stateToLump, lumpToState };
+}
+
+/**
+ * The lumps' module records (#529): the lumps of each leaf module ranked by `size` (flow, else state-node count), ties
+ * by id, as Infomap ranks a module's nodes; a lump's record is its leaf module's path, then its 1-based rank.
+ * `leafOf` is each lump's leaf-module key. O(lumps · log lumps).
+ */
+function lumpRecords(leafOf: readonly string[], size: (lump: number) => number): ModulePathNode[] {
+  const byLeaf = new Map<string, number[]>();
+  for (let l = 0; l < leafOf.length; l++) {
+    const leaf = leafOf[l]!;
+    const lumps = byLeaf.get(leaf);
+    if (lumps) lumps.push(l);
+    else byLeaf.set(leaf, [l]);
+  }
+  const records = new Array<ModulePathNode>(leafOf.length);
+  for (const [leaf, lumps] of byLeaf) {
+    const prefix = leaf === "" ? [] : leaf.split(":").map(Number);
+    lumps.sort((a, b) => size(b) - size(a) || a - b);
+    for (let r = 0; r < lumps.length; r++) records[lumps[r]!] = { id: lumps[r]!, path: [...prefix, r + 1] };
+  }
+  return records;
 }

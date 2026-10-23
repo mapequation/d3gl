@@ -1,8 +1,18 @@
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath, StyleTables, TextData, HoverText } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
 import { paintTexts } from "./draw-texts.js";
+import { overlayBounds } from "./overlay-bounds.js";
 
 const css = (c: readonly [number, number, number, number]) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] / 255).toFixed(4)})`;
+
+/** A device-px rectangle of the canvas kept in `cv`, to put back where a hover slot painted over it. */
+interface PixelSnap {
+  cv: HTMLCanvasElement;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 /** The persistent clip currently applied to the context (for incremental append):
  *  which layer it's for and at which transform, so we only re-clip when those change. */
@@ -132,6 +142,9 @@ export class CanvasBackend implements Backend {
     // Loop, not push(...spread): a big batch would exceed the argument-count limit.
     const acc = layer.drawables as DrawableVector[];
     for (const d of delta.drawables) acc.push(d);
+    // The new shapes go under the hover slots: take them off first (without the append clip), paint them back after.
+    const top = this.hasTop();
+    if (top) { this.releaseClip(); this.liftTop(); }
 
     const { ctx } = this;
     const t = this.transform;
@@ -153,6 +166,7 @@ export class CanvasBackend implements Backend {
       this.setView(t);
     }
     this.drawShapes(delta.drawables, layer.sizeMode === "screen", t);
+    if (top) { this.releaseClip(); this.paintTop(); }
   }
 
   render(): void {
@@ -175,34 +189,85 @@ export class CanvasBackend implements Backend {
       if (path) ctx.restore();
     }
     this.drawTexts(); // labels on top (screen space) — included in toPNG via the live canvas
+    // The repaint drew over the pixels the hover slots kept; paint them again, keeping fresh ones.
+    this.overlaySnaps.length = 0;
+    this.hoverSnap = null;
+    this.paintTop();
   }
 
-  /** Set the screen-space text labels (#105 N7b-2); drawn on the next render(). Replaces the set. */
-  setTextLayer(texts: readonly TextData[]): void {
-    this.textData = texts;
-  }
+  /** The highlight overlays (#519), drawn over the scene and the placed labels, under the hover label. */
+  private overlays: readonly RenderLayer[] = [];
+  /** The device-px rectangle under each painted overlay, in paint order, kept to put back on a change. */
+  private overlaySnaps: PixelSnap[] = [];
+  /** One reusable canvas per overlay slot for those rectangles (no per-hover canvas allocation). */
+  private overlaySnapCanvases: HTMLCanvasElement[] = [];
 
-  /** The one hovered label shown in full (#496), and the pixels it covers, kept to restore on clear. */
-  private hoverText: HoverText | null = null;
-  private snapCanvas: HTMLCanvasElement | null = null;
-  private hoverSnap: { cv: HTMLCanvasElement; x: number; y: number; w: number; h: number } | null = null;
+  /** Replace the highlight overlays; {@link renderOverlays} (or the next render()) paints them. */
+  setOverlays(layers: readonly RenderLayer[]): void {
+    this.overlays = layers;
+  }
 
   /**
-   * The one-label hover slot (#496): paint a chip and the full text over the live canvas, keeping the small
-   * rectangle underneath so a clear puts it back. Costs one `drawImage` out and one back of a label-sized
-   * rectangle (a copy, not `getImageData`, which un-premultiplies and would not restore exactly) plus one text paint, whatever the scene or the placed labels, and repaints nothing else. A
-   * later `render()` repaints everything and paints the hover again from `hoverText`.
+   * Repaint only the overlays (#519): put back the pixels kept under the hover label and the old
+   * overlays, then keep the rectangle under each new overlay and paint it. Costs O(overlay drawables)
+   * plus a copy out and back of each overlay's bounding box, whatever the scene.
    */
-  setHoverText(hover: HoverText | null): void {
-    this.restoreHover();
-    this.hoverText = hover;
-    if (hover) this.paintHover(hover);
+  renderOverlays(): void {
+    // Mid-gesture snapshot pan: the frozen raster stands in for the scene; the gesture-end render paints them.
+    if (this.ptSnapshot) return;
+    this.releaseClip(); // a persistent append-clip must not clip the restore
+    this.liftTop();
+    this.paintTop();
   }
 
-  private restoreHover(): void {
-    const snap = this.hoverSnap;
-    this.hoverSnap = null;
-    if (!snap) return;
+  /** Take the hover label and the overlays off the canvas, newest first, putting back what they covered. */
+  private liftTop(): void {
+    this.restoreHover();
+    for (let i = this.overlaySnaps.length - 1; i >= 0; i--) {
+      const snap = this.overlaySnaps[i];
+      if (snap) this.putBack(snap);
+    }
+    this.overlaySnaps.length = 0;
+  }
+
+  /** Paint the overlays and then the hover label over the live canvas, keeping the pixels under each. */
+  private paintTop(): void {
+    const { ctx } = this;
+    const t = this.transform;
+    for (let i = 0; i < this.overlays.length; i++) {
+      const layer = this.overlays[i];
+      if (!layer) continue;
+      const screen = layer.sizeMode === "screen";
+      const b = overlayBounds(layer.drawables, screen, t);
+      if (!b) continue; // nothing visible: nothing to keep or paint
+      const cv = this.overlaySnapCanvases[i] ?? document.createElement("canvas");
+      this.overlaySnapCanvases[i] = cv;
+      const snap = this.keep(cv, b[0], b[1], b[2], b[3]);
+      if (!snap) continue; // off the canvas
+      this.overlaySnaps.push(snap);
+      const path = layer.clipTo ? this.clipPathFor(layer.clipTo) : null;
+      ctx.save();
+      this.setView(t);
+      if (path) ctx.clip(path);
+      this.drawShapes(layer.drawables, screen, t);
+      ctx.restore();
+    }
+    if (this.hoverText) this.paintHover(this.hoverText);
+  }
+
+  /** Copy the device-px rectangle under CSS-px `[x0, y0, x1, y1]` (clamped to the canvas) into `cv`. */
+  private keep(cv: HTMLCanvasElement, x0: number, y0: number, x1: number, y1: number): PixelSnap | null {
+    const { dpr } = this;
+    const dx0 = Math.max(0, Math.floor(x0 * dpr)), dy0 = Math.max(0, Math.floor(y0 * dpr));
+    const dx1 = Math.min(this.canvas.width, Math.ceil(x1 * dpr)), dy1 = Math.min(this.canvas.height, Math.ceil(y1 * dpr));
+    if (dx1 <= dx0 || dy1 <= dy0) return null;
+    cv.width = dx1 - dx0; cv.height = dy1 - dy0; // resizing clears it
+    cv.getContext("2d")?.drawImage(this.canvas, dx0, dy0, cv.width, cv.height, 0, 0, cv.width, cv.height);
+    return { cv, x: dx0, y: dy0, w: cv.width, h: cv.height };
+  }
+
+  /** Put a kept rectangle back exactly (a `copy` composite, clipped to the rectangle). */
+  private putBack(snap: PixelSnap): void {
     const { ctx } = this;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -214,24 +279,47 @@ export class CanvasBackend implements Backend {
     ctx.restore();
   }
 
+  /** Set the screen-space text labels (#105 N7b-2); drawn on the next render(). Replaces the set. */
+  setTextLayer(texts: readonly TextData[]): void {
+    this.textData = texts;
+  }
+
+  /** The one hovered label shown in full (#496), and the pixels it covers, kept to restore on clear. */
+  private hoverText: HoverText | null = null;
+  private snapCanvas: HTMLCanvasElement | null = null;
+  private hoverSnap: PixelSnap | null = null;
+
+  /**
+   * The one-label hover slot (#496): paint a chip and the full text over the live canvas, keeping the small
+   * rectangle underneath so a clear puts it back. Costs one `drawImage` out and one back of a label-sized
+   * rectangle (a copy, not `getImageData`, which un-premultiplies and would not restore exactly) plus one text paint, whatever the scene or the placed labels, and repaints nothing else. A
+   * later `render()` repaints everything and paints the hover again from `hoverText`.
+   */
+  setHoverText(hover: HoverText | null): void {
+    this.releaseClip(); // a persistent append-clip must not clip the restore
+    this.restoreHover();
+    this.hoverText = hover;
+    if (hover) this.paintHover(hover);
+  }
+
+  private restoreHover(): void {
+    const snap = this.hoverSnap;
+    this.hoverSnap = null;
+    if (snap) this.putBack(snap);
+  }
+
   private paintHover(h: HoverText): void {
-    const { ctx, dpr } = this;
+    const { ctx } = this;
     const td = h.text;
     const pad = td.halo?.width ?? 2;
     const left = (td.align === "middle" ? td.x - h.width / 2 : td.align === "end" ? td.x - h.width : td.x) - pad;
     const top = td.y - h.height / 2 - 1;
     const w = h.width + 2 * pad, ht = h.height + 2;
-    // Device-px rectangle clamped to the canvas.
     // Kept rectangle: the chip plus the halo's reach beyond it (the stroke is `pad` px on each side of the glyphs).
     const m = pad + 1;
-    const x0 = Math.max(0, Math.floor((left - m) * dpr)), y0 = Math.max(0, Math.floor((top - m) * dpr));
-    const x1 = Math.min(this.canvas.width, Math.ceil((left + w + m) * dpr)), y1 = Math.min(this.canvas.height, Math.ceil((top + ht + m) * dpr));
-    if (x1 > x0 && y1 > y0) {
-      const cv = this.snapCanvas ?? (this.snapCanvas = document.createElement("canvas"));
-      cv.width = x1 - x0; cv.height = y1 - y0; // resizing clears it; one reusable canvas, no per-hover allocation of a new one
-      cv.getContext("2d")?.drawImage(this.canvas, x0, y0, cv.width, cv.height, 0, 0, cv.width, cv.height);
-      this.hoverSnap = { cv, x: x0, y: y0, w: cv.width, h: cv.height };
-    }
+    const cv = this.snapCanvas ?? document.createElement("canvas");
+    this.snapCanvas = cv; // one reusable canvas, no per-hover allocation of a new one
+    this.hoverSnap = this.keep(cv, left - m, top - m, left + w + m, top + ht + m);
     ctx.save();
     this.setScreen();
     ctx.fillStyle = td.halo?.color ?? "#fff";
@@ -244,7 +332,6 @@ export class CanvasBackend implements Backend {
    *  ({@link paintTexts} — also used by the WebGL toPNG export composite, #219). Coords are
    *  CSS px; setScreen folds in the device-pixel ratio. */
   private drawTexts(): void {
-    this.hoverSnap = null; // a repaint drew over the pixels it kept; the hover below keeps fresh ones
     if (this.textData.length > 0) {
       const { ctx } = this;
       ctx.save();
@@ -252,7 +339,6 @@ export class CanvasBackend implements Backend {
       paintTexts(ctx, this.textData);
       ctx.restore();
     }
-    if (this.hoverText) this.paintHover(this.hoverText);
   }
 
   setPassThroughLayer(layer: PassThroughLayer): void {
@@ -276,8 +362,17 @@ export class CanvasBackend implements Backend {
       this.ptSnapshot = null;       // a fresh repaint supersedes any in-flight snapshot-pan
       this.render();                // clears + redraws the retained base map
     }
+    // Draw under the hover slots: take them off, draw, paint them back (O(overlays), not O(scene)).
+    const top = !this.ptSnapshot && this.hasTop();
+    if (top) this.liftTop();
     if (batch.points) this.drawPtBatch(name, batch.points);
     if (batch.paths) this.drawPathBatch(name, batch.paths);
+    if (top) this.paintTop();
+  }
+
+  /** Whether a hover slot (an overlay or the hover label) has painted over the live canvas. */
+  private hasTop(): boolean {
+    return this.overlaySnaps.length > 0 || this.hoverSnap !== null;
   }
 
   /** Capture the current canvas + transform so render() can snapshot-pan during a gesture. */
@@ -351,6 +446,9 @@ export class CanvasBackend implements Backend {
     const t = this.transform;
     const a = t.k / s.k;
     this.clearAll();
+    // The frozen raster replaces the pixels the hover slots kept (it shows the overlays as they were).
+    this.overlaySnaps.length = 0;
+    this.hoverSnap = null;
     // The snapshot is a device-px raster; the pan delta (t-s) is in CSS px, so scale it by dpr.
     ctx.setTransform(a, 0, 0, a, (t.x - a * s.x) * this.dpr, (t.y - a * s.y) * this.dpr);
     ctx.drawImage(this.ptSnapshot!.canvas, 0, 0);
@@ -461,7 +559,8 @@ export class CanvasBackend implements Backend {
   }
 
   toPNG(): string { this.render(); return this.canvas.toDataURL("image/png"); }
-  toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform, this.textData); }
+  // The overlays export after the scene, as WebGL's overlay layers do.
+  toSVG(): string { return svgFromLayers(this.width, this.height, [...this.layers, ...this.overlays], this.transform, this.textData); }
   destroy(): void {
     this.releaseClip();
     this.layers = [];

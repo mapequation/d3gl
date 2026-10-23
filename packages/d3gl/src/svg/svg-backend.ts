@@ -24,6 +24,19 @@ export class SvgBackend implements Backend {
    *  change rewrites this one element and never the placed set. */
   private hoverG: SVGGElement;
   private hoverText: HoverText | null = null;
+  /** The highlight overlays (#519), in a group of their own between the scene and the labels (where
+   *  WebGL draws them under its HTML labels), so a hover change rewrites this group's markup and never
+   *  the scene's. `overlayView` holds the world content under the view transform. */
+  private overlayG: SVGGElement;
+  private overlayView: SVGGElement;
+  private overlayRest: SVGGElement;
+  private overlays: readonly RenderLayer[] = [];
+  /** Some overlay is screen sizeMode, so a move must re-serialize the overlays too. */
+  private overlayHasScreen = false;
+  /** `overlayView` holds world content. Only then does a zoom write its transform: with nothing
+   *  highlighted a zoom stays ONE attribute write on `view` (the retained-document guard, #264). */
+  private overlayHasWorld = false;
+  private overlayDirty = false;
   /** True when some layer is screen sizeMode → `view`/strokes depend on the transform,
    *  so a move must re-serialize (no O(1) transform fast path). */
   private hasScreen = false;
@@ -48,7 +61,11 @@ export class SvgBackend implements Backend {
     this.screen = document.createElementNS(SVG_NS, "g");
     this.text = document.createElementNS(SVG_NS, "g");
     this.hoverG = document.createElementNS(SVG_NS, "g");
-    this.root.append(this.defs, this.view, this.screen, this.text, this.hoverG);
+    this.overlayG = document.createElementNS(SVG_NS, "g");
+    this.overlayView = document.createElementNS(SVG_NS, "g");
+    this.overlayRest = document.createElementNS(SVG_NS, "g");
+    this.overlayG.append(this.overlayView, this.overlayRest);
+    this.root.append(this.defs, this.view, this.screen, this.overlayG, this.text, this.hoverG);
     host.appendChild(this.root);
   }
 
@@ -94,8 +111,32 @@ export class SvgBackend implements Backend {
     this.hoverG.innerHTML = serializeHoverText(hover);
   }
 
+  /** Replace the highlight overlays; {@link renderOverlays} (or the next render()) writes them. */
+  setOverlays(layers: readonly RenderLayer[]): void {
+    this.overlays = layers;
+    this.overlayDirty = true;
+  }
+
+  /** Rewrite only the overlay group's markup (#519): O(overlay drawables), whatever the scene. A clipped
+   *  overlay also writes its clip silhouette (O(that clip layer)). */
+  renderOverlays(): void {
+    const { defs, world, screen, hasScreen } = svgBody(this.overlays, this.transform, this.layers);
+    this.overlayView.innerHTML = world;
+    // Its transform follows setTransform only while it has world content, so (re)point it here; an
+    // emptied group drops it, back to the pristine element a zoom never touches.
+    const hadWorld = this.overlayHasWorld;
+    this.overlayHasWorld = world !== "";
+    if (this.overlayHasWorld) this.overlayView.setAttribute("transform", viewTransform(this.transform));
+    else if (hadWorld) this.overlayView.removeAttribute("transform");
+    this.overlayRest.innerHTML = defs ? `<defs>${defs}</defs>${screen}` : screen;
+    this.overlayHasScreen = hasScreen;
+    this.overlayDirty = false;
+  }
+
   setTransform(t: ViewTransform): void {
     this.transform = t;
+    if (this.overlayHasWorld) this.overlayView.setAttribute("transform", viewTransform(t));
+    if (this.overlayHasScreen) this.overlayDirty = true;
     // O(1) for the common (all-world) case: just re-point the view group, and DON'T mark
     // dirty — the engine's following render() then no-ops (the retained DOM stands). With
     // screen-mode content the coords/strokes bake the transform, so a re-serialize is due.
@@ -114,9 +155,11 @@ export class SvgBackend implements Backend {
     this.root.setAttribute("height", String(height));
     this.root.setAttribute("viewBox", `0 0 ${width} ${height}`);
     this.dirty = true;
+    this.overlayDirty = true;
   }
 
   render(): void {
+    if (this.overlayDirty) this.renderOverlays();
     if (!this.dirty) return; // only the transform changed (already applied in setTransform)
     const { defs, world, screen, hasScreen } = svgBody(this.layers, this.transform);
     this.defs.innerHTML = defs;
@@ -127,7 +170,8 @@ export class SvgBackend implements Backend {
     this.dirty = false;
   }
 
-  toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform, this.textData); } // the hover is transient, not exported (as on WebGL)
+  // The overlays export after the scene, as WebGL's overlay layers do; the hover label is transient (as on WebGL).
+  toSVG(): string { return svgFromLayers(this.width, this.height, [...this.layers, ...this.overlays], this.transform, this.textData); }
   toPNG(): string {
     throw new Error("SvgBackend.toPNG: rasterize via a raster backend (canvas/webgl); SVG export is toSVG()");
   }

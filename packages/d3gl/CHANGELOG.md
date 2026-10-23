@@ -1,5 +1,11 @@
 # @mapequation/d3gl
 
+## 0.12.1
+
+### Patch Changes
+
+- [#530](https://github.com/mapequation/d3gl/pull/530) [`2c40ef8`](https://github.com/mapequation/d3gl/commit/2c40ef89c8be14fc01e74db3cf62504a598e7733) Thanks [@danieledler](https://github.com/danieledler)! - State networks: lump each physical node's state nodes in one leaf module into one node in the state and both views, as the map equation codes them ([#529](https://github.com/mapequation/d3gl/issues/529)). `stateNetwork(graph, { modules, lump: true })` or `net.lump(on)` toggles it (without modules every state node is in the root module: a node per physical node); the physical view and its layout are the same either way, and `net.lumped` maps a lump to its physical node and state nodes. `lumpStateGraph()` gives the lumped network on its own, merged by the same code that derives the physical graph.
+
 ## 0.12.0
 
 ### Minor Changes
