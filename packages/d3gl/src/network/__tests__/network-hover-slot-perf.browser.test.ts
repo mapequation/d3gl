@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll, vi } from "vitest";
+import { describe, it, expect, afterAll, afterEach, vi } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
@@ -16,8 +16,9 @@ import { CanvasBackend } from "../../canvas/canvas-backend.js";
  * group. LOD off: every node and link is drawn, so an O(N) path cannot hide behind a small frontier.
  *
  * Deterministic signatures, per hover change, independent of machine load:
- * - Canvas: zero `clearRect` (no full repaint), and `fill` + `stroke` calls bounded by the highlight's shapes;
- * - SVG: the scene's groups are never touched, and the elements written are bounded by the highlight's.
+ * - Canvas: zero `clearRect` (no full repaint), and `fill` + `stroke` calls ≤ `PER_CHANGE.canvas`;
+ * - SVG: the scene's groups are never touched, and the elements written ≤ `PER_CHANGE.svg`.
+ * Both are the worst change of the sweep, not an average over it.
  * The wall-clock median is a generous ceiling on top (information under load; an O(N) path is 10-100× over it).
  *
  * The 40 hover targets sit on a strip of their own with a 16 px pitch (above the bulk), so every move re-targets
@@ -28,6 +29,19 @@ const N = perfN(50_000, { max: 200_000 });
 const W = 640, H = 400;
 const TARGETS = 40, PITCH = 16, STRIP_Y = 20;
 const ROUNDS = 3;
+
+/**
+ * Per-backend limits per hover change, measured: exactly what the one-node highlight needs, so one more shape
+ * painted or element written per change fails. (Before #519 a change repainted the whole scene: O(nodes + links).)
+ * - Canvas: 1 `fill` + `stroke` call, the hovered node's ring.
+ * - SVG: 2 elements written, the overlay group's highlight markup.
+ * WebGL has no overlay slot (it redraws from resident GPU buffers): its hover sweep is guarded in
+ * `network-module-boundary-perf` (#476).
+ */
+const PER_CHANGE = {
+  canvas: { fillStroke: 1 },
+  svg: { written: 2 },
+} as const;
 
 function graph(): { positions: Float32Array; source: number[]; target: number[] } {
   const positions = new Float32Array(2 * N);
@@ -50,6 +64,7 @@ const median = (xs: number[]): number => {
 describe.each(["canvas", "svg"] as const)(`hover sweep, LOD off (no lod() set) — %s (n=${N})`, (backend) => {
   const host = perfHost(W, H);
   afterAll(() => host.remove());
+  afterEach(() => { vi.restoreAllMocks(); }); // a failed leg must not leak its spies' counts into the next
 
   it("a hover change repaints only the highlight: O(highlight), not O(nodes + links)", async () => {
     const net = network(host, { width: W, height: H, backend });
@@ -79,15 +94,21 @@ describe.each(["canvas", "svg"] as const)(`hover sweep, LOD off (no lod() set) �
     if (svg) mo.observe(svg, { subtree: true, childList: true, attributes: true });
 
     const rect = host.getBoundingClientRect();
-    const times: number[] = [];
+    const times: number[] = [], paints: number[] = [], writes: number[] = [];
     let changes = 0;
     for (let round = 0; round < ROUNDS; round++) {
       for (let i = 0; i < TARGETS; i++) {
-        const before = tips;
+        const before = tips, paint0 = fill.mock.calls.length + stroke.mock.calls.length;
+        count(mo.takeRecords());
+        const written0 = written;
         const t0 = performance.now();
         host.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 8 + PITCH * i, clientY: rect.top + STRIP_Y, bubbles: true }));
         const dt = performance.now() - t0;
-        if (tips > before) { changes++; times.push(dt); }
+        if (tips > before) {
+          changes++; times.push(dt);
+          count(mo.takeRecords());
+          paints.push(fill.mock.calls.length + stroke.mock.calls.length - paint0); writes.push(written - written0);
+        }
       }
     }
     count(mo.takeRecords());
@@ -101,10 +122,10 @@ describe.each(["canvas", "svg"] as const)(`hover sweep, LOD off (no lod() set) �
     expect(full.mock.calls.length, "full repaints during the sweep").toBe(0);
     if (backend === "canvas") {
       expect(clear.mock.calls.length, "the scene was repainted").toBe(0);
-      expect(perChange(fill.mock.calls.length + stroke.mock.calls.length), "fill + stroke calls per hover change").toBeLessThanOrEqual(8);
+      expect(Math.max(...paints), "fill + stroke calls per hover change").toBeLessThanOrEqual(PER_CHANGE.canvas.fillStroke);
     } else {
       expect(sceneMutations, "the scene's markup was touched").toBe(0);
-      expect(perChange(written), "elements written per hover change").toBeLessThanOrEqual(8);
+      expect(Math.max(...writes), "elements written per hover change").toBeLessThanOrEqual(PER_CHANGE.svg.written);
     }
     expect(median(times), "median ms per hover change").toBeLessThan(perfBudget(10));
     vi.restoreAllMocks();
