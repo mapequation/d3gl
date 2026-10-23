@@ -22,6 +22,20 @@ export const DROP_REACH = DROP_LENGTH - 1;
 /** `cot α`, as the shaders bake it. */
 export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
 
+/**
+ * The half-arrow band's outer control offsets, per unit width, in each leg's own frame (`u` along the leg, `o` its
+ * outward normal): the outer edge's control points are `P1 + width·(ALONG·u0 + ACROSS·o0)` and
+ * `P2 + width·(ALONG·u3 + ACROSS·o3)`, its ends `width·o` from the inner edge's. The drop is the same shape for every
+ * loop (a similarity of the {@link DROP_LENGTH} / {@link DROP_HALF_SPREAD} cubic), so one fitted pair keeps the
+ * band's width within 4% of `width` along the whole 230° turn, for widths up to 5 node radii and any head length
+ * up to a node radius (a single Tiller–Hanson offset dips to 64% at the far end; moving the controls straight out
+ * by `width·o`, as before #505's fix, crossed the edges there). Refit both if the drop's constants change: the
+ * unit test pins the width.
+ */
+export const DROP_OUTER_ALONG = 2;
+/** See {@link DROP_OUTER_ALONG}. */
+export const DROP_OUTER_ACROSS = 0.77;
+
 /** The drop's two control points from its ends `(sx, sy)` (the `P0` rim end) and `(tx, ty)` (`P3`). */
 export function dropControls(sx: number, sy: number, tx: number, ty: number, reach: number): [number, number, number, number] {
   const hx = 0.5 * (tx - sx);
@@ -50,7 +64,8 @@ export function traceDrop(ctx: Pick<DropContext, "moveTo" | "bezierCurveTo">, sx
 /**
  * Trace the drop as one filled half-arrow glyph (the `half-arrow` link style): its inner edge is the drop from
  * the rim end `(sx, sy)` to the head's base, its outer edge the same drop moved `width` OUTSIDE the loop (each leg
- * along its own normal, so the legs stay parallel), and its barbed head lands its tip on the rim at `(tx, ty)`,
+ * along its own normal, so the legs stay parallel, with the controls offset by {@link DROP_OUTER_ALONG} so the band keeps
+ * the same width round the far end), and its barbed head lands its tip on the rim at `(tx, ty)`,
  * pointing into the node. Head size as an ordinary half-arrow's (`10·∛width` long, `2·√width` barb), capped at half a
  * leg. Points are solved in the ends' space and emitted × `scale` (the screen-sizeMode bake). The GLSL twin is
  * {@link DROP_HALF_ARROW_GLSL}.
@@ -80,7 +95,11 @@ export function traceDropHalfArrow(ctx: DropContext, sx: number, sy: number, tx:
   ctx.lineTo(tx * s, ty * s);
   ctx.lineTo((bx + (width + barb) * o3x) * s, (by + (width + barb) * o3y) * s);
   ctx.lineTo((bx + width * o3x) * s, (by + width * o3y) * s);
-  ctx.bezierCurveTo((c2x + width * o3x) * s, (c2y + width * o3y) * s, (c1x + width * o0x) * s, (c1y + width * o0y) * s, (sx + width * o0x) * s, (sy + width * o0y) * s);
+  const ka = DROP_OUTER_ALONG * width;
+  const kc = DROP_OUTER_ACROSS * width;
+  const d1x = c1x + ka * u0x + kc * o0x, d1y = c1y + ka * u0y + kc * o0y;
+  const d2x = c2x + ka * u3x + kc * o3x, d2y = c2y + ka * u3y + kc * o3y;
+  ctx.bezierCurveTo(d2x * s, d2y * s, d1x * s, d1y * s, (sx + width * o0x) * s, (sy + width * o0y) * s);
   ctx.closePath();
 }
 
@@ -135,5 +154,5 @@ export const DROP_HALF_ARROW_GLSL = `
   vec2 x12 = p1 + tipLength * u3;
   vec2 x13 = x12 + width * o3;
   vec2 x14 = x13 + tipWidth * o3;
-  vec2 cp1 = c1 + width * o0;
-  vec2 cp2 = c2 + width * o3;`;
+  vec2 cp1 = c1 + width * (${f(DROP_OUTER_ALONG)} * u0 + ${f(DROP_OUTER_ACROSS)} * o0);
+  vec2 cp2 = c2 + width * (${f(DROP_OUTER_ALONG)} * u3 + ${f(DROP_OUTER_ACROSS)} * o3);`;
