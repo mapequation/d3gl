@@ -2768,7 +2768,11 @@ export interface DeclutterOptions {
   k: number;
   /** Aggregate draw-radius cap (matches {@link frontierCircles}), for the on-screen size. */
   maxAggregateRadius?: number;
-  /** Spacing multiplier on the exclusion radius (>1 = sparser, <1 = denser). Default 1. */
+  /**
+   * Multiplier on the exclusion distance: a glyph is dropped when its centre is within
+   * `spacing·(rᵢ + rⱼ)` of a kept glyph (>1 = sparser, <1 = denser). Default 2: kept glyphs keep a
+   * gap around them, so the links between them stay visible (#512); 1 drops only real overlaps.
+   */
   spacing?: number;
   /**
    * Cross-fade alpha (#133), indexed by tree-node id. A glyph mid-transition (`fadeAlpha[g] < 1`) is
@@ -2869,8 +2873,10 @@ function sortOrderByWeightDesc(sc: DeclutterFrontierScratch, F: number): Uint32A
 
 /**
  * Thin an LOD frontier in screen space: keep higher-importance glyphs (by tree {@link LODTree.weight}
- * = strength) and drop lower-importance ones that would **overlap** a kept glyph (centre distance <
- * sum of the two radii). Greedy in descending importance over a uniform screen grid, so a dense
+ * = strength) and drop lower-importance ones whose centre lies within `spacing·(rᵢ + rⱼ)` of a kept
+ * glyph. The default spacing 2 also drops near neighbours, so kept glyphs keep a gap around them and
+ * the links between them stay visible; in a small graph that can hide a whole non-overlapping module
+ * aggregate (#512). Spacing 1 drops only glyphs that really **overlap** a kept one. Greedy in descending importance over a screen grid, so a dense
  * cluster keeps its most important members and the kept set is overlap-free (no overdraw). Runs per
  * cut, so it's zoom-dependent — more glyphs resolve as you zoom in. Returns the kept frontier ids
  * (original order).

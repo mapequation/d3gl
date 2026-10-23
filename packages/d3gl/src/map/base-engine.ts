@@ -1363,6 +1363,13 @@ export abstract class BaseEngine {
     if (this.interacting && spec.hideOnInteraction) return;
     const backend = this.handle?.backend;
     if (!backend) return; // pre-install: installBackend pushes overlays with setLayers
+    if (backend.setOverlays && backend.renderOverlays) {
+      // The overlay slot (#519): repaint only the overlays, O(highlighted), not the whole scene.
+      if (this.skipPlaceholderPaint()) return;
+      backend.setOverlays(this.overlayRenderLayers());
+      backend.renderOverlays();
+      return;
+    }
     backend.updateLayer(spec.name + HIGHLIGHT_SUFFIX, this.overlayRenderLayer(spec));
     this.render();
   }
@@ -1383,10 +1390,14 @@ export abstract class BaseEngine {
     return out;
   }
 
-  /** Everything the backend should draw: user layers in declaration order, then
-   *  highlight overlays on top. */
-  private allRenderLayers(): RenderLayer[] {
-    return [...this.renderSpecs().map((s) => this.renderLayer(s)), ...this.overlayRenderLayers()];
+  /** Hand `backend` everything it should draw: user layers in declaration order, then the highlight
+   *  overlays on top — in its overlay slot when it has one (#519), else as the last layers. */
+  private pushRenderLayers(backend: Backend): void {
+    const layers = this.renderSpecs().map((s) => this.renderLayer(s));
+    if (backend.setOverlays) {
+      backend.setLayers(layers);
+      backend.setOverlays(this.overlayRenderLayers());
+    } else backend.setLayers([...layers, ...this.overlayRenderLayers()]);
   }
 
   /** Recompose + write the effective colors for `ids`: base accessor value with the
@@ -2675,10 +2686,10 @@ export abstract class BaseEngine {
     // backend reads too, so skipping them would only move identical work later (the #201 rule).
     for (const spec of this.specs) if (spec.declutter) this.cullDeclutter(spec, this.transform);
     // #273: a large scene is not worth pushing to `"auto"`'s throwaway placeholder canvas —
-    // `allRenderLayers()` alone materializes one DrawableVector per drawable, and the paint that
+    // `pushRenderLayers()` alone materializes one DrawableVector per drawable, and the paint that
     // follows is discarded by the WebGL install ~100-200 ms later.
     if (this.skipPlaceholderPaint()) return;
-    this.handle?.backend.setLayers(this.allRenderLayers());
+    if (this.handle) this.pushRenderLayers(this.handle.backend);
     this.handle?.backend.setTransform(this.transform);
     this.render();
     // render() above clears the canvas and redraws ONLY the retained layers — it has no
@@ -2760,7 +2771,7 @@ export abstract class BaseEngine {
     // `currentBackend === "webgl"`, so the real first paint is never skipped. `setTransform` runs
     // either way (O(1), and it keeps the surface correctly framed), in its original position.
     const paint = !this.skipPlaceholderPaint();
-    if (paint) next.backend.setLayers(this.allRenderLayers());
+    if (paint) this.pushRenderLayers(next.backend);
     next.backend.setTransform(this.transform);
     if (paint) next.backend.render();
     // Replay retained pass-through layers onto the freshly-installed backend (mirrors the
@@ -2842,7 +2853,7 @@ export abstract class BaseEngine {
    * one covers the geometry WebGL renders too — every `geoMap` layer, `plot.layer()`, every
    * non-decluttered `points()` layer. That geometry must still be BUILT (withholding it would only
    * move identical work later), but pushing and painting it on `"auto"`'s placeholder canvas is
-   * pure waste: `allRenderLayers()` materializes one `DrawableVector` per drawable and
+   * pure waste: `pushRenderLayers()` materializes one `DrawableVector` per drawable and
    * `CanvasBackend.render()` then runs `drawShapes` over all of them, ~0.7 µs each, for a frame the
    * WebGL install discards ~100-200 ms later. Above {@link AUTO_PLACEHOLDER_MAX_ELEMENTS} the
    * placeholder is therefore left correctly sized but EMPTY. Nothing about page layout depends on
