@@ -473,6 +473,64 @@ describe("network shader highlight: selection.others dim + outgoing links (#162)
     net.destroy();
   });
 
+  it("#538 a selected node collapsed into a module: the module rings faintly and stays undimmed, its links unlit", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules of two nodes; at k=1 each collapses to one aggregate glyph. Edge 1→2 joins the modules.
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
+    net.data(g).style({ directed: true, nodeRadius: 8 }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // each module's two members (15 apart) overlap, so it stays collapsed (#426)
+    net.interactive({ selectable: { multi: true } });
+    net.setTransform(T);
+
+    const tree = (net as any).lodTree;
+    const frontier = [...(baseLane(net).visible as Uint32Array)];
+    const holder = frontier.find((id) => id >= tree.leafCount && leavesUnder(tree, id).includes(0))!;
+    const other = frontier.find((id) => id >= tree.leafCount && id !== holder)!;
+    expect(holder).toBeDefined();
+    expect(other).toBeDefined();
+    expect(frontier).not.toContain(0); // leaf 0 is collapsed into `holder`
+
+    net.select("nodes", [0]);
+    // The module holding leaf 0 rings, in the faint select colour (red at 0.45 of its alpha).
+    expect([...(hlLane(net).visible as Uint32Array)]).toEqual([holder]);
+    const ring = layer(emit(hlLane(net)), "network-highlight:ring").circles;
+    expect(ring.count).toBe(1);
+    expect([...(ring.borderColors as Uint8Array).subarray(0, 4)]).toEqual([220, 38, 38, Math.round(255 * 0.45)]);
+    // It is kept undimmed; the other module is not.
+    const base = emit(baseLane(net));
+    const nodes = layer(base, "nodes").circles;
+    const groups = [...(nodes.groups as Float32Array)];
+    expect((nodes.selected as Uint8Array)[groups.indexOf(holder)]).toBe(1);
+    expect((nodes.selected as Uint8Array)[groups.indexOf(other)]).toBe(0);
+    // Its links are not lit: only a selected node's own links are (the module's carry its whole flow).
+    const links = linkData(layer(base, "links"));
+    expect(links.count).toBeGreaterThan(0);
+    expect([...(links.selected as Uint8Array).subarray(0, links.count)].every((f) => f === 0)).toBe(true);
+    // Marked once for this selection: the emits and a zoom frame read the holders, they do not re-mark them.
+    const builds = net.holderStats.builds;
+    expect(net.holderStats.holders).toBe(2); // the module and the root above it
+    net.setTransform({ k: 1.01, x: 0, y: 0 });
+    emit(hlLane(net));
+    expect(net.holderStats.builds).toBe(builds);
+
+    // Zoomed in on leaf 0, it is drawn and takes the full select ring, and its module no ring.
+    const k = 12;
+    const zoomed = { k, x: 100 - tree.cx[0] * k, y: 100 - tree.cy[0] * k };
+    net.setTransform(zoomed);
+    baseLane(net).update(zoomed, 200, 200);
+    expect([...(baseLane(net).visible as Uint32Array)]).toContain(0);
+    expect([...(hlLane(net).visible as Uint32Array)]).toEqual([0]);
+    const leafRing = layer(hlLane(net).update(zoomed, 200, 200), "network-highlight:ring").circles;
+    expect([...(leafRing.borderColors as Uint8Array).subarray(0, 4)]).toEqual([220, 38, 38, 255]);
+
+    // Cleared, no holder rings.
+    net.select("nodes", null);
+    net.setTransform(T);
+    expect([...(hlLane(net).visible as Uint32Array)]).toEqual([]);
+    net.destroy();
+  });
+
   it("#3 modular-map: hovering an aggregate pushes its group id as the hover uniform (no re-emit)", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });

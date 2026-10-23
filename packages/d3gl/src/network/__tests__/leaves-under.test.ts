@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { leavesUnder, lodTreeFromTopology, ancestorAwareSelected } from "../lod.js";
+import { leavesUnder, lodTreeFromTopology, ancestorAwareSelected, markHolders } from "../lod.js";
 import type { LODTopology } from "../lod.js";
 
 /**
@@ -72,5 +72,50 @@ describe("ancestorAwareSelected (#162)", () => {
   it("selecting the root marks every node", () => {
     const isSel = ancestorAwareSelected(parent, (g) => g === 6);
     expect([0, 1, 2, 3, 4, 5, 6].map((g) => isSel(g))).toEqual([true, true, true, true, true, true, true]);
+  });
+});
+
+describe("markHolders (#538)", () => {
+  // tinyTree: root 6 ├─ 4 ─ {0,1}  └─ 5 ─ {2,3}; parent pointers for that tree.
+  const parent = Int32Array.from([4, 4, 5, 5, 6, 6, -1]);
+  const holders = (flags: Uint8Array): number[] => [...flags.keys()].filter((g) => flags[g] === 1);
+
+  it("marks every strict ancestor of a selected leaf, and nothing else", () => {
+    const flags = new Uint8Array(7);
+    const marked: number[] = [];
+    markHolders(parent, new Set([2]), flags, marked);
+    expect(holders(flags)).toEqual([5, 6]);
+    expect([...marked].sort()).toEqual([5, 6]);
+  });
+
+  it("marks each holder once, however many selected nodes it holds", () => {
+    const flags = new Uint8Array(7);
+    const marked: number[] = [];
+    markHolders(parent, [0, 1, 2, 3, 4, 5], flags, marked);
+    expect(holders(flags)).toEqual([4, 5, 6]);
+    expect(marked.length).toBe(3); // a climb stops at the first holder already marked
+  });
+
+  it("a selected module holds too when a selected node is under it", () => {
+    const flags = new Uint8Array(7);
+    markHolders(parent, [4, 0], flags, []);
+    expect(holders(flags)).toEqual([4, 6]);
+  });
+
+  it("clears the previous marks, through the list, before marking again", () => {
+    const flags = new Uint8Array(7);
+    const marked: number[] = [];
+    markHolders(parent, [2], flags, marked);
+    markHolders(parent, [0], flags, marked);
+    expect(holders(flags)).toEqual([4, 6]);
+    markHolders(parent, [], flags, marked);
+    expect(holders(flags)).toEqual([]);
+    expect(marked).toEqual([]);
+  });
+
+  it("skips ids that are not tree nodes, and the root holds nothing above it", () => {
+    const flags = new Uint8Array(7);
+    markHolders(parent, ["a", -1, 7, 99, 1.5, 6], flags, []);
+    expect(holders(flags)).toEqual([]);
   });
 });
