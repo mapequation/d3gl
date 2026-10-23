@@ -56,6 +56,8 @@ interface Case {
   selfWeights?: number[];
   /** LOD on, every leaf kept (the loops of an LOD frame's kept leaves). */
   lod?: boolean;
+  /** The link width (default 3). */
+  linkWidth?: number;
 }
 
 async function draw(c: Case) {
@@ -65,7 +67,7 @@ async function draw(c: Case) {
   const g = buildGraph({ nodeCount: 2, source: [0, ...self.map(() => 0)], target: [1, ...self.map(() => 0)], weight: [1, ...self], directed: c.directed });
   net
     .data(g)
-    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: 3, arrowSize: 4, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode })
+    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: c.linkWidth ?? 3, arrowSize: 4, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode })
     .lod(c.lod ? { expandPx: 1, declutter: false } : false)
     .layout({ backend: "positions", positions: POSITIONS });
   net.setTransform({ k: 1, x: 0, y: 0 });
@@ -174,6 +176,19 @@ describe("self-link loops (#505)", () => {
     expect(net.pick(100, CY)?.id).toBe(0); // the 0–1 leaf link still picks as edge 0
     net.destroy();
   });
+
+  for (const backend of BACKENDS)
+    for (const sizeMode of SIZE_MODES)
+      it(`${backend} / ${sizeMode}: the half-arrow loop's band is one link width thick at its far end`, async () => {
+        // The loop's axis (row CY, left of the node) crosses only the band's far end: the drop's apex, then the outer
+        // edge `width` further out. An outer edge moved straight out per leg crossed the inner one there (#505).
+        const width = 8;
+        const net = await draw({ backend, sizeMode, directed: true, linkStyle: "half-arrow", linkWidth: width });
+        const run = await redPixels(frame(net, backend), 0, CY, CX - R - 1, CY + 1);
+        net.destroy();
+        expect(run).toBeGreaterThan(width - 1.5);
+        expect(run).toBeLessThan(width + 1.5);
+      });
 
   it("webgl: a half-arrow loop level with its neighbour (a vertical chord) bows outward in world mode", async () => {
     // Node 1 exactly level with node 0 (θ = π): the chord is vertical, the case the lane's side rule decides from

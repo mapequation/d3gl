@@ -149,6 +149,65 @@ describe("self-loop geometry", () => {
       expect(Math.abs(across(fx, fy))).toBeGreaterThan(Math.abs(across(so[0] ?? 0, so[1] ?? 0)));
     }
   });
+
+  it("keeps the half-arrow drop's band one width wide round the whole curve, its edges never crossing", () => {
+    const loops = buildSelfLoopIndex([0], [0], [1], 1);
+    if (!loops) throw new Error("expected loops");
+    const r = 10;
+    type Pt = [number, number];
+    const cubic = (a: Pt, b: Pt, c: Pt, d: Pt, t: number): Pt => {
+      const u = 1 - t;
+      const w0 = u * u * u, w1 = 3 * u * u * t, w2 = 3 * u * t * t, w3 = t * t * t;
+      return [w0 * a[0] + w1 * b[0] + w2 * c[0] + w3 * d[0], w0 * a[1] + w1 * b[1] + w2 * c[1] + w3 * d[1]];
+    };
+    for (const theta of [-2.5, 0, 1.2]) {
+      for (const width of [0.5, 2, 10, 50]) {
+        const so = new Float32Array(2);
+        const to = new Float32Array(2);
+        loopEnds(loops, [theta], [r], so, to);
+        // The two cubics in trace order: [start, c1, c2, end] for the inner edge, then the outer.
+        const curves: Pt[][] = [];
+        let at: Pt = [0, 0];
+        const lines: Pt[] = [];
+        const rec = {
+          moveTo: (x: number, y: number) => void (at = [x, y]),
+          lineTo: (x: number, y: number) => {
+            at = [x, y];
+            lines.push(at);
+          },
+          bezierCurveTo: (a: number, b: number, c: number, d: number, x: number, y: number) => {
+            curves.push([at, [a, b], [c, d], [x, y]]);
+            at = [x, y];
+          },
+          closePath: () => undefined,
+        };
+        traceDropHalfArrow(rec, so[0] ?? 0, so[1] ?? 0, to[0] ?? 0, to[1] ?? 0, width, DROP_REACH);
+        const [inner, outer] = curves;
+        if (!inner || !outer) throw new Error("expected two edge cubics");
+        const [i0, i1, i2, i3] = inner;
+        const [o0, o1, o2, o3] = outer;
+        if (!i0 || !i1 || !i2 || !i3 || !o0 || !o1 || !o2 || !o3) throw new Error("expected cubic control points");
+        const dense: Pt[] = [];
+        for (let k = 0; k <= 2000; k++) dense.push(cubic(i0, i1, i2, i3, k / 2000));
+        for (let k = 0; k <= 40; k++) {
+          const q = cubic(o0, o1, o2, o3, k / 40);
+          let best = Infinity;
+          let near: Pt = [0, 0];
+          for (const p of dense) {
+            const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+            if (d < best) [best, near] = [d, p];
+          }
+          expect(Math.abs(best / width - 1)).toBeLessThan(0.1);
+          // Outside the loop: the outer sample is farther from the node centre than its nearest inner point.
+          expect(Math.hypot(q[0], q[1])).toBeGreaterThan(Math.hypot(near[0], near[1]));
+        }
+        // The barb tip (the lineTo after the inner edge) lands on the rim.
+        const [tip] = lines;
+        if (!tip) throw new Error("expected the head's tip");
+        expect(Math.hypot(tip[0], tip[1])).toBeCloseTo(r, 4);
+      }
+    }
+  });
 });
 
 describe("self-loop cache and layers (per-frame cost)", () => {
