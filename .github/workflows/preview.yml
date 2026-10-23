@@ -39,10 +39,11 @@ jobs:
           dist: preview
           teardown: "true"
           failOnError: "true"
+          # Each line runs as one command without a shell: no redirects or pipes.
           build: |
             pnpm install --frozen-lockfile
             pnpm --filter @d3gl/website build
             mkdir -p preview
             cp -R website/dist preview/d3gl
             cp website/dist/404.html preview/404.html
-            printf '<!doctype html>\n<meta http-equiv="refresh" content="0; url=/d3gl/">\n<a href="/d3gl/">d3gl</a>\n' > preview/index.html
+            cp .github/preview/index.html preview/index.html
