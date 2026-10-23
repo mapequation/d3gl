@@ -22,8 +22,8 @@ export { bezierControl, bentEndTangent };
 
 /**
  * A built-in per-node metric d3gl can read directly, or a custom `(index, graph) => value` accessor.
- * `"degree"` is the neighbour count ({@link CSR.degree}); `"strength"` the weighted degree
- * ({@link NetworkGraph.strength}); `"flow"` the app-provided {@link NetworkGraph.flow} (errors if absent).
+ * `"degree"` is the number of incident edges ({@link NetworkGraph.degree}); `"strength"` the weighted degree
+ * ({@link NetworkGraph.strength}) — both count a self-link once, as Infomap does; `"flow"` the app-provided {@link NetworkGraph.flow} (errors if absent).
  */
 export type NodeMetric = "degree" | "strength" | "flow" | ((index: number, graph: NetworkGraph) => number);
 
@@ -49,7 +49,7 @@ function metricAccessor(graph: NetworkGraph, by: NodeMetric): (index: number) =>
   if (typeof by === "function") return (i) => by(i, graph);
   switch (by) {
     case "degree":
-      return (i) => graph.csr.degree[i]!;
+      return (i) => graph.degree[i] ?? 0;
     case "strength":
       return (i) => graph.strength[i]!;
     case "flow": {
@@ -75,7 +75,7 @@ export function resolveNodeRadii(graph: NetworkGraph, spec: NodeRadiusSpec): Flo
   }
   const radii = new Float32Array(n);
   if (typeof spec === "function") {
-    const degree = graph.csr.degree;
+    const degree = graph.degree;
     for (let i = 0; i < n; i++) radii[i] = spec(degree[i]!, i, graph);
     return radii;
   }

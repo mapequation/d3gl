@@ -140,12 +140,14 @@ net.style({ nodeRadius: { by: "strength", scale: scaleSqrt().range([2, 20]) } })
 - a **`number`** — one constant radius for every node (the default is 4);
 - a **function** `(degree, index, graph) => radius` — the node's degree is the first argument, so a
   bare d3 scale works; `index`/`graph` are there for anything custom;
-- **`{ by, scale }`** — feed a metric through any scale, where `by` is `"degree"` (neighbour count),
-  `"strength"` (weighted degree — summed incident edge weights), `"flow"` (an app-provided per-node
-  value, see below), or your own `(index, graph) => value` accessor;
+- **`{ by, scale }`** — feed a metric through any scale, where `by` is `"degree"` (the number of
+  incident edges), `"strength"` (weighted degree — summed incident edge weights), `"flow"` (an
+  app-provided per-node value, see below), or your own `(index, graph) => value` accessor;
 - a **`Float32Array`** of per-node radii you computed yourself.
 
-`degree` and `strength` are derived from the edge list automatically. **Flow** is a model quantity
+`degree` and `strength` are derived from the edge list automatically (`graph.degree`, `graph.strength`).
+A self-link counts **once**, as in Infomap: a node with a self-link of weight `w` and one other link of
+weight `v` has degree 2 and strength `w + v`. **Flow** is a model quantity
 (e.g. an Infomap visit rate) that d3gl does not invent — supply it as `buildGraph({ …, nodeFlow })`
 to make `{ by: "flow", scale }` available.
 
@@ -279,8 +281,9 @@ when `directed`, or `half-arrow`) and the `sizeMode`, on WebGL, Canvas and SVG a
 
 Hovering or clicking a loop reports the node's first self-link edge with the summed weight, and the
 selection and hover highlight include it. With LOD on, a drawn leaf node keeps its loop; an aggregate
-draws none. In a [state network](#state-networks-physical--state-views) the state view and the both view draw loops; the
-physical view does not.
+draws none. In a [state network](#state-networks-physical--state-views) every view draws loops: the state view and the
+both view for the state graph's self-links, and the physical view for flow that stays inside a physical node
+— the state links between state nodes of one physical node, summed into that physical node's self-link.
 
 A graph without self-links pays one scan of its edges, once per graph, and nothing per frame. With
 self-links, each frame that moves the nodes updates the loops in place, in time linear in the loops and
