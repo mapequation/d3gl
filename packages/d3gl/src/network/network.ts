@@ -26,6 +26,7 @@ import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import { grownCapacity } from "../webgl/instanced.js";
 import type { NetworkGraph } from "./graph.js";
+import { planNetworkUpdate, type ModuleHierarchy, type NetworkUpdatePlan } from "./network-update.js";
 import { layoutBox, layoutFitTransform, fitCameraPath, type FitBox } from "./fit.js";
 import type { InstancedArrowsData, InstancedCirclesData, InstancedHalfArrowsData, InstancedLayer, InstancedLinesData, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
@@ -757,6 +758,21 @@ export interface NetworkDataOptions {
 }
 
 /**
+ * A change to the **flow and the modules** of the network the engine holds, for {@link Network.update} (#547): what
+ * a re-clustering (an Infomap run) gives. Indexed per node of the loaded network. A field left out is unchanged.
+ */
+export interface NetworkUpdateOptions {
+  /** The new per-node flow ({@link NetworkGraph.flow}), length `nodeCount`. The engine keeps its own copy. */
+  flow?: ArrayLike<number>;
+  /** The new module assignment, as {@link NetworkDataOptions.modules} takes it; `null` removes the modules and their
+   *  links. New modules keep the module links held until now unless `moduleLinks` replaces them. */
+  modules?: ArrayLike<ModuleNode> | null;
+  /** The new module links, as {@link NetworkDataOptions.moduleLinks} takes them; `null` removes them. Requires
+   *  modules, given here or held. */
+  moduleLinks?: ArrayLike<ModuleLink> | null;
+}
+
+/**
  * Options for {@link Network.stateNetwork} (#171). The engine ingests a state network + a per-**state-node**
  * module assignment, derives the physical network's overlapping-module pie wedges + module colours, and lets
  * you toggle the state ↔ physical view with {@link Network.view}.
@@ -849,7 +865,7 @@ const CONTAINER_RING_DARKEN = 0.62;
 const CONTAINER_RING_PX = 1;
 
 /** A state network's module hierarchy, or a plain network's (#326): the records with each node's record index. */
-type Hierarchy = { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; recordOf: Int32Array };
+type Hierarchy = ModuleHierarchy;
 
 /**
  * One of a state network's two layouts (#495): the physical graph's (drawn by the physical and both views) and the
@@ -1498,13 +1514,56 @@ export class Network extends BaseEngine {
    * Leaves any state-network mode ({@link stateNetwork}) — a plain graph replaces it.
    */
   data(graph: NetworkGraph, opts: NetworkDataOptions = {}): this {
-    const { modules, moduleLinks } = opts;
-    if (moduleLinks && !modules) throw new Error("network.data: moduleLinks requires modules");
-    const recordOf = modules ? moduleRecordIndex(graph.nodeCount, modules) : null;
-    if (modules && moduleLinks) checkModuleLinks(graph.nodeCount, modules, moduleLinks);
-    this.hierarchy = modules && recordOf ? { modules, moduleLinks, recordOf } : null;
+    // Load, then the step update() runs (#547): the module checks and the module handling live there.
+    const plan = planNetworkUpdate("network.data", graph.nodeCount, { modules: opts.modules ?? null, moduleLinks: opts.moduleLinks ?? null }, null);
     this.clearStateNetwork();
-    return this.setActiveGraph(graph);
+    this.adoptGraph(graph);
+    this.applyUpdate(plan);
+    return this.rebuild();
+  }
+
+  /**
+   * Change the **flow and the modules** of the network the engine holds (#547), keeping its nodes, links, weights and
+   * positions: what a re-clustering gives. `net.update({ flow, modules, moduleLinks })` — a field left out is
+   * unchanged, `modules: null` removes the modules and their links. Everything is checked first, as {@link data}
+   * checks its hierarchy, and a bad change throws with the engine unchanged; so does a call with no network loaded.
+   *
+   * Kept: the positions and the layout state, the camera, the selection (the same ids), and the style options — spec
+   * styles (`{ by: "flow" }`, `{ by: "module" }`) re-resolve against the new flow and modules. Rebuilt: the resolved
+   * style and module colours, the module tree (and so a LOD cut drawn from it, with its module links), the module
+   * springs and the nested discs. A structural or spatial LOD tree is kept, with its sizes and colours recomputed. A
+   * running layout stops, as `data()` stops it, and the positions stay where it left them: continue it warm with
+   * {@link layout} if you want to. `update()` itself never lays out. The caller's arrays are never written.
+   *
+   * O(nodes + total module path length + module links) for the checks and the copied flow, plus the module tree build
+   * when a LOD cut draws modules — no topology rebuild, no layout.
+   */
+  update(opts: NetworkUpdateOptions): this {
+    const graph = this.graph;
+    if (!graph) throw new Error("network.update: no network loaded");
+    if (this.stateData) throw new Error("network.update: state networks are not supported yet (#547)");
+    const plan = planNetworkUpdate("network.update", graph.nodeCount, opts, this.hierarchy);
+    this.applyUpdate(plan);
+    // The new module tree (or the kept tree's sizes and colours) before the one rebuild, as lod() would build it.
+    if (this.lodOptions) this.recomputeLODGeometry();
+    return this.rebuild();
+  }
+
+  /**
+   * Apply a checked change to the flow and the modules ({@link planNetworkUpdate}) to the loaded graph: the step
+   * {@link update} runs, and {@link data} runs after it loads a graph (#547). Stops a running layout, as its run was
+   * pulling with the previous modules; keeps the positions and the topology caches. The engine holds its own graph
+   * view with the new flow, sharing every other buffer with the caller's graph. The caller rebuilds.
+   */
+  private applyUpdate(plan: NetworkUpdatePlan): void {
+    const graph = this.graph;
+    if (!graph) return;
+    this.haltLayout();
+    this.moved = null; // the rebuild draws the whole graph
+    if (plan.flow) this.graph = { ...graph, flow: plan.flow };
+    if (plan.hierarchy !== undefined) this.hierarchy = plan.hierarchy;
+    this.dropModuleCaches();
+    this.dropStyleCaches();
   }
 
   /** Drop the state-network mode and everything derived from it (#494). */
@@ -1531,24 +1590,33 @@ export class Network extends BaseEngine {
     this.pieColumns.clear(); // the previous network's wedges
   }
 
-  /** Point the engine at `graph` and drop the per-graph caches (LOD tree, resolved style, parent cache).
-   *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
-   *  `data` it does NOT clear the state-network mode. */
-  private setActiveGraph(graph: NetworkGraph): this {
-    this.adoptGraph(graph);
-    return this.rebuild();
-  }
-
-  /** {@link setActiveGraph} without its rebuild: the caller rebuilds once it is done with the new graph. */
+  /** Point the engine at `graph` and drop the per-graph caches (layout, module tree, LOD tree, resolved style,
+   *  parent cache); unlike {@link data} it does NOT clear the state-network mode. The caller rebuilds once it is
+   *  done with the new graph. */
   private adoptGraph(graph: NetworkGraph): void {
     this.haltLayout(); // any worker layout is tied to the previous graph's buffers
     // …and so is everything the previous graph was laid out with.
+    this.dropModuleCaches();
+    this.laidOut = false;
+    this.showGraph(graph);
+  }
+
+  /** Drop what the graph's modules derive for its layouts (#547): the module tree, its springs, the nested discs. */
+  private dropModuleCaches(): void {
     this.moduleTreeCache = null;
     this.moduleSpringsCache = null;
     this.cancelModuleTreeJob();
-    this.laidOut = false;
     this.nestedDiscs = null;
-    this.showGraph(graph);
+  }
+
+  /** Drop the resolved style and what it derives from the flow and the modules (#547): ring and module colours,
+   *  module-boundary widths, link colours. */
+  private dropStyleCaches(): void {
+    this.lodBorderStyle = null; // the tree's ring colours
+    this.moduleAggregateFill = null; // and its module colours (#494)
+    this.boundaryWidths = null; // and its module-boundary widths
+    this.resolvedCache = null;
+    this.linkColors = null;
   }
 
   /**
@@ -1573,9 +1641,7 @@ export class Network extends BaseEngine {
       this.styleOpts = { ...this.styleOpts, nodeRadius: undefined };
     }
     // New topology + position buffer: drop the retained LOD tree and the resolved-style cache.
-    this.lodBorderStyle = null; // the previous graph's tree and its ring colours
-    this.moduleAggregateFill = null; // and its module colours (#494)
-    this.boundaryWidths = null; // and its module-boundary widths
+    this.dropStyleCaches();
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodWorkerSource = null;
@@ -1586,8 +1652,6 @@ export class Network extends BaseEngine {
     this.lodSpatial = false;
     this.lodModules = false;
     this.lodHasGeometry = false;
-    this.resolvedCache = null;
-    this.linkColors = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     this.fitBound = null; // tied to the old graph
   }
