@@ -263,8 +263,10 @@ demand (e.g. before a programmatic export).
 ### Self-links
 
 A **self-link** (an edge whose source and target are the same node) draws as a **loop** at its node:
-a teardrop that leaves and re-enters the node's rim, placed opposite the mean direction of the node's
-neighbours, so it points into the free space beside the node. A node with several self-link edges draws
+a drop that leaves the node's rim and comes back to it along two legs aimed at the node's centre, with
+a round far end. It is placed opposite the mean direction of the node's neighbours, so it points into the
+free space beside the node, and a directed loop's arrowhead points into the node like an ordinary link's
+head at its target. A node with several self-link edges draws
 **one** loop: their weights are summed, and the loop's width, colour and flow come from that sum. The
 placement is a fixed rule, not a style option. Loops follow the link style (`line`, with an arrowhead
 when `directed`, or `half-arrow`) and the `sizeMode`, on WebGL, Canvas and SVG alike, and in `toSVG()`.
