@@ -11,6 +11,7 @@ import type {
 import { PathRecorder } from "./path-recorder.js";
 import { DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
+import { traceDrop, traceDropHalfArrow } from "./loop-drop.js";
 import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
 
@@ -170,11 +171,13 @@ export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): Drawab
     out.push(
       drawable(e, {
         subpaths: record((ctx) => {
-          ctx.moveTo(sx, sy);
-          if (bend) {
+          if (l.curve === "drop") traceDrop(ctx, sx, sy, tx, ty, bend);
+          else if (bend) {
+            ctx.moveTo(sx, sy);
             const [cx, cy] = bezierControl(sx, sy, tx, ty, bend);
             ctx.quadraticCurveTo(cx, cy, tx, ty);
           } else {
+            ctx.moveTo(sx, sy);
             ctx.lineTo(tx, ty);
           }
         }),
@@ -241,6 +244,12 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
     const x1 = (h.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1);
     const y1 = (h.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1);
     const r = styleRow(h, e);
+    if (h.curve === "drop") {
+      const width = h.widths[r * 2] ?? 0;
+      const reach = h.bends[r] ?? 0;
+      out.push(drawable(e, { subpaths: record((ctx) => traceDropHalfArrow(ctx, x0, y0, x1, y1, width, reach, inv)), fill: linkColor(h, e) }));
+      continue;
+    }
     const geom = halfLinkGeometry({
       x0,
       y0,
@@ -251,9 +260,6 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
       width: h.widths[r * 2] ?? 0,
       oppositeWidth: h.widths[r * 2 + 1] ?? 0,
       bend: chordBend(x0, y0, x1, y1, h.bends[r] ?? 0),
-      // The shader's bow side: the centres' delta plus the offsets' delta, not the baked ends' delta (#505).
-      sideX: ((h.targets[e * 2] ?? 0) - (h.sources[e * 2] ?? 0)) * bake + offsetAt(to, e * 2, 1) - offsetAt(so, e * 2, 1),
-      sideY: ((h.targets[e * 2 + 1] ?? 0) - (h.sources[e * 2 + 1] ?? 0)) * bake + offsetAt(to, e * 2 + 1, 1) - offsetAt(so, e * 2 + 1, 1),
     });
     if (!geom) continue;
     const g = bake === 1 ? geom : scaleHalfLink(geom, inv);

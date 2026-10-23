@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { bezierControl, halfLinkGeometry, chordBend } from "../../core/half-link.js";
+import { DROP_HALF_SPREAD, DROP_LENGTH, DROP_REACH, dropControls, dropEndTangent, traceDropHalfArrow } from "../../core/loop-drop.js";
 import { StableColumns } from "../../core/stable-columns.js";
 import {
   keptLeafLoops,
@@ -11,20 +11,18 @@ import {
   buildSelfLoopIndex,
   selfLoopOfEdge,
   selfLoopAngles,
-  teardropEnds,
-  halfArrowLoopBend,
+  loopEnds,
+  loopArrowFrom,
   selfLoopCache,
   updateSelfLoops,
   selfLoopStats,
   selfLoopSelected,
   FALLBACK_ANGLE,
-  LOOP_REACH,
-  TEARDROP_BEND,
   SELF_LOOP_LAYER,
   SELF_LOOP_ARROW_LAYER,
 } from "../self-loops.js";
 
-/** Self-link loops (#505): one teardrop per node with a self-link, its duplicates summed. */
+/** Self-link loops (#505): one drop per node with a self-link, its duplicates summed. */
 
 const style = (n: number, over: Partial<ResolvedNetworkStyle> = {}): ResolvedNetworkStyle => ({
   nodeRadii: new Float32Array(n).fill(4),
@@ -86,26 +84,44 @@ describe("self-loop geometry", () => {
     expect(angles[1]).toBeCloseTo(FALLBACK_ANGLE, 6);
   });
 
-  it("puts both ends on the rim and the apex at r·(1 + reach) along θ", () => {
+  it("puts both ends on the rim, both end tangents through the centre, and the round far end along θ", () => {
     const loops = buildSelfLoopIndex([0], [0], [1], 1);
     if (!loops) throw new Error("expected loops");
     const r = 7;
-    for (const theta of [0, 1, -2, Math.PI]) {
-      const so = new Float32Array(2);
-      const to = new Float32Array(2);
-      teardropEnds(loops, [theta], [r], so, to);
-      expect(Math.hypot(so[0] ?? 0, so[1] ?? 0)).toBeCloseTo(r, 5);
-      expect(Math.hypot(to[0] ?? 0, to[1] ?? 0)).toBeCloseTo(r, 5);
-      // The quadratic's apex (t = ½) = (S + 2C + T) / 4.
-      const [cx, cy] = bezierControl(so[0] ?? 0, so[1] ?? 0, to[0] ?? 0, to[1] ?? 0, TEARDROP_BEND);
-      const ax = ((so[0] ?? 0) + 2 * cx + (to[0] ?? 0)) / 4;
-      const ay = ((so[1] ?? 0) + 2 * cy + (to[1] ?? 0)) / 4;
-      expect(Math.hypot(ax, ay)).toBeCloseTo(r * (1 + LOOP_REACH), 4);
-      expect(Math.atan2(ay, ax)).toBeCloseTo(Math.atan2(Math.sin(theta), Math.cos(theta)), 4);
+    // A node offset (the both view) moves the whole drop: the centre is then `o`, not the origin.
+    for (const [ox, oy] of [[0, 0], [30, -12]]) {
+      for (const theta of [0, 1, -2, Math.PI, 2.5]) {
+        const so = new Float32Array(2);
+        const to = new Float32Array(2);
+        loopEnds(loops, [theta], [r], so, to);
+        const sx = (so[0] ?? 0) + ox, sy = (so[1] ?? 0) + oy, tx = (to[0] ?? 0) + ox, ty = (to[1] ?? 0) + oy;
+        expect(Math.hypot(sx - ox, sy - oy)).toBeCloseTo(r, 4);
+        expect(Math.hypot(tx - ox, ty - oy)).toBeCloseTo(r, 4);
+        const [c1x, c1y, c2x, c2y] = dropControls(sx, sy, tx, ty, DROP_REACH);
+        // End tangents (P1 − P0, P3 − P2) parallel to the radius (P − c): their cross product is 0.
+        const cross = (ax: number, ay: number, bx: number, by: number): number => ax * by - ay * bx;
+        expect(cross(c1x - sx, c1y - sy, sx - ox, sy - oy) / r ** 2).toBeCloseTo(0, 5);
+        expect(cross(tx - c2x, ty - c2y, tx - ox, ty - oy) / r ** 2).toBeCloseTo(0, 5);
+        // Out along the first leg, back IN along the second: P1 beyond P0, P2 beyond P3, at DROP_LENGTH radii.
+        expect(Math.hypot(c1x - ox, c1y - oy)).toBeCloseTo(DROP_LENGTH * r, 4);
+        expect(Math.hypot(c2x - ox, c2y - oy)).toBeCloseTo(DROP_LENGTH * r, 4);
+        const [ex, ey] = dropEndTangent(sx, sy, tx, ty);
+        expect(ex * (tx - ox) + ey * (ty - oy)).toBeCloseTo(-r, 4); // the arrowhead points into the node
+        // The far end, B(½) = (P0 + 3P1 + 3P2 + P3) / 8, lies on θ beyond the rim.
+        const ax = (sx + 3 * c1x + 3 * c2x + tx) / 8 - ox;
+        const ay = (sy + 3 * c1y + 3 * c2y + ty) / 8 - oy;
+        expect(Math.hypot(ax, ay)).toBeCloseTo((r * Math.cos(DROP_HALF_SPREAD) * (2 + 6 * DROP_LENGTH)) / 8, 4);
+        expect(Math.atan2(ay, ax)).toBeCloseTo(Math.atan2(Math.sin(theta), Math.cos(theta)), 4);
+        // The arrowhead's foot is the drop's last control point.
+        const foot = new Float32Array(2);
+        loopArrowFrom(Float32Array.of(sx, sy), Float32Array.of(tx, ty), foot, 1);
+        expect(foot[0]).toBeCloseTo(c2x, 3);
+        expect(foot[1]).toBeCloseTo(c2y, 3);
+      }
     }
   });
 
-  it("bows the half-arrow loop outward at every angle (the half-arrow's direction-fixed side)", () => {
+  it("fills the half-arrow drop outside the loop, its tip on the rim at the target end", () => {
     const loops = buildSelfLoopIndex([0], [0], [1], 1);
     if (!loops) throw new Error("expected loops");
     const r = 10;
@@ -113,41 +129,24 @@ describe("self-loop geometry", () => {
       const theta = -Math.PI + (k * 2 * Math.PI) / 16;
       const so = new Float32Array(2);
       const to = new Float32Array(2);
-      teardropEnds(loops, [theta], [r], so, to);
-      const x0 = so[0] ?? 0, y0 = so[1] ?? 0, x1 = to[0] ?? 0, y1 = to[1] ?? 0;
-      const geom = halfLinkGeometry({ x0, y0, r0: 0, x1, y1, r1: 0, width: 1, oppositeWidth: 0, bend: chordBend(x0, y0, x1, y1, halfArrowLoopBend(x1 - x0, y1 - y0)) });
-      if (!geom) throw new Error("expected a half-arrow");
-      // The centre curve's control lies beyond the rim, along θ.
-      expect(geom.cp1x * Math.cos(theta) + geom.cp1y * Math.sin(theta)).toBeGreaterThan(r);
-    }
-  });
-});
-
-describe("half-arrow loop side", () => {
-  // The WebGL lane's rule, in float32: the side from the centres' delta (0 for a loop) plus the offsets' delta.
-  const laneOutward = (so: Float32Array, to: Float32Array, bend: number, theta: number): boolean => {
-    const sx = Math.fround(Math.fround(0) + Math.fround((to[0] ?? 0) - (so[0] ?? 0)));
-    const sy = Math.fround((to[1] ?? 0) - (so[1] ?? 0));
-    const curvature = sx > 0 || (sx === 0 && sy < 0) ? 1 : -1;
-    const dx = (to[0] ?? 0) - (so[0] ?? 0);
-    const dy = (to[1] ?? 0) - (so[1] ?? 0);
-    const len = Math.hypot(dx, dy);
-    // The bow goes along curvature · sign(bend) · right, right = (−dy, dx) / len; outward is along θ.
-    const along = (curvature * Math.sign(bend) * (-dy * Math.cos(theta) + dx * Math.sin(theta))) / len;
-    return along > 0;
-  };
-
-  it("bows outward on a vertical chord (θ ≈ 0, π), where the chord's x is rounding, at its exact angle", () => {
-    const loops = buildSelfLoopIndex([0], [0], [1], 1);
-    if (!loops) throw new Error("expected loops");
-    for (const theta of [0, Math.PI, -Math.PI, 1e-9, -1e-9, Math.PI - 1e-9, -Math.PI + 1e-9, 1e-30]) {
-      for (const r of [0.001, 3, 10, 12345]) {
-        const so = new Float32Array(2);
-        const to = new Float32Array(2);
-        teardropEnds(loops, [theta], [r], so, to);
-        const bend = halfArrowLoopBend((to[0] ?? 0) - (so[0] ?? 0), (to[1] ?? 0) - (so[1] ?? 0));
-        expect(laneOutward(so, to, bend, theta)).toBe(true);
-      }
+      loopEnds(loops, [theta], [r], so, to);
+      const pts: [number, number][] = [];
+      const rec = {
+        moveTo: (x: number, y: number) => pts.push([x, y]),
+        lineTo: (x: number, y: number) => pts.push([x, y]),
+        bezierCurveTo: (_a: number, _b: number, _c: number, _d: number, x: number, y: number) => pts.push([x, y]),
+        closePath: () => undefined,
+      };
+      traceDropHalfArrow(rec, so[0] ?? 0, so[1] ?? 0, to[0] ?? 0, to[1] ?? 0, 2, DROP_REACH);
+      // moveTo P0, inner → head base, tip, barb, outer start, outer → foot.
+      expect(pts).toHaveLength(6);
+      const [tipX, tipY] = pts[2] ?? [0, 0];
+      expect(tipX).toBeCloseTo(to[0] ?? 0, 5);
+      expect(tipY).toBeCloseTo(to[1] ?? 0, 5);
+      // The outer foot sits on the far side of the source leg from θ: outside the drop.
+      const [fx, fy] = pts[5] ?? [0, 0];
+      const across = (x: number, y: number): number => -x * Math.sin(theta) + y * Math.cos(theta);
+      expect(Math.abs(across(fx, fy))).toBeGreaterThan(Math.abs(across(so[0] ?? 0, so[1] ?? 0)));
     }
   });
 });

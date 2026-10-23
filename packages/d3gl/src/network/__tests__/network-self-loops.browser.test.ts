@@ -1,14 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { network, type NetworkLinkHit } from "../network.js";
 import { buildGraph } from "../graph.js";
-import { LOOP_REACH } from "../self-loops.js";
+import { DROP_HALF_SPREAD, DROP_LENGTH } from "../../core/loop-drop.js";
 
 /**
  * #505: a self-link draws as a loop at its node, on WebGL, Canvas and SVG, in both size modes; a directed one
  * shows its arrowhead; the half-arrow style draws it too; hovering or clicking the loop reports the self-link.
  *
  * Node 0 (at x = 60) has a self-link and one neighbour, node 1 (at x = 140), so its loop points away from it,
- * towards −x: its apex sits `r·(1 + LOOP_REACH)` left of the centre, outside the node.
+ * towards −x: its round far end, the drop's `B(½)`, sits `r·cos α·(2 + 6·DROP_LENGTH)/8` left of the centre, outside
+ * the node.
  */
 
 const W = 200;
@@ -17,7 +18,7 @@ const SIZE_MODES = ["screen", "world"] as const;
 const R = 10;
 const CX = 60;
 const CY = 100;
-const APEX_X = CX - R * (1 + LOOP_REACH);
+const APEX_X = CX - (R * Math.cos(DROP_HALF_SPREAD) * (2 + 6 * DROP_LENGTH)) / 8;
 const POSITIONS = new Float32Array([CX, CY, 140, CY]);
 
 function host(): HTMLElement {
@@ -182,4 +183,42 @@ describe("self-link loops (#505)", () => {
     net.destroy();
     expect(red).toBeGreaterThan(10);
   });
+});
+
+/** The red mask of an SVG document, rasterized, over the loop's box (1 = link colour). */
+async function svgRedMask(svg: string): Promise<Uint8Array> {
+  const img = new Image();
+  img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  await img.decode();
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = W;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("no 2d context");
+  ctx.drawImage(img, 0, 0, W, W);
+  const x0 = Math.floor(APEX_X - 8), y0 = CY - 16;
+  const d = ctx.getImageData(x0, y0, CX - x0, 32).data;
+  const out = new Uint8Array(d.length / 4);
+  for (let i = 0; i < out.length; i++) out[i] = (d[4 * i] ?? 0) > 180 && (d[4 * i + 1] ?? 0) < 90 && (d[4 * i + 2] ?? 0) < 90 ? 1 : 0;
+  return out;
+}
+
+describe("self-link drop export (#505)", () => {
+  for (const sizeMode of SIZE_MODES)
+    for (const linkStyle of ["line", "half-arrow"] as const)
+      it(`${sizeMode} / ${linkStyle}: WebGL toSVG() draws the same drop as the Canvas Scene`, async () => {
+        const gl = await draw({ backend: "webgl", sizeMode, directed: true, linkStyle });
+        const cv = await draw({ backend: "canvas", sizeMode, directed: true, linkStyle });
+        const a = gl.toSVG();
+        const b = cv.toSVG();
+        const ma = await svgRedMask(a);
+        const mb = await svgRedMask(b);
+        let red = 0, diff = 0;
+        for (let i = 0; i < ma.length; i++) {
+          red += ma[i] ?? 0;
+          if (ma[i] !== mb[i]) diff++;
+        }
+        expect(red, "the export drew no loop (non-vacuity)").toBeGreaterThan(20);
+        expect(diff, `${diff} of ${red} loop pixels differ`).toBeLessThanOrEqual(Math.max(4, red * 0.05));
+      });
 });
