@@ -3237,9 +3237,9 @@ export function traceSuperArrows(g: GroupBuilder, arrows: InstancedArrowsData, i
 
 /** How the pie meets its node's border (#507): `fractions` are the per-physical border widths as fractions of
  *  the radius — the node lane's own `borders` column (the flow border, else the node border). With `darken`
- *  (a flow border with no colour given) the pie spans the full radius and each wedge's outer band of that
- *  fraction is its own colour with RGB × `darken`; without it the pie sits inside the border, at the node's
- *  inner radius. */
+ *  (a flow border or node border with no colour given) the pie spans the full radius and each wedge's outer
+ *  band of that fraction is its own colour with RGB × `darken`; without it (an explicit border colour) the pie
+ *  sits inside the border, at the node's inner radius. */
 export interface PieBorder {
   fractions: ArrayLike<number>;
   darken?: number;

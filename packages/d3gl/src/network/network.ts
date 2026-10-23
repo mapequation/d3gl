@@ -3440,10 +3440,12 @@ export class Network extends BaseEngine {
   private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle, nodeBorders: Float32Array | undefined): InstancedLayer | null {
     if (this.activeView !== "physical" || !this.pieWedges) return null;
     // The node's border, by the node layer's own `borders` column of this emit (no copy, one rule with the
-    // disc's, #507): a flow border with no colour given shows through the pie — each wedge spans the full
-    // radius and darkens its own outer band by the border's factor; any other border (an explicit flow-border
-    // colour, a node border) shows around the pie, drawn at the node's inner radius (#171 review).
-    const darken = resolved.flowBorder?.darken;
+    // disc's, #507): a flow border or node border with no colour given shows through the pie — each wedge
+    // spans the full radius and darkens its own outer band by the border's factor; a border with an explicit
+    // colour shows around the pie, drawn at the node's inner radius (#171 review). A flow border, when
+    // present, is the node's border (the node border is not drawn then), so its factor wins.
+    const flowBorder = resolved.flowBorder;
+    const darken = flowBorder ? flowBorder.darken : resolved.constBorder?.darken;
     const border = nodeBorders ? { fractions: nodeBorders, darken } : undefined;
     const pie = physicalPieInstances(this.pieWedges, graph.positions, resolved.nodeRadii, this.pieColors() ?? undefined, border);
     if (pie.count === 0) return null;
@@ -5912,11 +5914,11 @@ export class Network extends BaseEngine {
     // Always registered (empty in the state view / when no pie wedges) so a view switch clears it.
     const wedges = this.activeView === "physical" ? this.pieWedges : null;
     const pieRGBA = wedges ? this.pieColors() : null; // the WebGL pie's colours (#494)
-    // A flow border with no colour given shows through the pie (#507): each wedge spans the full radius and its
-    // outer band, from the node's inner radius out, is its own drawable (id `bandIds + k`) in its colour with
-    // RGB × the border's factor — the WebGL pie shader's band. Any other border shows around the pie: traced
-    // at the INNER radius, as around a single-module disc (#171 review).
-    const bandDarken = flow?.darken;
+    // A flow border or node border with no colour given shows through the pie (#507): each wedge spans the full
+    // radius and its outer band, from the node's inner radius out, is its own drawable (id `bandIds + k`) in its
+    // colour with RGB × the border's factor — the WebGL pie shader's band. A border with an explicit colour shows
+    // around the pie: traced at the INNER radius, as around a single-module disc (#171 review).
+    const bandDarken = darken;
     const bandIds = wedges ? wedges.end.length : 0;
     const pieIds: number[] = [];
     if (wedges) {

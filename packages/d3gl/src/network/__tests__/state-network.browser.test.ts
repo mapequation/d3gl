@@ -461,10 +461,10 @@ describe("physical-view pie highlight (#175)", () => {
   });
 });
 
-// #507: a flow border with no colour given shows THROUGH the pie — each wedge spans the full radius and its
-// outer band (the flow border's width) is its own colour with RGB × BORDER_DARKEN, as a single-module disc's
-// ring is its fill's. Any other border (an explicit flow-border colour, a node border) shows AROUND the pie,
-// which sits at the node's inner radius. Same on WebGL, Canvas, SVG and both `toSVG()` exports.
+// #507: a flow border or node border with no colour given shows THROUGH the pie — each wedge spans the full
+// radius and its outer band (the border's width) is its own colour with RGB × BORDER_DARKEN, as a single-module
+// disc's ring is its fill's. A border with an explicit colour shows AROUND the pie, which sits at the node's
+// inner radius. Same on WebGL, Canvas, SVG and both `toSVG()` exports.
 describe("physical-view pie and the node's border (#507)", () => {
   const BORDER: [number, number, number] = [255, 0, 255];
   const BORDER_PX = 6;
@@ -493,30 +493,37 @@ describe("physical-view pie and the node's border (#507)", () => {
     return px;
   }
 
+  const defaultShade = {
+    flowBorder: { flowBorder: { scale: () => BORDER_PX, flow: new Float32Array([1, 1, 1]) } },
+    nodeBorder: { nodeBorder: { width: BORDER_PX } },
+  } as const;
   for (const source of sources) {
-    it(`${source}: with the default flow-border shade, each wedge shows its colour inside and RGB × BORDER_DARKEN in the band`, async () => {
-      const px = await render(source, { nodeRadius: PIE_R, flowBorder: { scale: () => BORDER_PX, flow: new Float32Array([1, 1, 1]) } });
-      const inner = PIE_R - BORDER_PX; // where the band starts
-      for (const p of [0, 1]) {
-        const wedgeColors = new Set<string>();
-        let checked = 0;
-        for (let i = 0; i < 24; i++) {
-          const a = ((i + 0.5) / 24) * 2 * Math.PI;
-          // Clear of a wedge's radial edge: two samples on each side agree (no edge anti-aliasing between them).
-          const [c1, c2] = [rgbaAt(px, at(p, 3, a)), rgbaAt(px, at(p, inner - 3, a))];
-          const [b1, b2] = [rgbaAt(px, at(p, inner + 2, a)), rgbaAt(px, at(p, PIE_R - 2, a))];
-          if (!near(c1, c2, 1) || !near(b1, b2, 1)) continue;
-          checked++;
-          wedgeColors.add(c1.slice(0, 3).join(","));
-          expect(near(b1, darker(c1), 2), `physical ${p} at ${i}/24: band ${b1} is not ${darker(c1)} (wedge ${c1})`).toBe(true);
+    for (const kind of ["flowBorder", "nodeBorder"] as const) {
+      const label = kind === "flowBorder" ? "flow-border" : "node-border";
+      it(`${source}: with the default ${label} shade, each wedge shows its colour inside and RGB × BORDER_DARKEN in the band`, async () => {
+        const px = await render(source, { nodeRadius: PIE_R, ...defaultShade[kind] });
+        const inner = PIE_R - BORDER_PX; // where the band starts
+        for (const p of [0, 1]) {
+          const wedgeColors = new Set<string>();
+          let checked = 0;
+          for (let i = 0; i < 24; i++) {
+            const a = ((i + 0.5) / 24) * 2 * Math.PI;
+            // Clear of a wedge's radial edge: two samples on each side agree (no edge anti-aliasing between them).
+            const [c1, c2] = [rgbaAt(px, at(p, 3, a)), rgbaAt(px, at(p, inner - 3, a))];
+            const [b1, b2] = [rgbaAt(px, at(p, inner + 2, a)), rgbaAt(px, at(p, PIE_R - 2, a))];
+            if (!near(c1, c2, 1) || !near(b1, b2, 1)) continue;
+            checked++;
+            wedgeColors.add(c1.slice(0, 3).join(","));
+            expect(near(b1, darker(c1), 2), `physical ${p} at ${i}/24: band ${b1} is not ${darker(c1)} (wedge ${c1})`).toBe(true);
+          }
+          expect(checked, `physical ${p}: too few clean samples`).toBeGreaterThanOrEqual(16);
+          expect(wedgeColors.size, `physical ${p}: the band hides a wedge`).toBe(2);
         }
-        expect(checked, `physical ${p}: too few clean samples`).toBeGreaterThanOrEqual(16);
-        expect(wedgeColors.size, `physical ${p}: the band hides a wedge`).toBe(2);
-      }
-      // The single-module disc (physical 2): its flow-border ring is still its fill × BORDER_DARKEN.
-      const fill = rgbaAt(px, at(2, 4, -Math.PI / 2));
-      expect(near(rgbaAt(px, at(2, PIE_R - BORDER_PX / 2, -Math.PI / 2)), darker(fill), 2), "the disc's flow border changed").toBe(true);
-    });
+        // The single-module disc (physical 2): its flow-border ring is still its fill × BORDER_DARKEN.
+        const fill = rgbaAt(px, at(2, 4, -Math.PI / 2));
+        expect(near(rgbaAt(px, at(2, PIE_R - BORDER_PX / 2, -Math.PI / 2)), darker(fill), 2), `the disc's ${label} changed`).toBe(true);
+      });
+    }
   }
 
   const explicit = {

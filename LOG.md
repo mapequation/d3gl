@@ -1002,15 +1002,16 @@ Bordered nodes are deliberately kept out of that diff (the ring-vs-stacked-discs
 fold them in when #269 converges the two encodings.
 
 
-**A pie shows a default-shade flow border through it (#507).** In a state network's physical view, with a
-flow border and no colour given, each pie wedge spans the node's full radius and its outer band, from
-`r · (1 − b)` out to `r` (`b` = the node's flow-border fraction, the node lane's `borders` column), is the wedge's
+**A pie shows a default-shade border through it (#507).** In a state network's physical view, with a flow
+border or node border and no colour given, each pie wedge spans the node's full radius and its outer band, from
+`r · (1 − b)` out to `r` (`b` = the node's border fraction, the node lane's `borders` column), is the wedge's
 own colour with RGB × `BORDER_DARKEN` — as a single-module disc's ring is its fill's. WebGL does it in the pie
 shader (one `a_border` float per wedge, the circle's `r > 1 − border` test); Canvas/SVG and both `toSVG()`
 exports draw each wedge as two drawables, its inner sector then its band as an annular sector
 (`tracePieSector`, core/instanced-vector.ts, shared by `tracePieWedges` and `pieToDrawables`), so no area is
-painted twice and a dimmed (translucent) wedge composites as the shader's single fragment does. Any other border
-(an explicit flow-border colour, a node border) keeps the pie inside it, at the node's inner radius. The vector
+painted twice and a dimmed (translucent) wedge composites as the shader's single fragment does. Both borders'
+default shade is the same `BORDER_DARKEN` (0.62); with a flow border the node border is not drawn, so the flow
+border's factor applies. A border with an explicit colour keeps the pie inside it, at the node's inner radius. The vector
 band's edges are flattened at bake time (world tolerance), so at a deep zoom Canvas/SVG show facets the shader
 does not.
 
