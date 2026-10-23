@@ -327,7 +327,10 @@ What it composes:
   zoom-dependent, so more resolve as you zoom in. Importance is summed up the tree (a module's is its
   members' total) and set by `style({ importance })` — a metric (`"degree"`/`"strength"`/`"flow"`), an
   accessor, a `Float32Array`, or `"order"`. It **defaults to the node-size metric**, so the biggest
-  glyph wins an overlap.
+  glyph wins an overlap. A glyph is hidden when its centre lies within `declutterSpacing·(rᵢ + rⱼ)` of a
+  kept glyph. The default `declutterSpacing: 2` keeps a gap around each kept glyph, so the links between
+  them stay visible, but in a small graph it can hide a whole module that doesn't overlap anything;
+  `declutterSpacing: 1` hides only real overlaps, and `declutter: false` hides nothing.
 - **Super-edges** draw connectivity between visible nodes (a leaf↔leaf graph edge, or an
   aggregate↔aggregate coarse edge); a visible node keeps its edges even when a neighbour is
   off-screen. By default they connect *same-level* pairs (and, in a ragged module tree, a leaf to a
@@ -969,6 +972,16 @@ over (a physical node ↔ its state nodes), and every hit, selection and label s
 links all follow your `sizeMode`. Call `lod()` once: it holds across view switches and applies
 to the state view; the physical view draws in full, every pie with it, until pies are LOD-aware. Under a
 module palette a collapsed module takes its own colour from it.
+
+**Lumped state nodes.** The map equation codes the state nodes of one physical node in one leaf module with one
+codeword: within that module they are one node. `stateNetwork(graph, { modules, lump: true })`, or `net.lump(on)`
+at any time, draws the state and both views that way, one node per (leaf module, physical node), its flow and links
+the sums of its state nodes' (`lumpStateGraph` gives the same network on its own). Without `modules` every state
+node is in the root module, so each physical node's state nodes are one node. The physical view is the same
+either way, and keeps its layout across the toggle. The state view keeps its picture: the other form starts where the
+current one's nodes are (each lump at its state nodes' centroid, or a lump's state nodes around it), and a warm
+layout settles it. While lumped, a
+state-level hit's id is a lump's: `net.lumped` maps it to its physical node and its state nodes, and back.
 
 The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
 of a disc — no wedge texture, no per-fragment loop), so a physical view with many overlapping nodes draws

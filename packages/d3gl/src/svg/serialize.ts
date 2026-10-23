@@ -97,11 +97,13 @@ function drawableElements(d: DrawableVector): string {
 export function svgBody(
   layers: readonly VectorLayer[],
   t: ViewTransform,
+  /** Where a layer's `clipTo` source is looked up (the hover overlays clip to a scene layer, #519). */
+  clipSources: readonly VectorLayer[] = layers,
 ): { defs: string; world: string; screen: string; hasScreen: boolean } {
   const defs: string[] = [];
   const groups: string[] = [];
   const screenCircleGroups: string[] = [];
-  buildGroups(layers, t, defs, groups, screenCircleGroups);
+  buildGroups(layers, t, defs, groups, screenCircleGroups, clipSources);
   return {
     defs: defs.join(""),
     world: groups.join(""),
@@ -135,6 +137,7 @@ function buildGroups(
   defs: string[],
   groups: string[],
   screenCircleGroups: string[],
+  clipSources: readonly VectorLayer[] = layers,
 ): void {
   for (const layer of layers) {
     const screenMode = layer.sizeMode === "screen";
@@ -142,7 +145,7 @@ function buildGroups(
     // A clipPath def referencing the named clip layer's silhouette.
     let clipAttr = "";
     if (layer.clipTo) {
-      const src = layers.find((l) => l.name === layer.clipTo);
+      const src = clipSources.find((l) => l.name === layer.clipTo);
       if (src) {
         const id = `clip-${layer.name}`;
         const shapes = src.drawables

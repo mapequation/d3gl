@@ -400,6 +400,18 @@ export interface Backend {
   setLayers(layers: RenderLayer[]): void;
   updateLayer(name: string, layer: RenderLayer): void;
   /**
+   * The highlight-overlay slot (#519), optional: the engine's hover/`highlight()` overlays, kept apart
+   * from {@link setLayers}' scene layers so a hover change repaints only them. A backend that has it is
+   * handed the overlays here (never in `setLayers`) and draws them after the scene on every `render()`;
+   * {@link renderOverlays} repaints only the overlays (Canvas puts back the pixels kept under the old
+   * ones and keeps the rectangle under the new; SVG rewrites one group), O(overlay drawables) instead of
+   * O(scene). `toSVG()` exports them after the scene layers, as WebGL's export of its overlay layers does. WebGL leaves it unimplemented: its
+   * overlays are ordinary layers re-uploaded in place (#218) and a frame redraws everything anyway.
+   */
+  setOverlays?(layers: readonly RenderLayer[]): void;
+  /** Repaint only the overlays set by {@link setOverlays}. Both are implemented together or not at all. */
+  renderOverlays?(): void;
+  /**
    * Styles-only fast path (optional): the per-drawable color/flag tables changed but
    * geometry did not (recolor / dim / show-hide). `drawables` is the refreshed vector
    * view (same drawables, same order) so vector-reading consumers (Canvas redraw, SVG
