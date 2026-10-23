@@ -77,6 +77,11 @@ directions of the rings enclosing it, and the ring is an outer where the fill tu
   `network-hierarchy.browser.test.ts` can mock `buildModuleLODTree` in `modules.js`), or run the worker's
   real code in-process on a timer (#377: `gpu/__tests__/_in-process-lod-worker.ts`) and keep every test that
   needs the real worker in a mock-free file.
+- **A `MutationObserver` count needs `takeRecords()` before `disconnect()`** (#519): records are delivered
+  in a microtask, so a guard that mutates, then disconnects synchronously, drops every pending record and
+  counts 0. The SVG leg of `network-labels-hover-vector-perf` asserted on such a count and passed vacuously
+  until #526. Read `observer.takeRecords()` (plus anything already delivered) after each step, and prove a
+  count-based guard can fail by breaking the counted path once on purpose.
 ## Perf-guard coverage map (#258 — check here before claiming a cell is covered)
 
 Which guard covers which cell of the per-frame rule (`docs/agents/performance.md`). **A cell that runs but asserts nothing is not covered** — that
