@@ -1,5 +1,21 @@
 # @mapequation/d3gl
 
+## 0.12.2
+
+### Patch Changes
+
+- [#523](https://github.com/mapequation/d3gl/pull/523) [`6d41987`](https://github.com/mapequation/d3gl/commit/6d419876693b7ae6abcc3d75bb6867c1d89ca1d4) Thanks [@danieledler](https://github.com/danieledler)! - Network, LOD off: a layout or drag frame no longer rebuilds and re-uploads the node border and flow border columns. They are built once per style and uploaded only when the style or the node colours change.
+
+- [#526](https://github.com/mapequation/d3gl/pull/526) [`93722da`](https://github.com/mapequation/d3gl/commit/93722da58649b45d2ebe440bae6062aa19daecfc) Thanks [@danieledler](https://github.com/danieledler)! - `interactive({ hover, tooltip })` now works on the Canvas and SVG backends without an `on()` handler: a pointer move over a node shows its hover highlight and tooltip, as on WebGL. A hover change on Canvas and SVG now redraws only the hovered glyph's highlight instead of the whole scene (Canvas puts back the pixels under the old highlight, SVG rewrites one group), which also speeds up hover in maps and plots.
+
+- [#525](https://github.com/mapequation/d3gl/pull/525) [`704220e`](https://github.com/mapequation/d3gl/commit/704220eadc5516de98ddf73d81ea071f52562cc1) Thanks [@danieledler](https://github.com/danieledler)! - Corrected the LOD declutter documentation: a glyph is hidden when its centre lies within
+  `declutterSpacing·(rᵢ + rⱼ)` of a kept glyph. The default `declutterSpacing: 2` keeps a gap around kept
+  glyphs so the links between them stay visible, which in a small graph can hide a module that overlaps
+  nothing; `declutterSpacing: 1` hides only real overlaps and `declutter: false` hides nothing. Behaviour
+  unchanged.
+
+- [#541](https://github.com/mapequation/d3gl/pull/541) [`7974d53`](https://github.com/mapequation/d3gl/commit/7974d534d1cd5e59dbdc084a96255aec508b6a02) Thanks [@danieledler](https://github.com/danieledler)! - Under LOD, a selected node collapsed into a module now shows on that module: the module takes a faint selection ring and is not dimmed, and the ring moves down to the node as you zoom in. Links still light only for the selected nodes themselves. WebGL only for now; Canvas and SVG are tracked in [#539](https://github.com/mapequation/d3gl/issues/539).
+
 ## 0.12.1
 
 ### Patch Changes
