@@ -3,7 +3,7 @@ import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, fro
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, markHolders, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
@@ -1352,6 +1352,10 @@ export class Network extends BaseEngine {
    *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
   private derivedParentFor: LODTree | null = null;
   private derivedParent: Int32Array | null = null;
+  /** The holders of the node selection on the LOD tree (#538, {@link markHolders}): rebuilt when the
+   *  selection or the tree changes ({@link holdersOf}), never per frame. `flags` only grows, and a rebuild
+   *  clears just the previous marks. `builds` counts the rebuilds, for {@link holderStats}. */
+  private readonly holders = { tree: null as LODTree | null, sel: null as ReadonlySet<string | number> | null, stale: true, flags: new Uint8Array(0), marked: [] as number[], builds: 0 };
   /** Frontier label options (#105 N7b); null until {@link labels} is enabled. The overlay itself
    *  ({@link BaseEngine.labelLayer}), its placement/routing, and the export-anchor retention for the
    *  WebGL export-only text stash (#219) all live in the base (shared with plot/geo labels, #223). */
@@ -3816,6 +3820,16 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * The holders of the node selection under LOD (#538): the modules a selected node is collapsed into, which
+   * the cut rings faintly and keeps undimmed where it draws them. `builds` counts how often they were marked
+   * (once per selection or tree change, never per frame), `holders` how many the last marking found.
+   * Introspection for debugging and tests: a zoom sweep under an unchanged selection leaves `builds` as it was.
+   */
+  get holderStats(): { builds: number; holders: number } {
+    return { builds: this.holders.builds, holders: this.holders.marked.length };
+  }
+
+  /**
    * Which position transport the active layout uses:
    * - `"gpu"` — running on the WebGL GPU path (the handle's `transport` field is `"gpu"`).
    * - `"shared"` — CPU worker, positions stream zero-copy via a `SharedArrayBuffer` (cross-origin isolated page).
@@ -4280,14 +4294,17 @@ export class Network extends BaseEngine {
         // children ring in the selection colour too (#162) — matching the kept-link/dim highlight.
         const isSel = lod && this.lodTree && selected?.size ? this.makeSelectedPredicate(this.lodTree, selected) : null;
         const selColored = (g: number): boolean => (isSel ? isSel(g) : !!selected?.has(g));
-        const ringed = ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined);
+        const hovered = this.hoveredIds(this.NODE_LAYER);
+        // A glyph ringed only because it holds a selected node (#538) takes the faint ring.
+        const held = isSel && this.lodTree && selected ? this.holdersOf(this.lodTree, selected) : null;
+        const faint = held ? (g: number): boolean => held[g] === 1 && !selColored(g) && !hovered?.has(g) : undefined;
+        const ringed = ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined, faint);
         const glyphRings: InstancedLayer = { name: ringName, primitive: "circles", sizeMode, circles: offsets ? { ...ringed, offsets: offsetsAt(visible, offsets) } : ringed };
         room.ring = roomAfter(glyphRings.circles.count, room.ring);
         if (!boundaries) {
           room.boundary = 0;
           return [glyphRings];
         }
-        const hovered = this.hoveredIds(this.NODE_LAYER);
         const lit = (g: number): boolean => !!selected?.has(g) || !!hovered?.has(g);
         const circles = rings ? boundaryHighlightCircles(rings, lit, (g) => (selColored(g) ? colors.select : colors.hover), this.transform.k) : none;
         room.boundary = roomAfter(circles.count, room.boundary);
@@ -4299,7 +4316,8 @@ export class Network extends BaseEngine {
   }
 
   /** Highlighted node ids currently on screen: (selection ∪ hover) ∩ frontier (LOD, **ancestor-aware** —
-   *  an expanded selected aggregate's children count, #162) or taken directly (no-LOD). Returns the
+   *  an expanded selected aggregate's children count, #162 — and with the glyphs that hold a selected node,
+   *  #538) or taken directly (no-LOD). Returns the
    *  shared empty sentinel when nothing is highlighted, so the per-frame ring re-emit costs O(1) until
    *  the user selects/hovers something. */
   private highlightVisible(source: InstancedLane | null, lod: boolean): Uint32Array {
@@ -4308,9 +4326,10 @@ export class Network extends BaseEngine {
     const hov = this.hoveredIds(this.NODE_LAYER);
     if (lod && source && this.lodTree) {
       const isSel = sel && sel.size ? this.makeSelectedPredicate(this.lodTree, sel) : null;
+      const held = sel && sel.size ? this.holdersOf(this.lodTree, sel) : null;
       const vis = source.visible;
       const out: number[] = [];
-      for (let i = 0; i < vis.length; i++) { const g = vis[i]!; if ((isSel && isSel(g)) || hov?.has(g)) out.push(g); }
+      for (let i = 0; i < vis.length; i++) { const g = vis[i]!; if ((isSel && isSel(g)) || held?.[g] === 1 || hov?.has(g)) out.push(g); }
       return out.length ? Uint32Array.from(out) : EMPTY_VISIBLE;
     }
     const ids = new Set<number>();
@@ -4493,6 +4512,7 @@ export class Network extends BaseEngine {
    *  the `selected` flag buffers in place — neither rebuilds the full geometry on a click. */
   protected override onLaneSelectionChanged(_layer: string): void {
     this.invalidateNoLodSelected(); // #240: the cached flag columns encode the OLD selection
+    this.holders.stale = true; // #538: and so do the holders (a click toggles the set in place)
     if (this.lodReady() && this.lodTree) this.emitInstancedLane(this.NET_LANE);
     else this.pushLaneHighlight((layer) => this.noLodSelectedFor(layer));
     this.emitInstancedLane(this.NET_HL_LANE);
@@ -4510,6 +4530,25 @@ export class Network extends BaseEngine {
    *  O(frontier·depth) bound), with parent pointers from {@link treeParent}. */
   private makeSelectedPredicate(tree: LODTree, sel: ReadonlySet<string | number>): (g: number) => boolean {
     return ancestorAwareSelected(this.treeParent(tree), (g) => sel.has(g));
+  }
+
+  /** Holder flags of `sel` on `tree` (#538): `flags[g] === 1` when a selected node is collapsed into tree node
+   *  `g`. Marked by the pure {@link markHolders} in O(selected + holders) when the selection or the tree has
+   *  changed since the last call, so the per-frame callers read one byte per frontier glyph. */
+  private holdersOf(tree: LODTree, sel: ReadonlySet<string | number>): Uint8Array {
+    const h = this.holders;
+    if (h.stale || h.tree !== tree || h.sel !== sel) {
+      if (h.flags.length < tree.size) {
+        h.flags = new Uint8Array(tree.size);
+        h.marked.length = 0;
+      }
+      markHolders(this.treeParent(tree), sel, h.flags, h.marked);
+      h.tree = tree;
+      h.sel = sel;
+      h.stale = false;
+      h.builds++;
+    }
+    return h.flags;
   }
 
   /** Parent-pointer array for the LOD tree: the tree's own `parent` (provided-module trees) or one
@@ -5417,12 +5456,17 @@ export class Network extends BaseEngine {
       fadeAlpha: this.fadeAlpha ?? undefined,
     });
     // #162: attach the shader-highlight columns for the frontier nodes — group = tree-node id (the hovered
-    // id matches its own node); selected = ancestor-aware. The shader dims non-highlighted + keeps
+    // id matches its own node); selected = ancestor-aware, or holding a selected node (#538: kept undimmed,
+    // while the link flags above stay the selected nodes' own). The shader dims non-highlighted + keeps
     // selected/hovered from these + the lane uniforms, so a hover/selection never rebuilds these buffers.
     circles.groups = this.lodColumns.float32("nodes.groups", Float32Array.from(frontier));
     if (isSel) {
+      const held = sel ? this.holdersOf(tree, sel) : null;
       const s = new Uint8Array(frontier.length);
-      for (let i = 0; i < frontier.length; i++) s[i] = isSel(frontier[i]!) ? 1 : 0;
+      for (let i = 0; i < frontier.length; i++) {
+        const g = frontier[i]!;
+        s[i] = isSel(g) || held?.[g] === 1 ? 1 : 0;
+      }
       circles.selected = this.lodColumns.uint8("nodes.selected", s);
     }
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
