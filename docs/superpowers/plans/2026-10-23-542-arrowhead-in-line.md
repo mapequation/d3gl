@@ -136,14 +136,24 @@ A zoom frame with LOD off uploads nothing before and after (assert in network-sw
    network.ts:259, 293-299; website network.mdx; changeset; LOG.md ("Backend compositing equivalence": heads
    from the line instance, shaft trim; coverage-map row). ~30 calls.
 
-## Open questions (user)
+## Decisions (user, 2026-10-23) — these OVERRIDE the sections above where they differ
 
-- Q1 draw order: (a, recommended) heads over the shafts of their layer via two draws — one divergence: on WebGL
-  with LOD the leaf heads draw before super-edge shafts while Canvas/SVG put all heads last (visible only where a
-  super-edge crosses a leaf head); (b) each head with its own link: one draw on WebGL, a filled outline per link
-  on Canvas/SVG (screen-mode shafts become baked fills).
-- Q2: remove the public `"arrows"` primitive, `InstancedArrowsData`, `InstancedArrows` (breaking in 0.x → minor)?
-- Q3: a link wider than the head (w > 2·size) still shows beside the head; grow the head with the width?
+- **One shape per link (Q1 = b).** Each directed link and its head are ONE shape: one strip per link on WebGL
+  (shaft, then the head through degenerate vertices; one draw call per layer, no separate head model), one filled
+  outline per link on Canvas/SVG/`toSVG()`. Screen-mode outlines are baked and snap at gesture end, as the
+  Canvas/SVG heads already do. No double-blended overlap for translucent links. Paint order is per link, like any
+  two overlapping links today.
+- **Naming (Q2).** The public `arrows` primitive becomes the WHOLE arrow (shaft + head as one shape); `lines` stays
+  headless. Today's heads-only `arrows` / `InstancedArrowsData` / `InstancedArrows` are replaced (breaking → the
+  release is a minor bump, 0.13).
+- **Head width (Q3).** The head reuses the half-arrow style's barb rule: it sticks out the same amount beyond the
+  line on BOTH sides, so it grows with the link width and the shaft always ends inside it (setback from the tip
+  where the head is as wide as the line). Find the half-arrow barb scaling and share it.
+- **Bent `line` links get a full (symmetric) head**, computed from the link's own curve end tangent; the one-sided
+  head stays only in the `half-arrow` style. Reason: bug seen 2026-10-23 — with `linkStyle: "line"` and a bend, the
+  separately drawn heads look one-sided, bend more than their lines and some sit outside their line. Check whether
+  that bug is on main (not only on the #528/#536 branches) and add a pixel test for it.
+- Timing: start after the user's quota reset (2026-10-24 evening), step 1 first; steps 2–5 after #528/#536 merge.
 
 ## Risks
 
