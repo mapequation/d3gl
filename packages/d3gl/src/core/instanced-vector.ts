@@ -9,10 +9,10 @@ import type {
   VectorLayer,
 } from "./backend.js";
 import { PathRecorder } from "./path-recorder.js";
-import { arrowOutline } from "./arrowhead.js";
+import { arrowOutline, headLength } from "./arrowhead.js";
 import { DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
-import { traceDrop, traceDropHalfArrow } from "./loop-drop.js";
+import { loopHalfArrowOutline, traceLoop, traceOutline } from "./loop-drop.js";
 import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
 
@@ -184,7 +184,9 @@ export function pieToDrawables(
 /** Instanced lines → one stroked path per line (straight, or a quadratic bow for `bends`). World
  *  endpoints with a per-line width, so screen sizeMode needs no bake (the width alone is in px). The end
  *  offsets (#509) move each end by `offset · offsetScale` world units: `1 / k` on a screen layer, 1 on a world one
- *  (the bend is a fraction of the chord, so the bow on the moved ends is the one the shader draws in px). */
+ *  (the bend is a fraction of the chord, so the bow on the moved ends is the one the shader draws in px). A `"drop"`
+ *  layer (#505 self-link loops) traces each loop with {@link traceLoop}, its head length `headLength(arrowSize)` in the
+ *  offsets' units (0 while the loop lane carries no `arrowSize`: the #542 WebGL step brings it). */
 export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): DrawableVector[] {
   const out: DrawableVector[] = [];
   const { sourceOffsets: so, targetOffsets: to } = l;
@@ -195,10 +197,11 @@ export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): Drawab
     const ty = (l.targets[e * 2 + 1] ?? 0) + offsetAt(to, e * 2 + 1, offsetScale);
     const r = styleRow(l, e);
     const bend = l.bends ? (l.bends[r] ?? 0) : 0;
+    const loopHead = l.curve === "drop" ? headLength(l.arrowSize ?? 0) * offsetScale : 0;
     out.push(
       drawable(e, {
         subpaths: record((ctx) => {
-          if (l.curve === "drop") traceDrop(ctx, sx, sy, tx, ty, bend);
+          if (l.curve === "drop") traceLoop(ctx, sx, sy, tx, ty, loopHead);
           else if (bend) {
             ctx.moveTo(sx, sy);
             const [cx, cy] = bezierControl(sx, sy, tx, ty, bend);
@@ -303,16 +306,18 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
   const inv = 1 / bake;
   const { sourceOffsets: so, targetOffsets: to } = h;
   const out: DrawableVector[] = [];
+  const loopSamples = Math.max(2, (h.samples ?? 2) | 0);
+  const loopPts = h.curve === "drop" ? new Float64Array(2 * (2 * loopSamples + 4)) : null;
   for (let e = 0; e < h.count; e++) {
     const x0 = (h.sources[e * 2] ?? 0) * bake + offsetAt(so, e * 2, 1);
     const y0 = (h.sources[e * 2 + 1] ?? 0) * bake + offsetAt(so, e * 2 + 1, 1);
     const x1 = (h.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1);
     const y1 = (h.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1);
     const r = styleRow(h, e);
-    if (h.curve === "drop") {
-      const width = h.widths[r * 2] ?? 0;
-      const reach = h.bends[r] ?? 0;
-      out.push(drawable(e, { subpaths: record((ctx) => traceDropHalfArrow(ctx, x0, y0, x1, y1, width, reach, inv)), fill: linkColor(h, e) }));
+    if (loopPts) {
+      // A self-link loop (#505, #542): one half-arrow outline, solved in the bake space as the Scene's.
+      const n = loopHalfArrowOutline(loopPts, 0, x0, y0, x1, y1, h.widths[r * 2] ?? 0, loopSamples);
+      if (n > 0) out.push(drawable(e, { subpaths: record((ctx) => traceOutline(ctx, loopPts, n, inv)), fill: linkColor(h, e) }));
       continue;
     }
     const geom = halfLinkGeometry({

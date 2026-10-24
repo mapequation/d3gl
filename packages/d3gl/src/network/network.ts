@@ -6236,28 +6236,15 @@ export class Network extends BaseEngine {
         if (loops) {
           // `drawn`: in the both view's screen mode each state node's offset is baked into it (#509), as for its links.
           updateSelfLoops(drawn, loops);
+          // Each loop is ONE shape too (#542), filled and baked as its group's links.
           if (halfArrow) emitSelfLoopHalfArrows(g, loops, bake);
+          else if (arrowLine) emitSelfLoopArrows(g, loops, arrowBake);
           else emitSelfLoops(g, loops);
         }
       },
     });
-    // A directed link's head is part of its line (#542); the arrows group carries only the self-link loops' heads
-    // (#505) until the loops draw as one shape too.
-    this.registerLayer({
-      name: "arrows",
-      data: edgeIds,
-      ids: edgeIds,
-      // Baked screen-mode arrows live in world coords (like the half-arrow); world mode passes through.
-      sizeMode: arrowBake !== 1 ? "world" : linkMode,
-      fill: (e) => linkColorAt(e as number),
-      build: (g) => {
-        if (emit && drawLinks && style.directed && !halfArrow && loops) {
-          // Refreshed here too (O(S)), so an arrows-only re-bake never reads another frame's loop ends.
-          updateSelfLoops(drawn, loops);
-          emitSelfLoopArrows(g, loops, style.arrowSize, arrowBake);
-        }
-      },
-    });
+    // The arrows group stays registered (empty) for its canonical slot: only the LOD Scene path draws into it.
+    this.registerLayer({ name: "arrows", data: [], ids: [], sizeMode: linkMode, build: () => {} });
     // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the
     // slot exists in canonical order (above the links, under the nodes, #471) whichever path registers first.
     this.registerLayer({ name: "module-boundaries", data: [], ids: [], sizeMode: "world", build: () => {} });
@@ -6423,12 +6410,14 @@ export class Network extends BaseEngine {
         if (leafLoops && drawLoops) {
           const past = tree.size * tree.size;
           if (isHalf) emitSelfLoopHalfArrows(g, leafLoops, seBake, past);
-          else emitSelfLoops(g, leafLoops, past);
+          // A directed loop is one filled arrow outline (#542): it fills in the arrows group below, not this stroked one.
+          else if (!leafLoops.arrowheads) emitSelfLoops(g, leafLoops, past);
         }
       },
     });
     // Line-style directed arrowheads (the half-arrow's head is fused into its own filled shape, so this
-    // layer is empty for half-arrows). Baked screen-mode heads live in world coords, like the line.
+    // layer is empty for half-arrows), and the kept leaves' directed loops, each ONE filled arrow outline (#542).
+    // Baked screen-mode shapes live in world coords, like the line.
     const arrowBake = !isHalf && style.directed && screen ? this.transform.k || 1 : 1;
     this.registerLayer({
       name: "arrows",
@@ -6438,7 +6427,7 @@ export class Network extends BaseEngine {
       fill: (_d, i) => (i >= seCount ? loopCss(i) : se.arrows ? rgbaCss(se.arrows.colors, i) : ""),
       build: (g) => {
         if (se.arrows) traceSuperArrows(g, se.arrows, seIds, arrowBake);
-        if (leafLoops && drawLoops && leafLoops.arrowheads) emitSelfLoopArrows(g, leafLoops, style.arrowSize, arrowBake, tree.size * tree.size);
+        if (leafLoops && drawLoops && leafLoops.arrowheads) emitSelfLoopArrows(g, leafLoops, arrowBake, tree.size * tree.size);
       },
     });
 

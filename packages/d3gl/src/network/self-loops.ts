@@ -3,14 +3,13 @@
  * lanes draw nothing for it. This module turns a node's self-links into ONE small drop at its rim, sized from
  * the node's radius:
  *
- * - The drop ({@link ../core/loop-drop.ts}) leaves the rim at `θ + α` and comes back at `θ − α` along legs whose
- *   directions pass through the node centre, with a round far end: one cubic from the two rim ends. On WebGL it
- *   is one instance of the `lines` lane (or the `half-arrows` lane) with its two ends set off the node centre by
- *   `sourceOffsets` / `targetOffsets` (#509), drawn by the lane's `curve: "drop"` program in the loop layers
- *   only, so ordinary links run their program unchanged.
- * - A directed loop's arrowhead is an ordinary straight `arrows` instance from the drop's last control point to
- *   its rim end, with no setback: it points along the end tangent, into the node. The `half-arrow` style draws
- *   the drop as one half-arrow glyph.
+ * - The loop ({@link ../core/loop-drop.ts}, #542) leaves the centre along `θ + α` and comes back along `θ − α` on
+ *   the settled link cubic (`legCubic`), its far end round: a teardrop given by its two rim ends. On Canvas / SVG
+ *   it is ONE shape in the `links` group: a stroked path (undirected), a filled arrow outline (directed `line`
+ *   style, its tip on the rim) or a filled half-arrow outline. On WebGL it is one instance of the `lines` lane (or
+ *   the `half-arrows` lane) with its two ends set off the node centre by `sourceOffsets` / `targetOffsets` (#509),
+ *   drawn by the lane's `curve: "drop"` program in the loop layers only, so ordinary links run their program
+ *   unchanged; a directed loop there adds an `arrows` instance (the old drop, until the #542 WebGL step).
  * - `θ` points away from the node's neighbours: opposite the weighted mean of the unit vectors to them, or
  *   {@link FALLBACK_ANGLE} when they cancel (or the node has none).
  *
@@ -29,7 +28,8 @@ import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { RGBAValue } from "./glyphs.js";
 import type { StableColumns } from "../core/stable-columns.js";
-import { DROP_COT, DROP_HALF_SPREAD, DROP_REACH, dropEndTangent, traceDrop, traceDropHalfArrow } from "../core/loop-drop.js";
+import { DROP_COT, DROP_HALF_SPREAD, DROP_REACH, loopArrowOutline, loopHalfArrowOutline, traceLoop, traceOutline } from "../core/loop-drop.js";
+import { headLength } from "../core/arrowhead.js";
 
 /** The direction of a loop whose node has no neighbours to point away from (radians, y down: up-right). */
 export const FALLBACK_ANGLE = -Math.PI / 4;
@@ -149,9 +149,10 @@ export function loopEnds(loops: SelfLoopIndex, angles: ArrayLike<number>, radii:
   }
 }
 
-/** Each loop's arrowhead foot as an offset from its centre, into `out`: the drop's last control point (`DROP_LENGTH`
+/** Each loop's arrowhead foot as an offset from its centre, into `out`: the old drop's last control point (`DROP_LENGTH`
  *  radii out along the target end's radius), so a straight arrow from it to the target end points into the node.
- *  From the stored end offsets, which already carry any node offset. O(S). */
+ *  From the stored end offsets, which already carry any node offset. O(S). WebGL `arrows` layer only: the #542 WebGL
+ *  step folds the head into the loop line and drops this. */
 export function loopArrowFrom(so: Float32Array, to: Float32Array, out: Float32Array, count: number): void {
   for (let i = 0; i < count; i++) {
     // P2 = P3 + reach·(P3 − c), with P3 − c = cot α·⟂(D)/2 + D/2 (core/loop-drop.ts), inline: no tuple per loop.
@@ -335,11 +336,16 @@ export function selfLoopSelected(loops: SelfLoopIndex, linkSelected: Uint8Array)
   return out;
 }
 
+/** Module scratch for one loop's outline ({@link loopArrowOutline}: `2·LOOP_SAMPLES + 5` points, the most), refilled
+ *  per loop: the Scene records each path synchronously, so no loop allocates. */
+const LOOP_PTS = new Float64Array(2 * (2 * LOOP_SAMPLES + 5));
+
 /**
- * The Scene twin (Canvas / SVG) of the `line`-style loops: one stroked drawable each in the `links` group,
- * keyed by its edge. World mode traces world geometry; screen mode traces px offsets around an `anchor` at
- * the node centre, which the Scene draws as `anchor′ + (p − anchor)`: constant px at every zoom, no re-bake.
- * Reads the columns {@link updateSelfLoops} wrote; each drawable captures its numbers, not the columns.
+ * The Scene twin (Canvas / SVG) of the undirected `line`-style loops: one stroked drawable each in the `links` group,
+ * keyed by its edge ({@link traceLoop}, head length `headLength(arrowSize)` so the arrow loop runs the same path).
+ * World mode traces world geometry; screen mode traces px offsets around an `anchor` at the node centre, which the
+ * Scene draws as `anchor′ + (p − anchor)`: constant px at every zoom, no re-bake. Reads the columns
+ * {@link updateSelfLoops} wrote; each drawable captures its numbers, not the columns.
  */
 export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
@@ -348,46 +354,36 @@ export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache, idBase = 0): vo
     const px = centres[2 * i] ?? 0;
     const py = centres[2 * i + 1] ?? 0;
     const sox = so[2 * i] ?? 0, soy = so[2 * i + 1] ?? 0, tox = to[2 * i] ?? 0, toy = to[2 * i + 1] ?? 0;
-    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceDrop(ctx, px + sox, py + soy, px + tox, py + toy, DROP_REACH), { lineWidth: c.widths[i] ?? 0, anchor: screen ? [px, py] : undefined });
+    const h = headLength(c.arrowSizes[i] ?? 0);
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoop(ctx, px + sox, py + soy, px + tox, py + toy, h), { lineWidth: c.widths[i] ?? 0, anchor: screen ? [px, py] : undefined });
   }
 }
 
-/** The Scene twin of the `half-arrow` loops: one filled half-arrow glyph each, keyed by its edge. `bake` as
- *  `emitHalfLinks`: screen mode solves in px around the node centre × bake and emits ÷ bake. */
+/** The Scene twin of the `half-arrow` loops: one filled half-arrow outline each ({@link loopHalfArrowOutline}), keyed
+ *  by its edge. `bake` as `emitHalfLinks`: screen mode solves in px around the node centre × bake and emits ÷ bake. */
 export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, idBase = 0): void {
-  const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
-  for (let i = 0; i < loops.count; i++) {
-    const px = (centres[2 * i] ?? 0) * bake;
-    const py = (centres[2 * i + 1] ?? 0) * bake;
-    const x0 = px + (so[2 * i] ?? 0), y0 = py + (so[2 * i + 1] ?? 0);
-    const x1 = px + (to[2 * i] ?? 0), y1 = py + (to[2 * i + 1] ?? 0);
-    const width = c.widths[i] ?? 0;
-    const inv = 1 / bake;
-    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceDropHalfArrow(ctx, x0, y0, x1, y1, width, DROP_REACH, inv));
-  }
-}
-
-/** The Scene twin of the loop arrowheads, in the `arrows` group (filled). `bake` as `emitArrows`: screen mode
- *  solves in px around the node centre × bake and emits ÷ bake (re-baked with the other arrowheads). */
-export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, size: number, bake = 1, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const inv = 1 / bake;
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
-    const sx = px + (so[2 * i] ?? 0);
-    const sy = py + (so[2 * i + 1] ?? 0);
-    const tipX = px + (to[2 * i] ?? 0);
-    const tipY = py + (to[2 * i + 1] ?? 0);
-    const [ux, uy] = dropEndTangent(sx, sy, tipX, tipY);
-    const baseX = tipX - ux * 2 * size;
-    const baseY = tipY - uy * 2 * size;
-    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => {
-      ctx.moveTo(tipX * inv, tipY * inv);
-      ctx.lineTo((baseX + uy * size) * inv, (baseY - ux * size) * inv);
-      ctx.lineTo((baseX - uy * size) * inv, (baseY + ux * size) * inv);
-      ctx.closePath();
-    });
+    const n = loopHalfArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, LOOP_SAMPLES);
+    if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
+  }
+}
+
+/** The Scene twin of the directed `line`-style loops: one filled arrow outline each, shaft and head as ONE shape
+ *  ({@link loopArrowOutline}), keyed by its edge, in a filled group. `bake` as `emitArrowLinks`: screen mode solves in
+ *  px around the node centre × bake and emits ÷ bake (re-baked with the links). */
+export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, idBase = 0): void {
+  const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
+  const inv = 1 / bake;
+  for (let i = 0; i < loops.count; i++) {
+    const px = (centres[2 * i] ?? 0) * bake;
+    const py = (centres[2 * i + 1] ?? 0) * bake;
+    const h = headLength(c.arrowSizes[i] ?? 0);
+    const n = loopArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, h, LOOP_SAMPLES);
+    if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
   }
 }
 

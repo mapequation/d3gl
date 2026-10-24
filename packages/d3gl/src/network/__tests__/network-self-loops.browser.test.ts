@@ -1,15 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { network, type NetworkLinkHit } from "../network.js";
 import { buildGraph } from "../graph.js";
-import { DROP_HALF_SPREAD, DROP_LENGTH } from "../../core/loop-drop.js";
+import { DROP_HALF_SPREAD, LOOP_LEG } from "../../core/loop-drop.js";
+import { headLength } from "../../core/arrowhead.js";
 
 /**
  * #505: a self-link draws as a loop at its node, on WebGL, Canvas and SVG, in both size modes; a directed one
  * shows its arrowhead; the half-arrow style draws it too; hovering or clicking the loop reports the self-link.
  *
  * Node 0 (at x = 60) has a self-link and one neighbour, node 1 (at x = 140), so its loop points away from it,
- * towards −x. The loop runs from the node's centre back to it; its round far end, the drop's `B(½)`, sits
- * `¾·DROP_LENGTH·cos α·r` left of the centre, outside the node.
+ * towards −x. The loop runs from the node's centre back to it (#542: straight out to `E0 = c + ρ·u0`, the settled
+ * cubic to `E1`, straight back, `ρ = r + headLength(arrowSize)`); its round far end, the cubic's `B(½)`, sits
+ * `(4ρ + 3ℓ)·cos α/4` left of the centre (`ℓ = LOOP_LEG·r`), outside the node.
  */
 
 const W = 200;
@@ -18,22 +20,15 @@ const SIZE_MODES = ["screen", "world"] as const;
 const R = 10;
 const CX = 60;
 const CY = 100;
-const APEX_X = CX - 0.75 * DROP_LENGTH * Math.cos(DROP_HALF_SPREAD) * R;
+/** The draws' arrow size, and the `line`-style loop's leg offset `ρ` (its head length is the same, directed or not). */
+const ARROW_SIZE = 4;
+const RHO = R + headLength(ARROW_SIZE);
+const APEX_X = CX - ((4 * RHO + 3 * LOOP_LEG * R) * Math.cos(DROP_HALF_SPREAD)) / 4;
 
-/** Where the drop's first leg (the upper one, y < CY) crosses the circle of radius `d` round node 0: the cubic
- *  `c, c + L·u(π + α), c + L·u(π − α), c` (offsets from the centre), bisected on t ∈ (0, ½). */
+/** Where the loop's first leg (the upper one, y < CY) crosses the circle of radius `d ≤ ρ` round node 0: on its
+ *  straight piece, along `u(π + α)`. */
 function legAt(d: number): [number, number] {
-  const L = DROP_LENGTH * R;
-  const ax = -L * Math.cos(DROP_HALF_SPREAD), ay = -L * Math.sin(DROP_HALF_SPREAD);
-  const at = (t: number): [number, number] => [3 * (1 - t) * t * ax, 3 * (1 - t) * t * (1 - 2 * t) * ay];
-  let lo = 0, hi = 0.5;
-  for (let k = 0; k < 40; k++) {
-    const mid = 0.5 * (lo + hi);
-    if (Math.hypot(...at(mid)) < d) lo = mid;
-    else hi = mid;
-  }
-  const [x, y] = at(lo);
-  return [CX + x, CY + y];
+  return [CX - d * Math.cos(DROP_HALF_SPREAD), CY - d * Math.sin(DROP_HALF_SPREAD)];
 }
 const POSITIONS = new Float32Array([CX, CY, 140, CY]);
 
@@ -84,7 +79,7 @@ async function draw(c: Case) {
   const g = buildGraph({ nodeCount: 2, source: [0, ...self.map(() => 0)], target: [1, ...self.map(() => 0)], weight: [1, ...self], directed: c.directed });
   net
     .data(g)
-    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: c.linkWidth ?? 3, arrowSize: 4, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode })
+    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: c.linkWidth ?? 3, arrowSize: ARROW_SIZE, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode })
     .lod(c.lod ? { expandPx: 1, declutter: false } : false)
     .layout({ backend: "positions", positions: POSITIONS });
   net.setTransform({ k: 1, x: 0, y: 0 });

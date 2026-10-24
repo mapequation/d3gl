@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { DROP_HALF_SPREAD, DROP_LENGTH, DROP_REACH, dropEndTangent, traceDrop, traceDropHalfArrow } from "../../core/loop-drop.js";
+import { DROP_HALF_SPREAD, LOOP_LEG, loopArrowOutline, loopHalfArrowOutline, loopHalfHeadLength, traceLoop } from "../../core/loop-drop.js";
+import { headHalfWidth, headLength } from "../../core/arrowhead.js";
 import { StableColumns } from "../../core/stable-columns.js";
 import {
   keptLeafLoops,
@@ -12,7 +13,6 @@ import {
   selfLoopOfEdge,
   selfLoopAngles,
   loopEnds,
-  loopArrowFrom,
   selfLoopCache,
   updateSelfLoops,
   selfLoopStats,
@@ -84,145 +84,160 @@ describe("self-loop geometry", () => {
     expect(angles[1]).toBeCloseTo(FALLBACK_ANGLE, 6);
   });
 
-  it("starts and ends at the centre with radial legs, symmetric about θ, its far end ¾·L·cos α out", () => {
+  type Pt = [number, number];
+  const cubicAt = (a: Pt, b: Pt, c: Pt, d: Pt, t: number): Pt => {
+    const u = 1 - t;
+    const w0 = u * u * u, w1 = 3 * u * u * t, w2 = 3 * u * t * t, w3 = t * t * t;
+    return [w0 * a[0] + w1 * b[0] + w2 * c[0] + w3 * d[0], w0 * a[1] + w1 * b[1] + w2 * c[1] + w3 * d[1]];
+  };
+  /** The loop's rim ends at angle `theta` round a node of radius `r` at `(ox, oy)`, as `loopEnds` writes them. */
+  const endsAt = (theta: number, r: number, ox = 0, oy = 0): [number, number, number, number] => {
     const loops = buildSelfLoopIndex([0], [0], [1], 1);
     if (!loops) throw new Error("expected loops");
+    const so = new Float32Array(2);
+    const to = new Float32Array(2);
+    loopEnds(loops, [theta], [r], so, to);
+    return [(so[0] ?? 0) + ox, (so[1] ?? 0) + oy, (to[0] ?? 0) + ox, (to[1] ?? 0) + oy];
+  };
+  /** The loop's centre path from {@link traceLoop}: `[c, E0, P1, P2, E1, c]`. */
+  const centrePath = (sx: number, sy: number, tx: number, ty: number, h: number): Pt[] => {
+    const seg: Pt[] = [];
+    traceLoop({ moveTo: (x, y) => void seg.push([x, y]), lineTo: (x, y) => void seg.push([x, y]), bezierCurveTo: (a, b, c, d, x, y) => void seg.push([a, b], [c, d], [x, y]) }, sx, sy, tx, ty, h);
+    return seg;
+  };
+  const pt = (b: ArrayLike<number>, i: number): Pt => [b[2 * i] ?? 0, b[2 * i + 1] ?? 0];
+  /** Mirror `p` across the axis through `(ox, oy)` along `theta`. */
+  const mirror = (p: Pt, theta: number, ox: number, oy: number): Pt => {
+    const ax = Math.cos(theta), ay = Math.sin(theta);
+    const dx = p[0] - ox, dy = p[1] - oy;
+    const along = dx * ax + dy * ay;
+    return [ox + 2 * along * ax - dx, oy + 2 * along * ay - dy];
+  };
+  const expectPt = (a: Pt, b: Pt, digits = 4): void => {
+    expect(a[0]).toBeCloseTo(b[0], digits);
+    expect(a[1]).toBeCloseTo(b[1], digits);
+  };
+
+  it("traces the teardrop: centre → E0, legCubic(c, u0, r + h, c, u1, r + h, L·r), E1 → centre, symmetric about θ", () => {
     const r = 7;
-    // A node offset (the both view) moves the whole drop: the centre is then `o`, not the origin.
-    for (const [ox, oy] of [[0, 0], [30, -12]]) {
+    const h = 6;
+    const a = DROP_HALF_SPREAD;
+    // A node offset (the both view) moves the whole loop: the centre is then `o`, not the origin.
+    for (const [ox, oy] of [[0, 0], [30, -12]] as const) {
       for (const theta of [0, 1, -2, Math.PI, 2.5]) {
-        const so = new Float32Array(2);
-        const to = new Float32Array(2);
-        loopEnds(loops, [theta], [r], so, to);
-        const sx = (so[0] ?? 0) + ox, sy = (so[1] ?? 0) + oy, tx = (to[0] ?? 0) + ox, ty = (to[1] ?? 0) + oy;
-        // The rim ends carry the legs' directions; the arrowhead tip is the second.
-        expect(Math.hypot(sx - ox, sy - oy)).toBeCloseTo(r, 4);
-        expect(Math.hypot(tx - ox, ty - oy)).toBeCloseTo(r, 4);
-        const seg: number[][] = [];
-        traceDrop({ moveTo: (x, y) => void seg.push([x, y]), bezierCurveTo: (a, b, c, d, x, y) => void seg.push([a, b], [c, d], [x, y]) }, sx, sy, tx, ty, DROP_REACH);
-        const [[p0x, p0y] = [], [c1x = 0, c1y = 0] = [], [c2x = 0, c2y = 0] = [], [p3x, p3y] = []] = seg;
+        const [sx, sy, tx, ty] = endsAt(theta, r, ox, oy);
+        const path = centrePath(sx, sy, tx, ty, h);
+        expect(path).toHaveLength(6);
+        const [c0 = [0, 0], e0 = [0, 0], p1 = [0, 0], p2 = [0, 0], e1 = [0, 0], c1 = [0, 0]] = path;
         // Centre to centre, like an ordinary link.
-        expect(p0x).toBeCloseTo(ox, 4);
-        expect(p0y).toBeCloseTo(oy, 4);
-        expect(p3x).toBeCloseTo(ox, 4);
-        expect(p3y).toBeCloseTo(oy, 4);
-        // Radial legs: out along the source end's radius, back in along the target end's, at DROP_LENGTH radii.
-        const cross = (ax: number, ay: number, bx: number, by: number): number => ax * by - ay * bx;
-        expect(cross(c1x - ox, c1y - oy, sx - ox, sy - oy) / r ** 2).toBeCloseTo(0, 5);
-        expect(cross(c2x - ox, c2y - oy, tx - ox, ty - oy) / r ** 2).toBeCloseTo(0, 5);
-        expect((c1x - ox) * (sx - ox) + (c1y - oy) * (sy - oy)).toBeCloseTo(DROP_LENGTH * r * r, 3);
-        expect((c2x - ox) * (tx - ox) + (c2y - oy) * (ty - oy)).toBeCloseTo(DROP_LENGTH * r * r, 3);
-        // Symmetric about θ: the controls mirror each other across the axis.
-        const along = (x: number, y: number): number => x * Math.cos(theta) + y * Math.sin(theta);
-        const across = (x: number, y: number): number => -x * Math.sin(theta) + y * Math.cos(theta);
-        expect(along(c1x - ox, c1y - oy)).toBeCloseTo(along(c2x - ox, c2y - oy), 4);
-        expect(across(c1x - ox, c1y - oy)).toBeCloseTo(-across(c2x - ox, c2y - oy), 4);
-        expect(Math.abs(across(c1x - ox, c1y - oy))).toBeCloseTo(DROP_LENGTH * r * Math.sin(DROP_HALF_SPREAD), 4);
-        // The far end, B(½) = c + ⅜(P1 + P2 − 2c), lies on θ about 2.3 radii out.
-        const ax = (3 * (c1x + c2x - 2 * ox)) / 8;
-        const ay = (3 * (c1y + c2y - 2 * oy)) / 8;
-        expect(Math.hypot(ax, ay)).toBeCloseTo(0.75 * DROP_LENGTH * Math.cos(DROP_HALF_SPREAD) * r, 4);
-        expect(Math.hypot(ax, ay) / r).toBeCloseTo(2.3, 1);
-        expect(Math.atan2(ay, ax)).toBeCloseTo(Math.atan2(Math.sin(theta), Math.cos(theta)), 4);
-        // The arrowhead: tip one radius back from the centre along the end tangent, pointing into the node.
-        const [ex, ey] = dropEndTangent(sx, sy, tx, ty);
-        expect(cross(ex, ey, ox - c2x, oy - c2y)).toBeCloseTo(0, 3);
-        expect(tx).toBeCloseTo(ox - ex * r, 4);
-        expect(ty).toBeCloseTo(oy - ey * r, 4);
-        // The arrowhead's foot is the drop's last control point.
-        const foot = new Float32Array(2);
-        loopArrowFrom(Float32Array.of(sx, sy), Float32Array.of(tx, ty), foot, 1);
-        expect(foot[0]).toBeCloseTo(c2x, 3);
-        expect(foot[1]).toBeCloseTo(c2y, 3);
+        expectPt(c0, [ox, oy]);
+        expectPt(c1, [ox, oy]);
+        // The legs: E_k = c + (r + h)·u_k, controls ℓ = L·r further out along the same leg.
+        const u0: Pt = [Math.cos(theta + a), Math.sin(theta + a)];
+        const u1: Pt = [Math.cos(theta - a), Math.sin(theta - a)];
+        expectPt(e0, [ox + (r + h) * u0[0], oy + (r + h) * u0[1]]);
+        expectPt(e1, [ox + (r + h) * u1[0], oy + (r + h) * u1[1]]);
+        expectPt(p1, [e0[0] + LOOP_LEG * r * u0[0], e0[1] + LOOP_LEG * r * u0[1]]);
+        expectPt(p2, [e1[0] + LOOP_LEG * r * u1[0], e1[1] + LOOP_LEG * r * u1[1]]);
+        // Mirror-symmetric about θ: the reflection swaps the two ends and the two controls.
+        expectPt(mirror(e0, theta, ox, oy), e1);
+        expectPt(mirror(p1, theta, ox, oy), p2);
+        // The far end B(½) = c + (4ρ + 3ℓ)·cos α/4 · u(θ).
+        const far = cubicAt(e0, p1, p2, e1, 0.5);
+        const reach = ((4 * (r + h) + 3 * LOOP_LEG * r) * Math.cos(a)) / 4;
+        expectPt(far, [ox + reach * Math.cos(theta), oy + reach * Math.sin(theta)]);
       }
     }
   });
 
-  it("fills the half-arrow drop outside the loop, its tip on the rim at the target end", () => {
-    const loops = buildSelfLoopIndex([0], [0], [1], 1);
-    if (!loops) throw new Error("expected loops");
+  it("draws the arrow loop as one outline: the undirected path plus a head, its tip on the rim, the shaft's corners on the head's base", () => {
     const r = 10;
-    for (let k = 0; k < 16; k++) {
-      const theta = -Math.PI + (k * 2 * Math.PI) / 16;
-      const so = new Float32Array(2);
-      const to = new Float32Array(2);
-      loopEnds(loops, [theta], [r], so, to);
-      const pts: [number, number][] = [];
-      const rec = {
-        moveTo: (x: number, y: number) => pts.push([x, y]),
-        lineTo: (x: number, y: number) => pts.push([x, y]),
-        bezierCurveTo: (_a: number, _b: number, _c: number, _d: number, x: number, y: number) => pts.push([x, y]),
-        closePath: () => undefined,
-      };
-      traceDropHalfArrow(rec, so[0] ?? 0, so[1] ?? 0, to[0] ?? 0, to[1] ?? 0, 2, DROP_REACH);
-      // moveTo the centre, inner → head base, tip, barb, outer start, outer → foot.
-      expect(pts).toHaveLength(6);
-      expect(Math.hypot(...(pts[0] ?? [1, 1]))).toBeCloseTo(0, 5);
-      const [tipX, tipY] = pts[2] ?? [0, 0];
-      expect(tipX).toBeCloseTo(to[0] ?? 0, 5);
-      expect(tipY).toBeCloseTo(to[1] ?? 0, 5);
-      // The outer foot sits on the far side of the source leg (the line through the centre and P0) from θ: outside.
-      const [fx, fy] = pts[5] ?? [0, 0];
-      const side = (x: number, y: number): number => (so[0] ?? 0) * y - (so[1] ?? 0) * x;
-      expect(side(fx, fy) * side(Math.cos(theta), Math.sin(theta))).toBeLessThan(0);
+    const size = 4;
+    const h = headLength(size);
+    const m = 12;
+    for (const [ox, oy] of [[0, 0], [-5, 9]] as const) {
+      for (const theta of [-2.5, 0, 1.2, Math.PI]) {
+        for (const width of [0.5, 3, 8]) {
+          const [sx, sy, tx, ty] = endsAt(theta, r, ox, oy);
+          const buf = new Float64Array(2 * (2 * m + 5));
+          const n = loopArrowOutline(buf, 0, sx, sy, tx, ty, width, h, m);
+          expect(n).toBe(2 * m + 5);
+          const last = 2 * m + 4;
+          // The shaft's mid-line is the undirected loop's path: c, E0, then the cubic at t = (k − 1)/(m − 1).
+          const [c = [0, 0], e0 = [0, 0], p1 = [0, 0], p2 = [0, 0], e1 = [0, 0]] = centrePath(sx, sy, tx, ty, h);
+          for (let k = 0; k <= m; k++) {
+            const l = pt(buf, k);
+            const rr = pt(buf, last - k);
+            const want = k === 0 ? c : cubicAt(e0, p1, p2, e1, (k - 1) / (m - 1));
+            expectPt([(l[0] + rr[0]) / 2, (l[1] + rr[1]) / 2], want);
+            expect(Math.hypot(l[0] - rr[0], l[1] - rr[1])).toBeCloseTo(width, 4);
+            // Mirror-symmetric about θ apart from the head: each edge maps onto itself, reversed.
+            if (k >= 1) {
+              expectPt(mirror(l, theta, ox, oy), pt(buf, m + 1 - k));
+              expectPt(mirror(rr, theta, ox, oy), pt(buf, last - (m + 1 - k)));
+            }
+          }
+          // The head: left barb, tip, right barb. The tip is the rim end; the base is centred on E1, headHalfWidth wide.
+          const lb = pt(buf, m + 1), tip = pt(buf, m + 2), rb = pt(buf, m + 3);
+          expectPt(tip, [tx, ty]);
+          expect(Math.hypot(tip[0] - ox, tip[1] - oy)).toBeCloseTo(r, 4);
+          expectPt([(lb[0] + rb[0]) / 2, (lb[1] + rb[1]) / 2], e1);
+          expect(Math.hypot(lb[0] - rb[0], lb[1] - rb[1]) / 2).toBeCloseTo(headHalfWidth(width), 4);
+          expect(Math.hypot(e1[0] - tip[0], e1[1] - tip[1])).toBeCloseTo(h, 4);
+          // The shaft's end corners lie on the base, inside the barbs.
+          const cross = (p: Pt): number => (rb[0] - lb[0]) * (p[1] - lb[1]) - (rb[1] - lb[1]) * (p[0] - lb[0]);
+          for (const corner of [pt(buf, m), pt(buf, last - m)]) {
+            expect(cross(corner) / headHalfWidth(width)).toBeCloseTo(0, 4);
+            expect(Math.hypot(corner[0] - e1[0], corner[1] - e1[1])).toBeLessThan(headHalfWidth(width));
+          }
+          // The left edge is the loop's outside: farther from the centre than the right at the far end.
+          const mid = Math.round((m + 1) / 2);
+          expect(Math.hypot(pt(buf, mid)[0] - ox, pt(buf, mid)[1] - oy)).toBeGreaterThan(Math.hypot(pt(buf, last - mid)[0] - ox, pt(buf, last - mid)[1] - oy));
+        }
+      }
     }
   });
 
-  it("keeps the half-arrow drop's band one width wide round the whole curve, its edges never crossing", () => {
-    const loops = buildSelfLoopIndex([0], [0], [1], 1);
-    if (!loops) throw new Error("expected loops");
+  it("keeps the half-arrow loop's band one width wide along its length, outside the loop, its tip on the rim", () => {
     const r = 10;
-    type Pt = [number, number];
-    const cubic = (a: Pt, b: Pt, c: Pt, d: Pt, t: number): Pt => {
-      const u = 1 - t;
-      const w0 = u * u * u, w1 = 3 * u * u * t, w2 = 3 * u * t * t, w3 = t * t * t;
-      return [w0 * a[0] + w1 * b[0] + w2 * c[0] + w3 * d[0], w0 * a[1] + w1 * b[1] + w2 * c[1] + w3 * d[1]];
-    };
+    const m = 24;
     for (const theta of [-2.5, 0, 1.2]) {
       for (const width of [0.5, 2, 10, 50]) {
-        const so = new Float32Array(2);
-        const to = new Float32Array(2);
-        loopEnds(loops, [theta], [r], so, to);
-        // The two cubics in trace order: [start, c1, c2, end] for the inner edge, then the outer.
-        const curves: Pt[][] = [];
-        let at: Pt = [0, 0];
-        const lines: Pt[] = [];
-        const rec = {
-          moveTo: (x: number, y: number) => void (at = [x, y]),
-          lineTo: (x: number, y: number) => {
-            at = [x, y];
-            lines.push(at);
-          },
-          bezierCurveTo: (a: number, b: number, c: number, d: number, x: number, y: number) => {
-            curves.push([at, [a, b], [c, d], [x, y]]);
-            at = [x, y];
-          },
-          closePath: () => undefined,
-        };
-        traceDropHalfArrow(rec, so[0] ?? 0, so[1] ?? 0, to[0] ?? 0, to[1] ?? 0, width, DROP_REACH);
-        const [inner, outer] = curves;
-        if (!inner || !outer) throw new Error("expected two edge cubics");
-        const [i0, i1, i2, i3] = inner;
-        const [o0, o1, o2, o3] = outer;
-        if (!i0 || !i1 || !i2 || !i3 || !o0 || !o1 || !o2 || !o3) throw new Error("expected cubic control points");
+        const [sx, sy, tx, ty] = endsAt(theta, r);
+        const buf = new Float64Array(2 * (2 * m + 4));
+        const n = loopHalfArrowOutline(buf, 0, sx, sy, tx, ty, width, m);
+        expect(n).toBe(2 * m + 4);
+        const last = 2 * m + 3;
+        // The inner edge is the centre path for the half-arrow's head length.
+        const h = loopHalfHeadLength(width);
+        const [c = [0, 0], e0 = [0, 0], p1 = [0, 0], p2 = [0, 0], e1 = [0, 0]] = centrePath(sx, sy, tx, ty, h);
+        expectPt(pt(buf, 0), c);
+        expectPt(pt(buf, 1), e0);
+        expectPt(pt(buf, m), e1);
+        // The head: the tip on the rim, then the barb `width + 2√width` out from E1, then the outer edge at `width`.
+        const tip = pt(buf, m + 1);
+        expectPt(tip, [tx, ty]);
+        expect(Math.hypot(tip[0], tip[1])).toBeCloseTo(r, 4);
+        const barb = pt(buf, m + 2);
+        expect(Math.hypot(barb[0] - e1[0], barb[1] - e1[1])).toBeCloseTo(width + 2 * Math.sqrt(width), 4);
+        expect(Math.hypot(pt(buf, m + 3)[0] - e1[0], pt(buf, m + 3)[1] - e1[1])).toBeCloseTo(width, 4);
         const dense: Pt[] = [];
-        for (let k = 0; k <= 2000; k++) dense.push(cubic(i0, i1, i2, i3, k / 2000));
-        for (let k = 0; k <= 40; k++) {
-          const q = cubic(o0, o1, o2, o3, k / 40);
+        for (let k = 0; k <= 2000; k++) dense.push(cubicAt(e0, p1, p2, e1, k / 2000));
+        for (let k = 1; k <= m; k++) {
+          const q = pt(buf, last - k);
           let best = Infinity;
           let near: Pt = [0, 0];
           for (const p of dense) {
             const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
             if (d < best) [best, near] = [d, p];
           }
-          expect(Math.abs(best / width - 1)).toBeLessThan(0.1);
+          expect(Math.abs(best / width - 1)).toBeLessThan(0.01);
           // Outside the loop: the outer sample is farther from the node centre than its nearest inner point.
           expect(Math.hypot(q[0], q[1])).toBeGreaterThan(Math.hypot(near[0], near[1]));
+          // Mirror-symmetric about θ apart from the head: the outer edge maps onto itself, reversed.
+          expectPt(mirror(q, theta, 0, 0), pt(buf, last - (m + 1 - k)));
+          expectPt(mirror(pt(buf, k), theta, 0, 0), pt(buf, m + 1 - k));
         }
-        // The barb tip (the lineTo after the inner edge) lands on the rim.
-        const [tip] = lines;
-        if (!tip) throw new Error("expected the head's tip");
-        expect(Math.hypot(tip[0], tip[1])).toBeCloseTo(r, 4);
       }
     }
   });

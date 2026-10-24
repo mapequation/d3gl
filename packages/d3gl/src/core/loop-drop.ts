@@ -1,55 +1,38 @@
 /**
- * The self-link drop (#505): the shape a self-link loop draws, as a pure function of its two rim ends.
+ * The self-link loop (#505, #542): the shape a loop draws, on the settled link geometry of {@link legCubic}.
  *
- * A loop on a node of centre `c` and radius `r`, pointing away along `φ`, is given by its two rim points
- * `P0 = c + r·u(φ + α)` and `P3 = c + r·u(φ − α)` (`u(a) = (cos a, sin a)`, `α` = {@link DROP_HALF_SPREAD}). Like an
- * ordinary link, which runs centre to centre with the node fill hiding the part inside the node, it starts and
- * ends at the CENTRE: it is the cubic `c, P1, P2, c` with `P1 = c + L·u(φ + α)` and `P2 = c + L·u(φ − α)`. Both
- * legs are radial by construction, the loop is symmetric about `φ`, and its far end, `B(½) = c + ¾·L·cos α·u(φ)`,
- * lies `¾·L·cos α ≈ 2.3` radii out. The arrowhead's tip is `P3`, one radius back from the centre along the end
- * tangent, as an ordinary link's.
+ * A loop on a node of centre `c` and radius `r`, pointing away along `φ`, leaves along the leg `u0 = u(φ + α)` and
+ * comes back along `u1 = u(φ − α)` (`u(a) = (cos a, sin a)`, `α` = {@link DROP_HALF_SPREAD}). It is given by its two
+ * rim ends `S = c + r·u0` and `T = c + r·u1` (`network/self-loops.ts` `loopEnds`, which also adds any #509 node
+ * offset), and like an ordinary link its centre curve starts and ends at the CENTRE, the node fill hiding the part
+ * inside the node:
  *
- * The centre need not be stored: with the chord `D = P3 − P0` and `n = ⟂(D)/2 = (−D.y, D.x)/2`,
- * `P0 − c = cot α·n − D/2` and `P3 − c = cot α·n + D/2`, so `c = P0 − (P0 − c)`, `P1 = P0 + reach·(P0 − c)` and
- * `P2 = P3 + reach·(P3 − c)` with `reach = L/r − 1`. Every point is linear in the two ends, so the drop on projected
- * ends is the projection of the world drop (a similarity), and the WebGL lanes ({@link DROP_LINE_GLSL}) read nothing
- * more than an ordinary link: its two ends and one per-instance number (`reach`, in the `bends` column).
+ *   straight `c → E0`, then `legCubic(c, u0, ρ, c, u1, ρ, ℓ)` = `E0, E0 + ℓ·u0, E1 + ℓ·u1, E1`, then
+ *
+ * with `ρ = r + h` at both ends (`E_k = c + ρ·u_k`), `h` the head length and the leg `ℓ = L·r` ({@link LOOP_LEG}).
+ * The undirected loop goes on straight `E1 → c`; the arrow ends in a head whose base is on `E1` and whose tip is `T`,
+ * on the rim; the half-arrow ends in its one-sided barb. `h` is the same for the undirected loop and the arrow
+ * (`headLength(arrowSize)`), so toggling `directed` only adds or removes the head; the half-arrow's is
+ * {@link loopHalfHeadLength}. Apart from the head, every variant is mirror-symmetric about `φ`, and the far end,
+ * `B(½) = c + (4ρ + 3ℓ)·cos α/4 · u(φ)`, lies on the axis.
+ *
+ * The centre need not be stored: with the chord `D = T − S` and `n = cot α·⟂(D)/2`, `S − c = n − D/2 = r·u0` and
+ * `T − c = n + D/2 = r·u1`. Every point is linear in the two ends (and `h`), so the loop on projected ends is the
+ * projection of the world loop.
+ *
+ * The writers are scalar math into module scratch and the caller's output buffer: no allocation per loop. Perp
+ * convention as `arrowhead.ts`: `perp(v) = (−v.y, v.x)`, and `+perp(travel)` is the loop's OUTSIDE.
  */
+import { barbOverhang, headHalfWidth, legCubic, type PointBuffer } from "./arrowhead.js";
 
-/** Half the angle between the drop's two legs at the centre (radians). */
-export const DROP_HALF_SPREAD = (35 * Math.PI) / 180;
-/** How far the cubic's control points sit from the centre, in node radii (`L / r`): the far end at `¾·L·cos α ≈ 2.3`
- *  radii, the loop as wide as the rim it leaves. */
-export const DROP_LENGTH = 3.75;
-/** The control reach beyond the rim, in node radii: the value the drop lanes read from `bends`. */
-export const DROP_REACH = DROP_LENGTH - 1;
-/** `cot α`, as the shaders bake it. */
+/** Half the angle between the loop's two legs at the centre (radians). */
+export const DROP_HALF_SPREAD = (20 * Math.PI) / 180;
+/** `cot α`: recovers the loop's centre from its rim ends ({@link solveLoop}); the shaders bake it too. */
 export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
+/** The loop's leg length in node radii (`ℓ = L·r`): with {@link DROP_HALF_SPREAD}, the teardrop. */
+export const LOOP_LEG = 3;
 
-/**
- * The half-arrow band's outer control offsets, per unit width, in each leg's own frame (`u` along the leg, `o` its
- * outward normal): the outer edge's control points are `P1 + width·(ALONG·u0 + ACROSS·o0)` and
- * `P2 + width·(ALONG·u3 + ACROSS·o3)`, its ends `width·o` from the inner edge's. The drop is the same shape for every
- * loop (a similarity of the {@link DROP_LENGTH} / {@link DROP_HALF_SPREAD} cubic), so one fitted pair keeps the
- * band's width within 9% of `width` (2.5% across the far end) along the whole curve, from the centre round the far end to the head, for widths
- * from 0.05 to 5 node radii (moving the controls straight out by `width·o` crosses the edges at the far end). Refit
- * both if the drop's constants change: the unit test pins the width.
- */
-export const DROP_OUTER_ALONG = 2.35;
-/** See {@link DROP_OUTER_ALONG}. */
-export const DROP_OUTER_ACROSS = 0.74;
-
-/** The drop's two control points from its ends `(sx, sy)` (the `P0` rim end) and `(tx, ty)` (`P3`). */
-export function dropControls(sx: number, sy: number, tx: number, ty: number, reach: number): [number, number, number, number] {
-  const hx = 0.5 * (tx - sx);
-  const hy = 0.5 * (ty - sy);
-  // n = ⟂(D)/2; P0 − c = cot α·n − D/2, P3 − c = cot α·n + D/2.
-  const nx = -hy * DROP_COT;
-  const ny = hx * DROP_COT;
-  return [sx + reach * (nx - hx), sy + reach * (ny - hy), tx + reach * (nx + hx), ty + reach * (ny + hy)];
-}
-
-/** The path context the drop traces into (Canvas, SVG, the export recorder). */
+/** The path context a loop traces into (Canvas, SVG, the export recorder). */
 export interface DropContext {
   moveTo(x: number, y: number): void;
   lineTo(x: number, y: number): void;
@@ -57,70 +40,177 @@ export interface DropContext {
   closePath(): void;
 }
 
-/** Trace the drop's centre line, from the node centre back to it, given its rim ends `(sx, sy)` and `(tx, ty)`. */
-export function traceDrop(ctx: Pick<DropContext, "moveTo" | "bezierCurveTo">, sx: number, sy: number, tx: number, ty: number, reach: number): void {
-  const hx = 0.5 * (tx - sx);
-  const hy = 0.5 * (ty - sy);
-  const a0x = -hy * DROP_COT - hx; // P0 − c
-  const a0y = hx * DROP_COT - hy;
-  const cx = sx - a0x, cy = sy - a0y;
-  const [c1x, c1y, c2x, c2y] = dropControls(sx, sy, tx, ty, reach);
-  ctx.moveTo(cx, cy);
-  ctx.bezierCurveTo(c1x, c1y, c2x, c2y, cx, cy);
+/** The half-arrow loop's head length for band width `width`: an ordinary half-arrow's `10·∛width`
+ *  (`half-link.ts` `tipLength`, uncapped: a loop's legs are always long enough). */
+export function loopHalfHeadLength(width: number): number {
+  return 10 * Math.pow(width, 1 / 3);
 }
 
+/** Module scratch: the loop's frame (`c`, `r`, `u0`, `u1`), then its cubic's four controls. Refilled per call. */
+const FRAME = new Float64Array(7);
+const CUBIC = new Float64Array(8);
+
 /**
- * Trace the drop as one filled half-arrow glyph (the `half-arrow` link style): its inner edge is the drop from
- * the node centre to the head's base, its outer edge the same drop moved `width` OUTSIDE the loop (each leg
- * along its own normal, so the legs stay parallel, with the controls offset by {@link DROP_OUTER_ALONG} so the band keeps
- * the same width round the far end), and its barbed head lands its tip on the rim at `(tx, ty)`,
- * pointing into the node. Head size as an ordinary half-arrow's (`10·∛width` long, `2·√width` barb), capped at half a
- * leg. Points are solved in the ends' space and emitted × `scale` (the screen-sizeMode bake). The GLSL twin is
- * {@link DROP_HALF_ARROW_GLSL}.
+ * Solve the loop's frame from its rim ends `(sx, sy)` = `S` and `(tx, ty)` = `T` into {@link FRAME}, and its centre
+ * cubic for head length `h` into {@link CUBIC}: `c = S − (n − D/2)`, `r = |n − D/2|`, `u0 = (S − c)/r`,
+ * `u1 = (T − c)/r`, then `legCubic(c, u0, r + h, c, u1, r + h, L·r)`. Returns `r` (0 for coincident ends: no loop).
  */
-export function traceDropHalfArrow(ctx: DropContext, sx: number, sy: number, tx: number, ty: number, width: number, reach: number, scale = 1): void {
+function solveLoop(sx: number, sy: number, tx: number, ty: number, h: number): number {
   const hx = 0.5 * (tx - sx);
   const hy = 0.5 * (ty - sy);
   const nx = -hy * DROP_COT;
   const ny = hx * DROP_COT;
-  const a0x = nx - hx, a0y = ny - hy; // P0 − c
-  const a3x = nx + hx, a3y = ny + hy; // P3 − c
-  const r = Math.hypot(a3x, a3y);
-  if (!(r > 0)) return;
+  const a0x = nx - hx, a0y = ny - hy; // S − c = r·u0
+  const r = Math.hypot(a0x, a0y);
+  if (!(r > 0)) return 0;
+  const cx = sx - a0x, cy = sy - a0y;
   const u0x = a0x / r, u0y = a0y / r;
-  const u3x = a3x / r, u3y = a3y / r;
-  // Outside the loop: leg 0 (at φ + α) turns +90°, leg 3 (at φ − α) turns −90°.
-  const o0x = -u0y, o0y = u0x;
-  const o3x = u3y, o3y = -u3x;
-  const tip = Math.min((reach * r) / 2, 10 * Math.cbrt(width));
-  const barb = 2 * Math.sqrt(width);
-  const c1x = sx + reach * a0x, c1y = sy + reach * a0y;
-  const c2x = tx + reach * a3x, c2y = ty + reach * a3y;
-  const bx = tx + tip * u3x, by = ty + tip * u3y; // the head's base on the inner edge
-  const cx = sx - a0x, cy = sy - a0y; // the centre, where both legs start
-  const s = scale;
-  ctx.moveTo(cx * s, cy * s);
-  ctx.bezierCurveTo(c1x * s, c1y * s, c2x * s, c2y * s, bx * s, by * s);
-  ctx.lineTo(tx * s, ty * s);
-  ctx.lineTo((bx + (width + barb) * o3x) * s, (by + (width + barb) * o3y) * s);
-  ctx.lineTo((bx + width * o3x) * s, (by + width * o3y) * s);
-  const ka = DROP_OUTER_ALONG * width;
-  const kc = DROP_OUTER_ACROSS * width;
-  const d1x = c1x + ka * u0x + kc * o0x, d1y = c1y + ka * u0y + kc * o0y;
-  const d2x = c2x + ka * u3x + kc * o3x, d2y = c2y + ka * u3y + kc * o3y;
-  ctx.bezierCurveTo(d2x * s, d2y * s, d1x * s, d1y * s, (cx + width * o0x) * s, (cy + width * o0y) * s);
+  const u1x = (nx + hx) / r, u1y = (ny + hy) / r; // (T − c)/r
+  FRAME[0] = cx;
+  FRAME[1] = cy;
+  FRAME[2] = r;
+  FRAME[3] = u0x;
+  FRAME[4] = u0y;
+  FRAME[5] = u1x;
+  FRAME[6] = u1y;
+  legCubic(CUBIC, 0, cx, cy, u0x, u0y, r + h, cx, cy, u1x, u1y, r + h, LOOP_LEG * r);
+  return r;
+}
+
+/**
+ * Trace the loop's centre line (the stroked, undirected loop), given its rim ends `(sx, sy)`, `(tx, ty)` and head
+ * length `h` (`headLength(arrowSize)`, so the arrow loop runs along the same path): `moveTo(c)`, `lineTo(E0)`,
+ * `bezierCurveTo(E0 + ℓ·u0, E1 + ℓ·u1, E1)`, `lineTo(c)`, with `E_k = c + (r + h)·u_k` and `ℓ = L·r`.
+ */
+export function traceLoop(ctx: Pick<DropContext, "moveTo" | "lineTo" | "bezierCurveTo">, sx: number, sy: number, tx: number, ty: number, h: number): void {
+  if (solveLoop(sx, sy, tx, ty, h) === 0) return;
+  const cx = FRAME[0] ?? 0, cy = FRAME[1] ?? 0;
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(CUBIC[0] ?? 0, CUBIC[1] ?? 0);
+  ctx.bezierCurveTo(CUBIC[2] ?? 0, CUBIC[3] ?? 0, CUBIC[4] ?? 0, CUBIC[5] ?? 0, CUBIC[6] ?? 0, CUBIC[7] ?? 0);
+  ctx.lineTo(cx, cy);
+}
+
+/**
+ * Write the loop's two edges, offset `first` and `second` along `+perp(travel)` from its centre path `c → E0 → (cubic)
+ * → E1` (the {@link solveLoop} scratch): the first edge forwards at points `0 … M` (point 0 off `c`, with the straight
+ * leg's normal `perp(u0)`; point `1 + i` off the cubic at `t = i/(M−1)`), the second backwards at points
+ * `last − 0 … last − M`. The cubic's end normal is exactly `perp(−u1)`, the head's.
+ */
+function writeLoopEdges(out: PointBuffer, o: number, m: number, first: number, second: number, last: number): void {
+  const p0x = CUBIC[0] ?? 0, p0y = CUBIC[1] ?? 0, p1x = CUBIC[2] ?? 0, p1y = CUBIC[3] ?? 0;
+  const p2x = CUBIC[4] ?? 0, p2y = CUBIC[5] ?? 0, p3x = CUBIC[6] ?? 0, p3y = CUBIC[7] ?? 0;
+  const u0x = FRAME[3] ?? 0, u0y = FRAME[4] ?? 0, u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
+  for (let k = 0; k <= m; k++) {
+    let px: number;
+    let py: number;
+    let nx: number;
+    let ny: number;
+    if (k === 0) {
+      px = FRAME[0] ?? 0;
+      py = FRAME[1] ?? 0;
+      nx = -u0y;
+      ny = u0x;
+    } else if (k === 1) {
+      px = p0x;
+      py = p0y;
+      nx = -u0y;
+      ny = u0x;
+    } else if (k === m) {
+      px = p3x;
+      py = p3y;
+      nx = u1y; // perp(−u1)
+      ny = -u1x;
+    } else {
+      const t = (k - 1) / (m - 1);
+      const a = 1 - t;
+      px = a * a * a * p0x + 3 * a * a * t * p1x + 3 * a * t * t * p2x + t * t * t * p3x;
+      py = a * a * a * p0y + 3 * a * a * t * p1y + 3 * a * t * t * p2y + t * t * t * p3y;
+      // B'(t)/3 = (1−t)²(P1 − P0) + 2(1−t)t(P2 − P1) + t²(P3 − P2)
+      const gx = a * a * (p1x - p0x) + 2 * a * t * (p2x - p1x) + t * t * (p3x - p2x);
+      const gy = a * a * (p1y - p0y) + 2 * a * t * (p2y - p1y) + t * t * (p3y - p2y);
+      const gl = Math.hypot(gx, gy) || 1;
+      nx = -gy / gl;
+      ny = gx / gl;
+    }
+    const fi = o + 2 * k;
+    const si = o + 2 * (last - k);
+    out[fi] = px + nx * first;
+    out[fi + 1] = py + ny * first;
+    out[si] = px + nx * second;
+    out[si + 1] = py + ny * second;
+  }
+}
+
+/**
+ * Write the directed (`line` style) loop as ONE closed outline (Canvas/SVG/`toSVG()` fill), as `arrowOutline` does
+ * for a link: the shaft's left edge (`+width/2` along `perp(travel)`, the loop's outside) from `c` through the straight
+ * leg and `samples` points on the cubic to `E1`; the left barb `E1 + hw·n`, the tip `T = c + r·u1` on the rim, the
+ * right barb `E1 − hw·n` (`n = perp(−u1)`, `hw` = `headHalfWidth(width)`); the right edge (`−width/2`) back to `c`. The
+ * head's base is on `E1 = c + (r + h)·u1`, so the shaft's end corners land on it. `h` = `headLength(arrowSize)`.
+ * Writes `2·(2·samples + 5)` numbers at `o`; returns the point count `2·samples + 5` (0 for coincident ends).
+ */
+export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, h: number, samples: number): number {
+  const r = solveLoop(sx, sy, tx, ty, h);
+  if (r === 0) return 0;
+  const m = Math.max(2, samples | 0);
+  writeLoopEdges(out, o, m, width / 2, -width / 2, 2 * m + 4);
+  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
+  const ex = CUBIC[6] ?? 0, ey = CUBIC[7] ?? 0;
+  const hw = headHalfWidth(width);
+  const b = o + 2 * (m + 1);
+  out[b] = ex + u1y * hw;
+  out[b + 1] = ey - u1x * hw;
+  out[b + 2] = (FRAME[0] ?? 0) + r * u1x;
+  out[b + 3] = (FRAME[1] ?? 0) + r * u1y;
+  out[b + 4] = ex - u1y * hw;
+  out[b + 5] = ey + u1x * hw;
+  return 2 * m + 5;
+}
+
+/**
+ * Write the `half-arrow` loop as ONE closed outline: the band between offsets 0 (the inner edge, the centre path
+ * itself) and `+width` (the outer edge, on the loop's outside). The inner edge runs `c → E0 → (cubic) → E1` (points
+ * `0 … samples`), then the tip `T = c + r·u1` on the rim, the barb `E1 + (width + 2√width)·n` (`n = perp(−u1)`), and
+ * the outer edge back from `E1 + width·n` to `c + width·perp(u0)`. Head length `h` = {@link loopHalfHeadLength}.
+ * Writes `2·(2·samples + 4)` numbers at `o`; returns the point count `2·samples + 4` (0 for coincident ends).
+ */
+export function loopHalfArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, samples: number): number {
+  const r = solveLoop(sx, sy, tx, ty, loopHalfHeadLength(width));
+  if (r === 0) return 0;
+  const m = Math.max(2, samples | 0);
+  writeLoopEdges(out, o, m, 0, width, 2 * m + 3);
+  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
+  const reach = width + barbOverhang(width);
+  const b = o + 2 * (m + 1);
+  out[b] = (FRAME[0] ?? 0) + r * u1x;
+  out[b + 1] = (FRAME[1] ?? 0) + r * u1y;
+  out[b + 2] = (CUBIC[6] ?? 0) + u1y * reach;
+  out[b + 3] = (CUBIC[7] ?? 0) - u1x * reach;
+  return 2 * m + 4;
+}
+
+/** Trace `n` points of a written outline as one closed subpath, each × `scale` (the screen-sizeMode bake's `1/k`). */
+export function traceOutline(ctx: Pick<DropContext, "moveTo" | "lineTo" | "closePath">, pts: PointBuffer, n: number, scale = 1): void {
+  if (n === 0) return;
+  ctx.moveTo((pts[0] ?? 0) * scale, (pts[1] ?? 0) * scale);
+  for (let i = 1; i < n; i++) ctx.lineTo((pts[2 * i] ?? 0) * scale, (pts[2 * i + 1] ?? 0) * scale);
   ctx.closePath();
 }
 
-/** The drop's end tangent at `(tx, ty)` as a unit vector (radially into the node): the arrowhead's direction. */
-export function dropEndTangent(sx: number, sy: number, tx: number, ty: number): [number, number] {
-  const hx = 0.5 * (tx - sx);
-  const hy = 0.5 * (ty - sy);
-  const ax = -hy * DROP_COT + hx;
-  const ay = hx * DROP_COT + hy;
-  const l = Math.hypot(ax, ay) || 1;
-  return [-ax / l, -ay / l];
-}
+// ---------------------------------------------------------------------------------------------------------------
+// WebGL (#505 drop, pending the #542 WebGL step): the loop lanes still draw the old centre-to-centre drop cubic from
+// the GLSL below and these constants. The WebGL step replaces this whole block with the {@link legCubic} loop above.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The old drop's control distance from the centre, in node radii (WebGL lanes only, see the block note). */
+export const DROP_LENGTH = 3.75;
+/** The old drop's control reach beyond the rim, in node radii: the value the drop lanes read from `bends`. */
+export const DROP_REACH = DROP_LENGTH - 1;
+/** The old half-arrow drop's fitted outer control offsets, per unit width (WebGL lane only, see the block note). */
+export const DROP_OUTER_ALONG = 2.35;
+/** See {@link DROP_OUTER_ALONG}. */
+export const DROP_OUTER_ACROSS = 0.74;
 
 const f = (x: number): string => x.toPrecision(9);
 
@@ -143,7 +233,7 @@ export const DROP_LINE_GLSL = `
 /**
  * GLSL for the drop half-arrow lane: from `p0` / `p1` (the two rim ends; `p0` is moved to the centre, where the
  * glyph starts), `width` and `a_bend` = reach, the named
- * anchors of the half-arrow template and the two edge cubics, as {@link traceDropHalfArrow}.
+ * anchors of the half-arrow template and the two edge cubics (the old drop, see the block note).
  */
 export const DROP_HALF_ARROW_GLSL = `
   vec2 h = 0.5 * (a_targetOffset - a_sourceOffset);
