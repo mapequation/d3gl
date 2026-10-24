@@ -8,7 +8,7 @@ export default function SelfLinks() {
     <Example
       controls={[
         { type: "segmented", key: "links", label: "Links", options: ["Directed", "Undirected"] },
-        { type: "segmented", key: "style", label: "Style", options: ["Half-arrow", "Arrow"] },
+        { type: "segmented", key: "style", label: "Style", options: ["Half-arrow", "Arrow"], disabled: (o) => o.links === "Undirected" },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["World", "Screen"] },
       ]}
       width={720}

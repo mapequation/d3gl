@@ -30,7 +30,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     render: (options) => {
       net.style({
         directed: options.links === "Directed",
-        linkStyle: options.style === "Arrow" ? "line" : "half-arrow",
+        // Half-arrows show direction, so undirected links are always plain lines.
+        linkStyle: options.links === "Directed" && options.style === "Half-arrow" ? "half-arrow" : "line",
         sizeMode: options.sizing === "Screen" ? "screen" : "world",
         nodeRadius: { by: "degree", scale: radius },
         nodeFill: (i) => color(String(g.module[i])),
