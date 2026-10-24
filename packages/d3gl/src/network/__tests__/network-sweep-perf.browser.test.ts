@@ -167,13 +167,12 @@ function faintRings(frames: readonly (readonly InstancedLayer[])[]): number {
   return n;
 }
 
-/** Instances in the gathered layers alone (`links` / `arrows`): the links that touch an aggregate (#447). */
+/** Instances in the gathered `links` layer alone: the links that touch an aggregate (#447). */
 function gatheredLinks(layers: readonly InstancedLayer[]): number {
   let n = 0;
   for (const l of layers) {
     if (l.primitive === "lines" && l.name === "links") n += l.lines.count;
     else if (l.primitive === "half-arrows" && l.name === "links") n += l.halfArrows.count;
-    else if (l.primitive === "arrows" && l.name === "arrows") n += l.arrows.count;
   }
   return n;
 }
@@ -187,7 +186,6 @@ function alwaysWrittenBytes(layers: readonly InstancedLayer[]): number {
       bytes += c.centers.byteLength + c.radii.byteLength + c.colors.byteLength;
       if (c.borders) bytes += c.borders.byteLength + (c.borderColors?.byteLength ?? 0);
     } else if (l.primitive === "lines") bytes += l.lines.sources.byteLength + l.lines.targets.byteLength;
-    else if (l.primitive === "arrows") bytes += l.arrows.sources.byteLength + l.arrows.targets.byteLength;
     else if (l.primitive === "half-arrows") bytes += l.halfArrows.sources.byteLength + l.halfArrows.targets.byteLength;
   }
   return bytes;
@@ -216,14 +214,6 @@ function styleColumns(layers: readonly InstancedLayer[]): Map<string, ArrayBuffe
       put("half-arrows.groups", l.halfArrows.groups);
       put("half-arrows.groups2", l.halfArrows.groups2);
       put("half-arrows.selected", l.halfArrows.selected);
-    } else if (l.primitive === "arrows") {
-      put("arrows.radii", l.arrows.radii);
-      put("arrows.sizes", l.arrows.sizes);
-      put("arrows.colors", l.arrows.colors);
-      put("arrows.bends", l.arrows.bends);
-      put("arrows.groups", l.arrows.groups);
-      put("arrows.groups2", l.arrows.groups2);
-      put("arrows.selected", l.arrows.selected);
     } else if (l.primitive === "circles" && l.name === "nodes") {
       put("nodes.groups", l.circles.groups);
       put("nodes.selected", l.circles.selected);
@@ -626,7 +616,7 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
 
   const holdLegs = (): [string, HoldLeg, string[]][] => [
     ["lines", lodHold, ["lines"]],
-    ["directed lines + arrowheads", lodHoldArrows, ["arrows", "lines"]],
+    ["directed lines (head in the line, #542)", lodHoldArrows, ["lines"]],
     ["half-arrows", lodHoldHalfArrows, ["half-arrows"]],
   ];
 

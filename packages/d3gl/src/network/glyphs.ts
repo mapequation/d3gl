@@ -6,7 +6,7 @@ import type { PhysicalPieWedges } from "./pie.js";
 import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
 import { arrowOutline } from "../core/arrowhead.js";
-import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
+import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, chordBend } from "../core/half-link.js";
 import { PairIndex } from "./pair-index.js";
 import { selfLoopCache, selfLoopLayers, updateSelfLoops, type SelfLoopCache } from "./self-loops.js";
 
@@ -2120,8 +2120,7 @@ export function superEdgeBatches(
     return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids, flows };
   }
 
-  // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
-  // boundary along the bent end-tangent. Same colour as the line.
+  // Line style: bent/straight lines ∝ flow; a directed one carries its arrowhead in the same instance (#542).
   const widths = new Float32Array(count);
   for (let e = 0; e < count; e++) widths[e] = style.widthOf(wS[e]!);
   const bends = new Float32Array(count).fill(style.bend);
@@ -2130,14 +2129,14 @@ export function superEdgeBatches(
     : { sources, targets, widths, colors, count };
   if (!style.directed) return { lines, ids, flows };
 
-  // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
-  // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
-  // one-sided **half** head only for bent links (so reciprocal heads don't collide); straight links
-  // get the symmetric triangle — matching the non-LOD path (`half: bend !== 0`).
-  const aRadii = new Float32Array(count);
-  for (let e = 0; e < count; e++) putEndRadius(aRadii, e, e, bS[e]!);
-  const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
-  return { lines, arrows, ids, flows };
+  // The head orients + sets back in-shader (so screen sizeMode is honoured): the target centre (already in
+  // `targets`) plus its draw radius; the tip sits on the node boundary, a full head on the link's own end
+  // tangent — the shape the non-LOD path draws ({@link arrowOutline}).
+  const radii = new Float32Array(count);
+  for (let e = 0; e < count; e++) putEndRadius(radii, e, e, bS[e]!);
+  lines.radii = radii;
+  lines.arrowSize = style.arrowSize;
+  return { lines, ids, flows };
 }
 
 /** Reused working storage for {@link withLeafLinks}: a stamp per leaf and the frame's leaf-link edge list. */
@@ -2366,35 +2365,24 @@ export function withLeafLinks(
     lines.bends = column(ln.bends, gl?.bends, 1);
     lines.samples = ln.samples;
   }
-  const ar = cache.arrows;
-  if (!ar) return { lines, ids, flows, leafEdges };
-  const ga = gathered.arrows;
-  const arrows: InstancedArrowsData = {
-    sources,
-    targets,
-    radii: column(ar.radii, ga?.radii, 1),
-    sizes: column(ar.sizes, ga?.sizes, 1),
-    colors: lineColors,
-    count,
-  };
-  if (ar.bends) {
-    arrows.bends = column(ar.bends, ga?.bends, 1);
-    arrows.half = ar.half;
+  // A directed line carries its head (#542): the target radii gathered by edge, then the gathered pairs'.
+  if (ln.radii && ln.arrowSize !== undefined) {
+    lines.radii = column(ln.radii, gl?.radii, 1);
+    lines.arrowSize = ln.arrowSize;
   }
-  return { lines, arrows, ids, flows, leafEdges };
+  return { lines, ids, flows, leafEdges };
 }
 
 /**
  * {@link superEdges} output: the per-style instanced batches plus parallel per-super-edge metadata.
  * `ids[e] = sourceTreeNode * tree.size + targetTreeNode` (the stable directed pair) and `flows[e]` is
  * its summed flow — both indexed by the instance/`gl_InstanceID` order shared across half-arrows and
- * lines/arrows. The Scene path (#138) keys link drawables by `ids`; GPU-readback link picking (#141)
+ * lines. The Scene path (#138) keys link drawables by `ids`; GPU-readback link picking (#141)
  * maps a decoded instance index → `ids`/`flows` → a link HoverHit. (The WebGL fill draw ignores both.)
  */
 export interface SuperEdgesData {
   halfArrows?: InstancedHalfArrowsData;
   lines?: InstancedLinesData;
-  arrows?: InstancedArrowsData;
   ids: ArrayLike<number>;
   flows?: ArrayLike<number>;
   /** {@link withLeafLinks}: the graph edge of each of the first `leafEdges.length` instances (the leaf links,
@@ -2821,11 +2809,6 @@ export interface NoLodStyleCache {
   sizeMode: "world" | "screen";
   halfArrows?: HalfArrowStyleAttrs;
   lines?: LinkLinesStyleAttrs;
-  /**
-   * The LOD leaf links' heads-only `leaf-arrows` layer (until LOD draws the head in its line too, #542 step 4).
-   * Shares the line's radii/colours/bends arrays; only `sizes` is its own. The no-LOD layers never read it.
-   */
-  arrows?: LinkArrowsStyleAttrs;
   /** Per-edge source node id (#162 `groups` of every link layer), length `edgeCount`; absent on `"no-links"`. */
   groupSource?: Float32Array;
   /** Per-edge target node id (#162 `groups2` — undirected incident hover); absent when directed or `"no-links"`. */
@@ -2907,12 +2890,7 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   if (style.directed) {
     // #542: the head rides on the line instance; its radii are cached here, once per style version.
     const heads = linkHeads(graph, style.arrowSize, style.nodeRadii);
-    const arrows: LinkArrowsStyleAttrs = { radii: heads.radii, sizes: new Float32Array(graph.edgeCount).fill(style.arrowSize), colors: lines.colors };
-    if (lines.bends) {
-      arrows.bends = lines.bends;
-      arrows.half = true;
-    }
-    return { kind: "arrow-lines", sizeMode, lines: { ...lines, ...heads }, arrows, groupSource, groupTarget, nodeGroups, ends, loops };
+    return { kind: "arrow-lines", sizeMode, lines: { ...lines, ...heads }, groupSource, groupTarget, nodeGroups, ends, loops };
   }
   return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups, ends, loops };
 }
@@ -3029,7 +3007,7 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
  * Emit each directed `line` link as ONE filled arrow (#542): the shaft up to the head's base, then the head, its
  * tip on the target's rim (`nodeRadii[target]`), a full head on a bent link's own end tangent — the Canvas/SVG twin
  * of the WebGL headed line lane ({@link arrowOutline}; `toSVG()` traces the same outline). Keyed by edge index; the
- * layer sets the fill. `bake` is the screen-sizeMode bake of {@link emitArrows}: solve in px (positions × `bake`,
+ * layer sets the fill. `bake` is the screen-sizeMode bake of {@link emitHalfLinks}: solve in px (positions × `bake`,
  * widths/size/radii already px) and emit ÷`bake`, so the ×k view transform reproduces the constant-px render.
  */
 export function emitArrowLinks(
@@ -3062,47 +3040,6 @@ export function emitArrowLinks(
     g.drawable(e, (ctx) => {
       ctx.moveTo((pts[0] ?? 0) * inv, (pts[1] ?? 0) * inv);
       for (let i = 1; i < n; i++) ctx.lineTo((pts[2 * i] ?? 0) * inv, (pts[2 * i + 1] ?? 0) * inv);
-      ctx.closePath();
-    });
-  }
-}
-
-/**
- * Emit each directed link's arrowhead as a filled triangle, tip set back by the target node's radius
- * and oriented along the link's end-tangent (the bezier tangent when `bend` is set). With `half` the
- * triangle is one-sided (#104 N6c), matching the WebGL half-arrow.
- *
- * `bake` (default 1) is the **screen-sizeMode** bake (the same trick as {@link emitHalfLinks}): the
- * shape is solved in pixel space (positions × `bake`, with `size`/`nodeRadii` already in px) and scaled
- * back by `1/bake`, so the Scene's ×k view transform reproduces the WebGL constant-px arrowhead — tip
- * size *and* the node-boundary setback. Without it, the world-unit setback grows with zoom and the head
- * drifts off the node. The end-tangent direction is invariant under the uniform ×bake, so only the
- * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched.
- */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1): void {
-  const inv = 1 / bake;
-  for (let e = 0; e < graph.edgeCount; e++) {
-    const s = graph.source[e]!;
-    const t = graph.target[e]!;
-    if (s === t) continue; // #505: a directed loop is emitSelfLoopArrows' one outline, its head included (#542)
-    const sx = graph.positions[s * 2]! * bake;
-    const sy = graph.positions[s * 2 + 1]! * bake;
-    const tx = graph.positions[t * 2]! * bake;
-    const ty = graph.positions[t * 2 + 1]! * bake;
-    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
-    const px = -uy;
-    const py = ux;
-    const setback = nodeRadii[t]!;
-    const tipX = tx - ux * setback;
-    const tipY = ty - uy * setback;
-    const baseX = tipX - ux * 2 * size;
-    const baseY = tipY - uy * 2 * size;
-    g.drawable(e, (ctx) => {
-      // Solve in px×bake space, emit ÷bake so the ×k view restores the constant-px shape.
-      ctx.moveTo(tipX * inv, tipY * inv);
-      // Half-arrow: base on one side of the centreline only (tip → centre-base → +side).
-      ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
-      ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
       ctx.closePath();
     });
   }
@@ -3284,33 +3221,33 @@ export function traceSuperLines(g: GroupBuilder, lines: InstancedLinesData, ids:
 }
 
 /**
- * Trace LOD super-edges' directed **arrowheads** as filled triangles, keyed by super-edge pair id —
- * the Scene twin of {@link emitArrows}, reading the {@link superEdges} SoA (target centre + draw radius
- * for the boundary setback, size, bend, and `half` for one-sided heads on bent links). Same `bake` trick
- * for `screen` sizeMode: solve in pixel space (×bake) and emit ÷bake.
+ * Trace LOD directed `line` links (super-edges and leaf links) as ONE filled arrow each (#542), keyed by `ids` —
+ * the Scene twin of the WebGL headed line lane and of {@link emitArrowLinks}: {@link arrowOutline} from the
+ * line's ends, width, bend, `arrowSize` and target draw radius (`radii`). Same `bake` trick for `screen`
+ * sizeMode: solve in pixel space (×bake, widths/size/radii already px) and emit ÷bake.
  */
-export function traceSuperArrows(g: GroupBuilder, arrows: InstancedArrowsData, ids: ArrayLike<number>, bake = 1): void {
+export function traceSuperArrowLines(g: GroupBuilder, lines: InstancedLinesData, ids: ArrayLike<number>, bake = 1): void {
+  const { sources, targets, widths, bends, radii } = lines;
+  const size = lines.arrowSize ?? 0;
   const inv = 1 / bake;
-  const half = arrows.half === true;
-  for (let e = 0; e < arrows.count; e++) {
-    const sx = arrows.sources[e * 2]! * bake;
-    const sy = arrows.sources[e * 2 + 1]! * bake;
-    const tx = arrows.targets[e * 2]! * bake;
-    const ty = arrows.targets[e * 2 + 1]! * bake;
-    const bend = arrows.bends ? arrows.bends[e]! : 0;
-    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
-    const px = -uy;
-    const py = ux;
-    const setback = arrows.radii[e]!;
-    const size = arrows.sizes[e]!;
-    const tipX = tx - ux * setback;
-    const tipY = ty - uy * setback;
-    const baseX = tipX - ux * 2 * size;
-    const baseY = tipY - uy * 2 * size;
-    g.drawable(ids[e]!, (ctx) => {
-      ctx.moveTo(tipX * inv, tipY * inv);
-      ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
-      ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
+  const pts = new Float64Array(2 * (2 * BENT_SAMPLES + 3)); // one scratch for every link
+  for (let e = 0; e < lines.count; e++) {
+    const bend = bends ? (bends[e] ?? 0) : 0;
+    const n = arrowOutline(pts, 0, {
+      sx: (sources[e * 2] ?? 0) * bake,
+      sy: (sources[e * 2 + 1] ?? 0) * bake,
+      tx: (targets[e * 2] ?? 0) * bake,
+      ty: (targets[e * 2 + 1] ?? 0) * bake,
+      radius: radii ? (radii[e] ?? 0) : 0,
+      width: widths[e] ?? 0,
+      size,
+      bend,
+    }, bend ? BENT_SAMPLES : 2);
+    if (n === 0) continue;
+    // The Scene records the path synchronously, so the shared scratch is safe to reuse for the next link.
+    g.drawable(ids[e] ?? 0, (ctx) => {
+      ctx.moveTo((pts[0] ?? 0) * inv, (pts[1] ?? 0) * inv);
+      for (let i = 1; i < n; i++) ctx.lineTo((pts[2 * i] ?? 0) * inv, (pts[2 * i + 1] ?? 0) * inv);
       ctx.closePath();
     });
   }

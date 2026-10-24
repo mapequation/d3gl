@@ -287,7 +287,6 @@ describe("networkLayers", () => {
       const cache = noLodStyleCache(g, s);
       expect(cache.kind).toBe("no-links");
       expect(cache.lines).toBeUndefined();
-      expect(cache.arrows).toBeUndefined();
       expect(cache.halfArrows).toBeUndefined();
       expect(networkLayersFromCache(g, s, cache).map((l) => l.name)).toEqual(["nodes"]);
     }
