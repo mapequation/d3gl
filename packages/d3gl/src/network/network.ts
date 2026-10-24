@@ -3749,13 +3749,17 @@ export class Network extends BaseEngine {
 
   /** The physical-view pie layer (#171): overlapping (≥2-module) physical nodes as instanced pie wedges,
    *  drawn on top of the node discs. Null off the physical view, without pie wedges, or when none overlap. */
-  private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer | null {
+  private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle, nodeBorders: Float32Array | undefined): InstancedLayer | null {
     if (this.activeView !== "physical" || !this.pieWedges) return null;
-    // Draw the pie at the node's INNER radius (inside any constant border), so the "nodes" circle's
-    // border ring shows around the pie exactly as it does around a single-module disc (#171 review).
-    const cb = resolved.constBorder;
-    const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width))) : resolved.nodeRadii;
-    const pie = physicalPieInstances(this.pieWedges, graph.positions, radii, this.pieColors() ?? undefined);
+    // The node's border, by the node layer's own `borders` column of this emit (no copy, one rule with the
+    // disc's, #507): a flow border or node border with no colour given shows through the pie — each wedge
+    // spans the full radius and darkens its own outer band by the border's factor; a border with an explicit
+    // colour shows around the pie, drawn at the node's inner radius (#171 review). A flow border, when
+    // present, is the node's border (the node border is not drawn then), so its factor wins.
+    const flowBorder = resolved.flowBorder;
+    const darken = flowBorder ? flowBorder.darken : resolved.constBorder?.darken;
+    const border = nodeBorders ? { fractions: nodeBorders, darken } : undefined;
+    const pie = physicalPieInstances(this.pieWedges, graph.positions, resolved.nodeRadii, this.pieColors() ?? undefined, border);
     if (pie.count === 0) return null;
     // Unchanged columns go out as the arrays last emitted (one compare pass each, O(wedges), on an emit that is
     // O(wedges) already), so the GPU layer re-uploads only what changed.
@@ -3764,6 +3768,7 @@ export class Network extends BaseEngine {
     pie.radii = cols.float32("radii", pie.radii);
     pie.angles = cols.float32("angles", pie.angles);
     pie.colors = cols.uint8("colors", pie.colors);
+    if (pie.borders) pie.borders = cols.float32("borders", pie.borders);
     if (pie.groups) pie.groups = cols.float32("groups", pie.groups);
     // #175: the per-wedge `selected` flags travel ON the emit (like the nodes' via attachNoLodHighlight).
     // A flag-less emit would zero-fill the GPU column (HighlightBuffers.write) on the next layout/drag
@@ -3771,6 +3776,13 @@ export class Network extends BaseEngine {
     // back the same array and its upload is skipped.
     pie.selected = this.noLodSelectedFor(this.PIE_LAYER);
     return { name: this.PIE_LAYER, primitive: "pie", pie, sizeMode: resolved.sizeMode };
+  }
+
+  /** The node layer's per-node border widths as fractions of the radius (the flow border, else the node
+   *  border), as the instanced-circle shader reads them; undefined without a border (#507). */
+  private nodeBorderFractions(layers: InstancedLayer[]): Float32Array | undefined {
+    for (const l of layers) if (l.name === this.NODE_LAYER && l.primitive === "circles" && !l.circles.bordersPx) return l.circles.borders;
+    return undefined;
   }
 
   /** The `both`-view container layer (#171): faint world-sized discs at each physical node, sized to hold
@@ -4299,7 +4311,7 @@ export class Network extends BaseEngine {
         // State-network overlays (#171), build-once per emit: the `both`-view physical **container** discs
         // draw UNDER the nodes/links (backdrop), the physical-view **pie** wedges draw ON TOP (cover the disc).
         const container = this.containerLayer();
-        const pie = this.pieInstancedLayer(graph, resolved);
+        const pie = this.pieInstancedLayer(graph, resolved, this.nodeBorderFractions(base));
         return [...(container ? [container] : []), ...base, ...(pie ? [pie] : [])];
       });
       this.registerInstancedLane(this.NET_LANE, {
@@ -6214,22 +6226,38 @@ export class Network extends BaseEngine {
     // Always registered (empty in the state view / when no pie wedges) so a view switch clears it.
     const wedges = this.activeView === "physical" ? this.pieWedges : null;
     const pieRGBA = wedges ? this.pieColors() : null; // the WebGL pie's colours (#494)
+    // A flow border or node border with no colour given shows through the pie (#507): each wedge spans the full
+    // radius and its outer band, from the node's inner radius out, is its own drawable (id `bandIds + k`) in its
+    // colour with RGB × the border's factor — the WebGL pie shader's band. A border with an explicit colour shows
+    // around the pie: traced at the INNER radius, as around a single-module disc (#171 review).
+    const bandDarken = darken;
+    const bandIds = wedges ? wedges.end.length : 0;
     const pieIds: number[] = [];
     if (wedges) {
       for (let p = 0; p < wedges.wedgeCount.length; p++) {
-        if (wedges.wedgeCount[p]! >= 2) for (let k = wedges.offset[p]!; k < wedges.offset[p + 1]!; k++) pieIds.push(k);
+        if (wedges.wedgeCount[p]! < 2) continue;
+        for (let k = wedges.offset[p]!; k < wedges.offset[p + 1]!; k++) {
+          pieIds.push(k);
+          if (bandDarken !== undefined) pieIds.push(bandIds + k);
+        }
       }
     }
+    const wedgeCss = (k: number): string => (pieRGBA ? rgbaCss(pieRGBA, k) : DEFAULT_NODE_FILL);
     this.registerLayer({
       name: this.PIE_LAYER,
       data: pieIds,
       ids: pieIds,
       sizeMode: style.sizeMode,
-      fill: (k) => (pieRGBA ? rgbaCss(pieRGBA, k as number) : DEFAULT_NODE_FILL),
+      fill: (id) => {
+        const k = id as number;
+        if (k < bandIds || bandDarken === undefined) return wedgeCss(k);
+        return pieRGBA ? darkenedCss(pieRGBA, k - bandIds, bandDarken) : DEFAULT_NODE_FILL;
+      },
       build: (g) => {
-        // Trace at the INNER radius (inside the border), so each node's black border ring shows around
-        // the pie exactly as around a single-module disc (matches the WebGL pie lane).
-        if (emit && wedges) tracePieWedges(g, wedges, graph.positions, innerRadii, style.sizeMode === "screen");
+        if (!emit || !wedges) return;
+        const screen = style.sizeMode === "screen";
+        if (bandDarken !== undefined) tracePieWedges(g, wedges, graph.positions, style.nodeRadii, screen, { inner: innerRadii, bandIds });
+        else tracePieWedges(g, wedges, graph.positions, innerRadii, screen);
       },
     });
   }

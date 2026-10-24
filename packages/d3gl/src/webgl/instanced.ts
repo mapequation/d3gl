@@ -189,6 +189,16 @@ function writeIfChanged<T extends ArrayBufferView>(buffer: Buffer, arr: T, last:
   return arr;
 }
 
+/** Pie-lane column uploads (#507), for the per-frame guards: bytes written by an in-place {@link InstancedPie}
+ *  update. A frame whose columns are the arrays last written adds 0; a position frame adds the centres alone. */
+export const pieColumnStats = { bytes: 0 };
+
+/** {@link writeIfChanged} for the pie lane's columns, counting the bytes into {@link pieColumnStats}. */
+function writePieColumn<T extends ArrayBufferView>(buffer: Buffer, arr: T, last: T): T {
+  if (arr !== last) pieColumnStats.bytes += arr.byteLength;
+  return writeIfChanged(buffer, arr, last);
+}
+
 /** Border-column uploads of the instanced circles (#513), for the per-frame guards: one per `borders` or
  *  `borderColors` array written to its buffer. A frame whose border columns are the arrays last written adds 0. */
 export const borderColumnStats = { writes: 0 };
@@ -499,9 +509,14 @@ export class InstancedPie {
   private radius: Buffer;
   private angles: Buffer;
   private color: Buffer;
+  /** The per-wedge outer band column (#507); a layer without one reads {@link InstancedPie.noBorders}. */
+  private border: Buffer;
   /** The columns last uploaded (#494): an update re-uploads only a column that is a new array, so a restyle
    *  that keeps the geometry (a palette change) uploads the colours alone. */
-  private last: { centers: Float32Array; radii: Float32Array; angles: Float32Array; colors: Uint8Array };
+  private last: { centers: Float32Array; radii: Float32Array; angles: Float32Array; colors: Uint8Array; borders: Float32Array };
+  /** The zero band column of a layer without `borders`, kept across updates, so it is the same array each
+   *  update and uploads only when the wedge count changes. */
+  private zeros = new Float32Array(0);
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -513,12 +528,15 @@ export class InstancedPie {
     this.radius = device.createBuffer({ data: data.radii });
     this.angles = device.createBuffer({ data: data.angles });
     this.color = device.createBuffer({ data: data.colors });
-    this.last = { centers: data.centers, radii: data.radii, angles: data.angles, colors: data.colors };
+    const borders = this.bordersOf(data);
+    this.border = device.createBuffer({ data: borders });
+    this.last = { centers: data.centers, radii: data.radii, angles: data.angles, colors: data.colors, borders };
     this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width, height],
+      u_borderDarken: data.borderDarken ?? 1,
       ...highlightUniforms(0), // pie is a node glyph — dimmed/kept, not recoloured (recolor = 0)
     };
     this.model = new Model(device, {
@@ -530,6 +548,7 @@ export class InstancedPie {
         { name: "a_radius", format: "float32", stepMode: "instance" },
         { name: "a_angles", format: "float32x2", stepMode: "instance" },
         { name: "a_color", format: "unorm8x4", stepMode: "instance" },
+        { name: "a_border", format: "float32", stepMode: "instance" },
         ...this.hl.layout,
       ],
       attributes: {
@@ -538,6 +557,7 @@ export class InstancedPie {
         a_radius: this.radius,
         a_angles: this.angles,
         a_color: this.color,
+        a_border: this.border,
         ...this.hl.attributes(),
       },
       uniforms: this.uniforms,
@@ -565,31 +585,37 @@ export class InstancedPie {
   /** In-place instance update (mirrors {@link InstancedCircles.update}): sub-upload while the wedge
    *  count fits capacity, else reallocate the instance buffers (keeping the same object). */
   update(device: Device, data: InstancedPieData): void {
+    const borders = this.bordersOf(data);
+    this.uniforms["u_borderDarken"] = data.borderDarken ?? 1;
     if (data.count > this._capacity) {
       this.center.destroy();
       this.radius.destroy();
       this.angles.destroy();
       this.color.destroy();
+      this.border.destroy();
       this._capacity = grownCapacity(data.count, this._capacity);
       this.center = grownBuffer(device, data.centers, data.count, this._capacity);
       this.radius = grownBuffer(device, data.radii, data.count, this._capacity);
       this.angles = grownBuffer(device, data.angles, data.count, this._capacity);
       this.color = grownBuffer(device, data.colors, data.count, this._capacity);
+      this.border = grownBuffer(device, borders, data.count, this._capacity);
       this.model.setAttributes({
         a_center: this.center,
         a_radius: this.radius,
         a_angles: this.angles,
         a_color: this.color,
+        a_border: this.border,
         ...this.hl.recreate(data, this._capacity),
       });
-      this.last = { centers: data.centers, radii: data.radii, angles: data.angles, colors: data.colors };
+      this.last = { centers: data.centers, radii: data.radii, angles: data.angles, colors: data.colors, borders };
     } else {
       const last = this.last;
       this.last = {
-        centers: writeIfChanged(this.center, data.centers, last.centers),
-        radii: writeIfChanged(this.radius, data.radii, last.radii),
-        angles: writeIfChanged(this.angles, data.angles, last.angles),
-        colors: writeIfChanged(this.color, data.colors, last.colors),
+        centers: writePieColumn(this.center, data.centers, last.centers),
+        radii: writePieColumn(this.radius, data.radii, last.radii),
+        angles: writePieColumn(this.angles, data.angles, last.angles),
+        colors: writePieColumn(this.color, data.colors, last.colors),
+        borders: writePieColumn(this.border, borders, last.borders),
       };
       this.hl.write(data);
     }
@@ -607,7 +633,15 @@ export class InstancedPie {
     this.radius.destroy();
     this.angles.destroy();
     this.color.destroy();
+    this.border.destroy();
     this.hl.destroy();
+  }
+
+  /** The layer's band column, else the kept zero column, rebuilt only when the wedge count changes. */
+  private bordersOf(data: InstancedPieData): Float32Array {
+    if (data.borders) return data.borders;
+    if (this.zeros.length !== data.count) this.zeros = new Float32Array(data.count);
+    return this.zeros;
   }
 }
 
