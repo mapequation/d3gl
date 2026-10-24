@@ -197,6 +197,47 @@ describe("network.update() on a state network (#547)", () => {
     net.destroy();
   });
 
+  it("a parked view whose run update() stopped before it settled runs again, warm, from its kept positions", async () => {
+    const graph = stateGraph([1, 1, 1, 1, 1, 1]);
+    const net = await engine();
+    net.stateNetwork(graph, { modules: MODULES, view: "physical" });
+    net.layout({ backend: "worker" });
+    await net.whenSettled();
+    net.view("state"); // laid out on first show
+    await net.whenSettled();
+    net.layout({ backend: "worker" }); // running…
+    net.view("physical"); // …and stopped before it settled: parked to go on
+    net.update({ flow: FLOW, modules: RECLUSTERED });
+    expect(net.layoutTransport, "the active view is the caller's: nothing starts").toBe("none");
+    const state = Array.from(graph.state.positions);
+    net.view("state");
+    expect(net.layoutTransport, "the stopped run goes on").not.toBe("none");
+    expect(Array.from(graph.state.positions), "from the kept positions").toEqual(state);
+    await net.whenSettled();
+    expect(Array.from(graph.state.positions), "a warm run, not a fresh layout").not.toEqual(state);
+    net.destroy();
+  });
+
+  it("new modules drop a selected state-view module of the old ones; nodes and lumps are kept", async () => {
+    const net = await shown(stateGraph([1, 1, 1, 1, 1, 1]), MODULES, "state", false);
+    net.lod({ expandPx: 60, declutter: false });
+    expect(net.lodSource).toBe("modules");
+    net.interactive({ selectable: { multi: true } });
+    const seen: number[][] = [];
+    net.on("select", (hits) => seen.push(ids(hits)));
+    net.select("nodes", [1, S]); // state 1 and a module of the state view's tree
+    net.update({ flow: FLOW });
+    expect(ids(net.selection()), "the same modules: the module stays selected").toEqual([1, S]);
+    net.update({ modules: RECLUSTERED });
+    expect(ids(net.selection()), "the old module is dropped, the state node stays").toEqual([1]);
+    expect(seen.at(-1), "the selection left is announced").toEqual([1]);
+    net.lump(true); // state 1 → lump 0 under RECLUSTERED
+    net.select("nodes", [0, L2]); // lump 0 and a module of the lumps' tree
+    net.update({ modules: MODULES }); // lump 0's states 0, 1, 5 → lumps 0, 0, 1
+    expect(ids(net.selection())).toEqual([0, 1]);
+    net.destroy();
+  });
+
   it("keeps the selection: the same ids, and a lump's through its state nodes", async () => {
     const net = await shown(stateGraph([1, 1, 1, 1, 1, 1]), MODULES, "state", false);
     net.interactive({ selectable: { multi: true } });
