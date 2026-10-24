@@ -329,7 +329,7 @@ export interface NetworkStyle {
    */
   selfLinkSpread?: number;
   /**
-   * Self-link loops (#542): how far a loop reaches out, as its leg length in node radii (default `1.5`). A provisional
+   * Self-link loops (#542): how far a loop reaches out, as its leg length in node radii (default `1`). A provisional
    * name: it may change before it is settled.
    */
   selfLinkLength?: number;

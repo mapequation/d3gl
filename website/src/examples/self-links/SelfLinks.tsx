@@ -14,7 +14,7 @@ export default function SelfLinks() {
         { type: "segmented", key: "bend", label: "Bend", options: ["Straight", "Bent"] },
         { type: "range", key: "bendStrength", label: "Bend strength", min: 0.05, max: 0.5, step: 0.05, value: 0.2, disabled: (o) => o.bend === "Straight" },
         { type: "range", key: "loopSpread", label: "Loop spread (°)", min: 10, max: 90, step: 5, value: 25 },
-        { type: "range", key: "loopLength", label: "Loop length (radii)", min: 0.5, max: 5, step: 0.25, value: 1.5 },
+        { type: "range", key: "loopLength", label: "Loop length (radii)", min: 0.5, max: 5, step: 0.25, value: 1 },
       ]}
       width={720}
       height={440}

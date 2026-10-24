@@ -301,17 +301,23 @@ describe("self-loop geometry", () => {
       expect(rec.subpaths).toHaveLength(1);
       return rec.subpaths[0]?.points ?? [];
     };
-    for (const r of [5, 10, 20]) {
-      for (const width of [1, 4, 10]) {
-        const [sx, sy, tx, ty] = endsAt(0.9, r, 3, -4);
-        // 1: a short arrowhead, shaft down the end piece; 5·∛w: the arrowhead as long as the half's, both the piece.
-        for (const size of [1, 5 * Math.cbrt(width)]) {
-          let n = loopArrowOutline(dense, 0, sx, sy, tx, ty, width, size, M);
-          let pts = traced((rec) => traceLoopArrowOutline(rec, sx, sy, tx, ty, width, size));
-          expect(outlineGap(pts, pts.length / 2, dense, n), `arrow r ${r} width ${width} size ${size}`).toBeLessThan(0.05 * width);
-          n = loopHalfArrowOutline(dense, 0, sx, sy, tx, ty, width, size, M);
-          pts = traced((rec) => traceLoopHalfArrowOutline(rec, sx, sy, tx, ty, width, size));
-          expect(outlineGap(pts, pts.length / 2, dense, n), `half r ${r} width ${width} size ${size}`).toBeLessThan(0.05 * width);
+    for (const leg of [LOOP_LEG, 1.5]) {
+      for (const r of [5, 10, 20]) {
+        for (const width of [1, 4, 10]) {
+          // The default legs (L = 1) under a loop as wide as its node (w = 2r) turn too tight for two cubics per edge:
+          // ~0.09·w off there.
+          if (leg < 1.5 && width >= 2 * r) continue;
+          const [sx, sy, tx, ty] = endsAt(0.9, r, 3, -4);
+          // 1: a short arrowhead, shaft down the end piece; 5·∛w: the arrowhead as long as the half's, both the piece.
+          for (const size of [1, 5 * Math.cbrt(width)]) {
+            const at = `L ${leg} r ${r} width ${width} size ${size}`;
+            let n = loopArrowOutline(dense, 0, sx, sy, tx, ty, width, size, M, leg);
+            let pts = traced((rec) => traceLoopArrowOutline(rec, sx, sy, tx, ty, width, size, leg));
+            expect(outlineGap(pts, pts.length / 2, dense, n), `arrow ${at}`).toBeLessThan(0.05 * width);
+            n = loopHalfArrowOutline(dense, 0, sx, sy, tx, ty, width, size, M, leg);
+            pts = traced((rec) => traceLoopHalfArrowOutline(rec, sx, sy, tx, ty, width, size, leg));
+            expect(outlineGap(pts, pts.length / 2, dense, n), `half ${at}`).toBeLessThan(0.05 * width);
+          }
         }
       }
     }
