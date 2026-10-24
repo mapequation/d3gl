@@ -264,14 +264,17 @@ in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
 in vec2 a_center;           // per-instance world centre (shared by a pie's wedges)
 in float a_radius;          // per-instance radius
 in vec2 a_angles;           // per-instance [startFrac, endFrac] in [0,1]
-in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+in float a_border;          // per-instance outer band as a fraction of the radius (#507); 0 = none${HL_UNIFORMS}
 out vec4 v_color;
 out vec2 v_local;
 out vec2 v_angles;
+out float v_border;
 void main() {
   v_color = a_color;${HL_APPLY}
   v_local = a_corner;
   v_angles = a_angles;
+  v_border = a_border;
   vec3 c = u_transform * vec3(a_center, 1.0);
   vec2 off = (u_screen > 0.5)
     ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
@@ -288,13 +291,17 @@ precision highp float;
 in vec4 v_color;
 in vec2 v_local;
 in vec2 v_angles;
+in float v_border;
+uniform float u_borderDarken; // RGB factor of the outer band (#507)
 out vec4 fragColor;
 void main() {
-  if (length(v_local) > 1.0) discard;
+  float r = length(v_local);
+  if (r > 1.0) discard;
   float frac = atan(v_local.y, v_local.x) * 0.15915494309; // /(2π) -> [-0.5, 0.5]
   if (frac < 0.0) frac += 1.0;                              // -> [0, 1)
   if (frac < v_angles.x || frac >= v_angles.y) discard;     // outside this wedge
-  fragColor = v_color;
+  // The wedge's outer band (the node's flow border, #507) in its own colour, darker — the circle's ring test.
+  fragColor = (v_border > 0.0 && r > 1.0 - v_border) ? vec4(v_color.rgb * u_borderDarken, v_color.a) : v_color;
 }`;
 
 // INSTANCED_LINE_VS — GPU-instanced "path-strip" lines for the network lane (#100, bent #104 N6c).

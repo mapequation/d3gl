@@ -4,7 +4,7 @@ import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, fro
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, markHolders, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
@@ -16,7 +16,7 @@ import { dominantWedges, physicalPieWedges, type PhysicalPieWedges, type PieWedg
 import { rosettePositions } from "./rosette.js";
 import { packStateNodes, pickBothNodes, regionBothNodes, instanceRuns, type BothStateNodes } from "./both-layout.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
-import { lumpStateGraph, type LumpedStateNetwork, type StateNetworkGraph } from "./state-graph.js";
+import { groupFlow, lumpStateGraph, type LumpedStateNetwork, type PhysicalToState, type StateNetworkGraph } from "./state-graph.js";
 import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type LayoutContinuation, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
 import { buildLeafIncidence, keptByLastGather, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
@@ -27,6 +27,7 @@ import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import { grownCapacity } from "../webgl/instanced.js";
 import type { NetworkGraph } from "./graph.js";
+import { planNetworkUpdate, type ModuleHierarchy, type NetworkUpdatePlan } from "./network-update.js";
 import { layoutBox, layoutFitTransform, fitCameraPath, type FitBox } from "./fit.js";
 import type { InstancedArrowsData, InstancedCirclesData, InstancedHalfArrowsData, InstancedLayer, InstancedLinesData, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
@@ -758,6 +759,22 @@ export interface NetworkDataOptions {
 }
 
 /**
+ * A change to the **flow and the modules** of the network the engine holds, for {@link Network.update} (#547): what
+ * a re-clustering (an Infomap run) gives. Indexed per node of the loaded network. A field left out is unchanged.
+ */
+export interface NetworkUpdateOptions {
+  /** The new per-node flow ({@link NetworkGraph.flow}), length `nodeCount`. The engine keeps its own copy. */
+  flow?: ArrayLike<number>;
+  /** The new module assignment, as {@link NetworkDataOptions.modules} takes it; `null` removes the modules and their
+   *  links. New modules come with their own `moduleLinks` or none: the links held until now are addressed in the
+   *  old modules' paths, so new modules without `moduleLinks` clear them. */
+  modules?: ArrayLike<ModuleNode> | null;
+  /** The new module links, as {@link NetworkDataOptions.moduleLinks} takes them; `null` removes them. Requires
+   *  modules, given here or held. */
+  moduleLinks?: ArrayLike<ModuleLink> | null;
+}
+
+/**
  * Options for {@link Network.stateNetwork} (#171). The engine ingests a state network + a per-**state-node**
  * module assignment, derives the physical network's overlapping-module pie wedges + module colours, and lets
  * you toggle the state ↔ physical view with {@link Network.view}.
@@ -767,6 +784,17 @@ export interface StateNetworkOptions {
    *  colours (every view) and the physical view's overlapping-module pie wedges. Optional (#494): a raw
    *  state network (before Infomap) still switches views, with no pies and the plain node fill. */
   modules?: ArrayLike<ModulePathNode>;
+  /**
+   * **Module-level links** of the state-node module hierarchy {@link modules} (#533), addressed by path, as
+   * `data(graph, { modules, moduleLinks })` takes them ({@link NetworkDataOptions.moduleLinks}): an Infomap state
+   * `.ftree` stores its leaf links only inside bottom modules and every coarser link once, in its `*Links` sections.
+   * The **state view** draws exactly these links between its modules, and its layouts pull along them, as for a plain
+   * network. The physical and both views have none: their modules overlap, so a module link has no single physical
+   * endpoint there. Lumped ({@link lump}), a module endpoint keeps its path and a leaf endpoint, a state node, becomes
+   * the lump that holds it. Requires `modules`; `stateNetwork()` checks up front that every endpoint is a module or
+   * leaf of that hierarchy and throws otherwise. @see {@link ModuleLink}
+   */
+  moduleLinks?: ArrayLike<ModuleLink>;
   /** Pie-wedge derivation options (grouping level, flow vs count sizing). @see {@link physicalPieWedges} */
   pie?: PieWedgeOptions;
   /** The engine's own module colour scheme (shared by node colours and pie wedges), used while the style
@@ -839,7 +867,7 @@ const CONTAINER_RING_DARKEN = 0.62;
 const CONTAINER_RING_PX = 1;
 
 /** A state network's module hierarchy, or a plain network's (#326): the records with each node's record index. */
-type Hierarchy = { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; recordOf: Int32Array };
+type Hierarchy = ModuleHierarchy;
 
 /**
  * One of a state network's two layouts (#495): the physical graph's (drawn by the physical and both views) and the
@@ -848,10 +876,11 @@ type Hierarchy = { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<Module
  * module tree across switches.
  */
 interface ViewLayout {
-  /** The graph this layout places: `sg.physical` or `sg.state`. */
-  readonly graph: NetworkGraph;
+  /** The graph this layout places: `sg.physical` or `sg.state`, the engine's view of it after an
+   *  {@link Network.update} (#547), which keeps the layout. */
+  graph: NetworkGraph;
   /** The module hierarchy of that graph (the state view's modules), as `data(graph, { modules })` holds it. */
-  readonly hierarchy: Hierarchy | null;
+  hierarchy: Hierarchy | null;
   /** A settled run, parked with its transport alive (a drag reheats it). Never a live run: a switch stops that. */
   handle: WorkerLayoutHandle | null;
   opts: NetworkLayoutOptions;
@@ -896,9 +925,15 @@ interface StateLevel {
   readonly both: NetworkGraph;
 }
 
-/** The {@link StateLevel} of `data`, with no layout run yet; `recordOf` is `modules`' record index, when known. */
-function newStateLevel(data: StateNetworkGraph, modules: ArrayLike<ModulePathNode> | null, recordOf = modules ? moduleRecordIndex(data.state.nodeCount, modules) : null): StateLevel {
-  const hierarchy = modules && recordOf ? { modules, moduleLinks: undefined, recordOf } : null;
+/** The {@link StateLevel} of `data`, with no layout run yet; `moduleLinks` are its state view's module links (#533),
+ *  `recordOf` is `modules`' record index, when known. */
+function newStateLevel(
+  data: StateNetworkGraph,
+  modules: ArrayLike<ModulePathNode> | null,
+  moduleLinks: ArrayLike<ModuleLink> | null,
+  recordOf = modules ? moduleRecordIndex(data.state.nodeCount, modules) : null,
+): StateLevel {
+  const hierarchy = modules && recordOf ? { modules, moduleLinks: moduleLinks ?? undefined, recordOf } : null;
   // The both view draws the state graph at positions of its own: each state node at its place in its container.
   return { data, modules, layout: newViewLayout(data.state, hierarchy), both: { ...data.state, positions: new Float32Array(2 * data.state.nodeCount) } };
 }
@@ -906,6 +941,34 @@ function newStateLevel(data: StateNetworkGraph, modules: ArrayLike<ModulePathNod
 /** A state-network layout that has not run yet (#495). */
 function newViewLayout(graph: NetworkGraph, hierarchy: Hierarchy | null): ViewLayout {
   return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null, camera: null, carried: false };
+}
+
+/** Forget what a layout derived from its graph's modules (#547): its module tree, springs and nested discs. */
+function dropLayoutModuleCaches(layout: ViewLayout): void {
+  layout.moduleTree = null;
+  layout.moduleSprings = null;
+  layout.nestedDiscs = null;
+}
+
+/**
+ * Each lump at its state nodes' centroid (#529, #547): `to` gets 2 coordinates per lump of `lumpToState`, from `from`
+ * with 2 per state node, or, with `at`, 2 per node `at[s]` drawn for state node `s` (the lump that held it).
+ * O(state nodes).
+ */
+function lumpCentroids(to: Float32Array, lumpToState: PhysicalToState, from: ArrayLike<number>, at?: ArrayLike<number>): void {
+  const { offsets, states } = lumpToState;
+  for (let l = 0; l + 1 < offsets.length; l++) {
+    const start = offsets[l]!, end = offsets[l + 1]!;
+    let x = 0, y = 0;
+    for (let i = start; i < end; i++) {
+      const st = states[i]!;
+      const k = at ? (at[st] ?? st) : st;
+      x += from[2 * k]!;
+      y += from[2 * k + 1]!;
+    }
+    to[2 * l] = x / (end - start);
+    to[2 * l + 1] = y / (end - start);
+  }
 }
 
 /** `opts` continued from where the nodes are (#495): a warm flat or nested start, for a view laid out on first show
@@ -1360,6 +1423,10 @@ export class Network extends BaseEngine {
    *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
   private derivedParentFor: LODTree | null = null;
   private derivedParent: Int32Array | null = null;
+  /** The holders of the node selection on the LOD tree (#538, {@link markHolders}): rebuilt when the
+   *  selection or the tree changes ({@link holdersOf}), never per frame. `flags` only grows, and a rebuild
+   *  clears just the previous marks. `builds` counts the rebuilds, for {@link holderStats}. */
+  private readonly holders = { tree: null as LODTree | null, sel: null as ReadonlySet<string | number> | null, stale: true, flags: new Uint8Array(0), marked: [] as number[], builds: 0 };
   /** Frontier label options (#105 N7b); null until {@link labels} is enabled. The overlay itself
    *  ({@link BaseEngine.labelLayer}), its placement/routing, and the export-anchor retention for the
    *  WebGL export-only text stash (#219) all live in the base (shared with plot/geo labels, #223). */
@@ -1375,8 +1442,9 @@ export class Network extends BaseEngine {
   /** State-network mode (#171): the ingested state network, or null for a plain graph. When set, the
    *  engine renders one of its three views ({@link activeView}), each with the layout it draws ({@link viewLayouts}). */
   private stateData: StateNetworkGraph | null = null;
-  /** The state network as given to {@link stateNetwork}, with its modules (#529): what {@link lump} lumps. */
-  private stateSource: { graph: StateNetworkGraph; modules: ArrayLike<ModulePathNode> | null } | null = null;
+  /** The state network as given to {@link stateNetwork}, with its modules and module links (#529, #533): what
+   *  {@link lump} lumps. */
+  private stateSource: { graph: StateNetworkGraph; modules: ArrayLike<ModulePathNode> | null; moduleLinks: ArrayLike<ModuleLink> | null; recordOf: Int32Array | null } | null = null;
   /** The lumped network (#529), built the first time it is drawn and kept for the state network. */
   private lumpedNet: LumpedStateNetwork | null = null;
   /** Whether the state and both views draw {@link lumpedNet} (#529). */
@@ -1418,6 +1486,8 @@ export class Network extends BaseEngine {
   private stateModules: ArrayLike<ModulePathNode> | null = null;
   /** The engine's own module colour scheme ({@link StateNetworkOptions.color}), for the default fill. */
   private stateColorOpts: ModuleColorOptions | undefined = undefined;
+  /** The state network's pie options ({@link StateNetworkOptions.pie}): {@link update} derives the pies again (#547). */
+  private statePie: PieWedgeOptions | undefined = undefined;
   /** The module each node of a view's graph is coloured by (#494): a state node's enclosing module, a
    *  physical node's (first) module at the pie level. Built once per state network, on first use. */
   private stateNodeModules: { state: NodeModules; physical: NodeModules; wedge: Int32Array; dominant: Int32Array } | null = null;
@@ -1484,13 +1554,261 @@ export class Network extends BaseEngine {
    * Leaves any state-network mode ({@link stateNetwork}) — a plain graph replaces it.
    */
   data(graph: NetworkGraph, opts: NetworkDataOptions = {}): this {
-    const { modules, moduleLinks } = opts;
-    if (moduleLinks && !modules) throw new Error("network.data: moduleLinks requires modules");
-    const recordOf = modules ? moduleRecordIndex(graph.nodeCount, modules) : null;
-    if (modules && moduleLinks) checkModuleLinks(graph.nodeCount, modules, moduleLinks);
-    this.hierarchy = modules && recordOf ? { modules, moduleLinks, recordOf } : null;
+    // Load, then the step update() runs (#547): the module checks and the module handling live there.
+    const plan = planNetworkUpdate("network.data", graph.nodeCount, { modules: opts.modules ?? null, moduleLinks: opts.moduleLinks ?? null }, null);
     this.clearStateNetwork();
-    return this.setActiveGraph(graph);
+    this.adoptGraph(graph);
+    this.applyUpdate(plan);
+    return this.rebuild();
+  }
+
+  /**
+   * Change the **flow and the modules** of the network the engine holds (#547), keeping its nodes, links, weights and
+   * positions: what a re-clustering gives. `net.update({ flow, modules, moduleLinks })` — a field left out is
+   * unchanged, `modules: null` removes the modules and their links. Everything is checked first, as {@link data}
+   * checks its hierarchy, and a bad change throws with the engine unchanged; so does a call with no network loaded.
+   *
+   * Kept: the positions and the layout state, the camera, the selected nodes (the same ids), and the style options —
+   * spec styles (`{ by: "flow" }`, `{ by: "module" }`) re-resolve against the new flow and modules. Rebuilt: the
+   * resolved style and module colours, the module tree (and so a LOD cut drawn from it, with its module links), the
+   * module springs and the nested discs. A structural or spatial LOD tree is kept, with its sizes and colours
+   * recomputed. New modules without `moduleLinks` clear the held module links: those name the old modules' paths.
+   * New modules also drop a selected module (a LOD aggregate) of the old ones, and `on("select")` hears the selection
+   * left; an aggregate of a kept tree stays. The hover is cleared, as {@link lump} clears it.
+   *
+   * A running layout stops, as `data()` stops it, and the positions stay where it left them: continue it warm with
+   * {@link layout} if you want to. `update()` itself never lays out. The caller's arrays are never written.
+   *
+   * O(nodes + total module path length + module links) for the checks and the copied flow — no topology rebuild, no
+   * layout — plus the module tree build when a LOD cut draws modules. That build takes the path a reload takes, so
+   * the main thread blocks no longer than on one: on a plain network it runs at the end of the call chain, as
+   * {@link lod} builds one after {@link data}, so a {@link layout} chained after `update()` that builds the tree on a
+   * worker (#428) builds this one there too; nothing is drawn until it lands. On a state network the state view
+   * builds it on the main thread, as {@link stateNetwork} and a view switch do.
+   *
+   * On a {@link stateNetwork} the change is indexed per state node. The physical flow is its state nodes' sum, and
+   * the pies, module colours, the state view's modules and module links, and the both view's packing follow the new
+   * flow and modules. Every view keeps its positions, its camera and its layout state. The runs stop: the active
+   * view's is the caller's to continue, and a parked view whose run had not settled runs again, warm, when it is
+   * shown, from full heat (the heat it had reached belonged to the old flow and modules); a settled parked run is
+   * stopped. Lumped ({@link lump}), the lumps are made again from the new modules: each starts at its state nodes'
+   * centroid in the state view's picture. `update()` starts no layout, so in a lumped state view on screen the new
+   * lumps stay there until the caller's warm {@link layout}; a state view shown later settles them with a warm run of
+   * the app's last {@link layout} options, as after `lump(true)`. The selected nodes are kept, a lump's mapped
+   * through its state nodes, a both-view container's to the same physical node's.
+   */
+  update(opts: NetworkUpdateOptions): this {
+    const graph = this.graph;
+    if (!graph) throw new Error("network.update: no network loaded");
+    if (this.stateData) return this.updateState(opts);
+    const plan = planNetworkUpdate("network.update", graph.nodeCount, opts, this.hierarchy);
+    const replaced = this.replacedModuleTree(plan);
+    this.clearHover(); // as lump() clears it: the hovered glyph may be an old module
+    this.applyUpdate(plan);
+    if (this.lodOptions) {
+      if (this.lodUsesModules() && !this.moduleTreeBuilt()) {
+        // The new module tree is built as lod() builds one after data() (#428): at the end of the call chain, so
+        // a layout() chained after this call builds it on a worker instead, and the main thread blocks no longer
+        // than on a reload. Nothing is drawn until it lands.
+        this.lodTree = null;
+        this.lodModules = false;
+        this.lodHasGeometry = false;
+        this.deferLODBuild();
+      } else this.recomputeLODGeometry(); // a kept tree's sizes and colours
+    }
+    const dropped = this.dropAggregates(replaced);
+    this.rebuild();
+    if (dropped) this.announceSelection();
+    return this;
+  }
+
+  /** The module tree drawn now that `plan` replaces (#547): the engine's own, when the modules change. Null when the
+   *  cut draws no module tree, an explicit `lod({ modules })` one (kept), or the modules stay. */
+  private replacedModuleTree(plan: NetworkUpdatePlan): LODTree | null {
+    return plan.hierarchy !== undefined && this.lodModules && !this.lodOptions?.modules ? this.lodTree : null;
+  }
+
+  /**
+   * Drop the selected aggregates of `tree`, a module tree an {@link update} replaces (#547): their ids belong to the
+   * old modules. A node keeps its id. Silent: returns whether the selection changed, for the caller to announce once
+   * it has rebuilt. O(selected).
+   */
+  private dropAggregates(tree: LODTree | null): boolean {
+    const sel = this.selectedIds(this.NODE_LAYER);
+    if (!tree || !sel) return false;
+    const leaves = tree.leafCount;
+    let dropped = false;
+    for (const id of sel) if (Number(id) >= leaves) dropped = true;
+    if (!dropped) return false;
+    this.remapLaneIds(this.NODE_LAYER, (id) => (Number(id) >= leaves ? null : id));
+    this.invalidateNoLodSelected();
+    return true;
+  }
+
+  /** Announce the node layer's selection as it stands, through {@link select} (`on("select")` hears it). */
+  private announceSelection(): void {
+    const sel = this.selectedIds(this.NODE_LAYER);
+    this.select(this.NODE_LAYER, sel && sel.size > 0 ? [...sel] : null);
+  }
+
+  /**
+   * Apply a checked change to the flow and the modules ({@link planNetworkUpdate}) to the loaded graph: the step
+   * {@link update} runs, and {@link data} runs after it loads a graph (#547). Stops a running layout, as its run was
+   * pulling with the previous modules; keeps the positions and the topology caches. The engine holds its own graph
+   * view with the new flow, sharing every other buffer with the caller's graph. The caller rebuilds.
+   */
+  private applyUpdate(plan: NetworkUpdatePlan): void {
+    const graph = this.graph;
+    if (!graph) return;
+    this.haltLayout();
+    this.moved = null; // the rebuild draws the whole graph
+    if (plan.flow) this.graph = { ...graph, flow: plan.flow };
+    if (plan.hierarchy !== undefined) this.hierarchy = plan.hierarchy;
+    this.dropModuleCaches();
+    this.dropStyleCaches();
+  }
+
+  /**
+   * {@link update} on a state network (#547): the checks, the shared step ({@link applyStateUpdate}), then the active
+   * view drawn as a view switch shows it, with no layout run. Everything is checked before anything changes, so a bad
+   * change throws with the engine unchanged. O(state nodes + total module path length + module links) for the checks,
+   * the physical flow and the pies, plus a lumping (O(state nodes + state links)) while lumped, plus the drawn view's
+   * LOD tree as a view switch builds it.
+   */
+  private updateState(opts: NetworkUpdateOptions): this {
+    const source = this.stateSource;
+    const sg = this.stateData;
+    const layouts = this.viewLayouts;
+    if (!source || !sg || !layouts) return this;
+    const plan = planNetworkUpdate("network.update", source.graph.state.nodeCount, opts, this.heldStateHierarchy());
+    const view = this.activeView;
+    // Lumped, the selection of the state or both view: its state nodes (a container as `stateCount + p`), mapped to
+    // the new lumps below. New modules drop a selected state-view aggregate first: it is an old module.
+    const lumpSel = this.lumpActive && view !== "physical" ? this.selectedIds(this.NODE_LAYER) : undefined;
+    let selStates: number[] | null = null;
+    if (lumpSel && lumpSel.size > 0) {
+      const S = sg.state.nodeCount;
+      const sel = plan.hierarchy !== undefined && view === "state" ? new Set([...lumpSel].filter((id) => Number(id) < S)) : lumpSel;
+      selStates = this.mapLumpSelection(sel, false);
+      this.dropNodeInteraction();
+    }
+    // Unlumped, every id stays but a selected aggregate of the module tree the new modules replace. The app's
+    // explicit `modules` in its LOD request is dropped with them, so its tree goes too.
+    const replaced = !lumpSel && plan.hierarchy !== undefined && this.lodModules ? this.lodTree : null;
+    this.clearHover(); // as lump() clears it
+    // The runs were pulling with the previous flow and modules: they stop, and the positions stay. A parked view whose
+    // run had not settled runs again, warm, when it is shown; the active view is the caller's to continue.
+    this.haltLayout();
+    this.stopParkedLayouts(layouts[layoutFamily(view)]);
+    this.applyStateUpdate(plan);
+    const both = this.bothGraph;
+    if (!both) return this;
+    // Draw the active view as a view switch shows it ({@link applyView}), with no layout run.
+    const layout = layouts[layoutFamily(view)];
+    if (this.lumpActive && view === "state") this.restoreLayout(layout); // the new lumps' layout
+    this.lodOptions = this.stateLODRequest ? this.viewLOD(this.stateLODRequest) : null;
+    this.showGraph(view === "both" ? both : layout.graph);
+    this.hierarchy = view === "state" ? layout.hierarchy : null;
+    if (view === "both") this.syncBoth();
+    if (this.lodOptions) this.recomputeLODGeometry();
+    const dropped = this.dropAggregates(replaced);
+    this.rebuild();
+    const lumpedNet = this.lumpedNet;
+    if (lumpSel && lumpSel.size > 0 && lumpedNet) {
+      const S = lumpedNet.stateToLump.length;
+      const L = lumpedNet.graph.state.nodeCount;
+      const mapped = new Set<number>();
+      for (const id of selStates ?? []) mapped.add(id < S ? (lumpedNet.stateToLump[id] ?? id) : L + id - S);
+      this.select(this.NODE_LAYER, mapped.size > 0 ? [...mapped] : null);
+    } else if (dropped) this.announceSelection();
+    return this;
+  }
+
+  /** The state network's module hierarchy as given, indexed per state node (#547). Null without modules. */
+  private heldStateHierarchy(): ModuleHierarchy | null {
+    const source = this.stateSource;
+    return source?.modules && source.recordOf ? { modules: source.modules, moduleLinks: source.moduleLinks ?? undefined, recordOf: source.recordOf } : null;
+  }
+
+  /**
+   * Apply a checked change to the flow and the modules ({@link planNetworkUpdate}) to the loaded state network: the
+   * step {@link update} runs, and {@link stateNetwork} runs after it loads a network (#547). The engine's own views of
+   * the state and physical graphs take the new flow (the physical flow is its state nodes' sum), sharing links,
+   * weights, CSR, `stateToPhysical` and every positions buffer with the caller's, which is never written. Derives the
+   * pies, the state level's modules and module links and, lumped, new lumps: each starts at its state nodes' centroid
+   * in the state view's picture, settled warm when the state view next shows them, as after lump(true). Every view
+   * keeps its positions, camera and layout state. The caller stops the runs and draws the active view.
+   */
+  private applyStateUpdate(plan: NetworkUpdatePlan): void {
+    const source = this.stateSource;
+    const layouts = this.viewLayouts;
+    if (!source || !layouts) return;
+    const given = source.graph;
+    const graph: StateNetworkGraph = plan.flow
+      ? { ...given, state: { ...given.state, flow: plan.flow }, physical: { ...given.physical, flow: groupFlow(plan.flow, given.stateToPhysical, given.physicalCount) } }
+      : given;
+    const { state, physical } = graph;
+    const hierarchy = plan.hierarchy === undefined ? this.heldStateHierarchy() : plan.hierarchy;
+    const modules = hierarchy?.modules ?? null;
+    const moduleLinks = hierarchy?.moduleLinks ?? null;
+    // Lumped, the lumps of the new modules; otherwise they are made again when lumping is next turned on.
+    const lumpedNet = this.lumpActive ? lumpStateGraph(graph, modules, moduleLinks) : null;
+    this.moved = null; // the rebuild draws the whole graph
+    this.dropModuleCaches();
+    this.stateSource = { graph, modules, moduleLinks, recordOf: hierarchy?.recordOf ?? null };
+    // The pies from the state nodes as given: lumped or not, each wedge's share is the same.
+    this.pieWedges = modules ? physicalPieWedges(graph, modules, this.statePie) : null;
+    this.pieColumns.clear();
+    // An explicit `modules` in the app's LOD request named the previous modules, as on a new state network.
+    const request = this.stateLODRequest;
+    if (plan.hierarchy !== undefined && request?.modules) this.stateLODRequest = { ...request, modules: undefined, moduleLinks: undefined };
+    layouts.physical.graph = physical;
+    dropLayoutModuleCaches(layouts.physical);
+    // The state level as given, drawn or parked, keeps its layout under the new flow and modules.
+    const sg = this.stateData;
+    const both = this.bothGraph;
+    const asGiven = this.lumpActive ? this.otherLevel : sg && both && { data: sg, modules: this.stateModules, layout: layouts.state, both };
+    const givenLevel: StateLevel | null = asGiven ? { data: graph, modules, layout: asGiven.layout, both: { ...state, positions: asGiven.both.positions } } : null;
+    if (givenLevel) {
+      givenLevel.layout.graph = state;
+      givenLevel.layout.hierarchy = hierarchy;
+      dropLayoutModuleCaches(givenLevel.layout);
+    }
+    if (lumpedNet) {
+      // New lumps, one state-view picture (#529): each starts at its state nodes' centroid, where their old lumps are
+      // drawn, and the state view settles them warm when it next shows them, as after lump(true).
+      const left = layouts.state;
+      const next = newStateLevel(lumpedNet.graph, lumpedNet.modules, lumpedNet.moduleLinks);
+      const old = this.lumpedNet;
+      if (left.placed && old) {
+        lumpCentroids(next.layout.graph.positions, lumpedNet.lumpToState, left.graph.positions, old.stateToLump);
+        next.layout.placed = true;
+        next.layout.carried = true;
+        next.layout.camera = left.camera;
+      }
+      this.otherLevel = givenLevel;
+      this.lumpedNet = lumpedNet;
+      this.stateData = lumpedNet.graph;
+      this.stateModules = lumpedNet.modules;
+      layouts.state = next.layout;
+      this.bothGraph = next.both;
+    } else if (givenLevel) {
+      this.otherLevel = null; // the old lumps
+      this.lumpedNet = null;
+      this.stateData = graph;
+      this.stateModules = modules;
+      this.bothGraph = givenLevel.both;
+    }
+    // Derived from the flow and the modules drawn: rebuilt as they are next needed.
+    this.bothPack = null;
+    this.bothBaked = null;
+    this.pendingOffsetChanges = null;
+    this.containerRadii = null;
+    this.containerColumns = null;
+    this.containerSelected = null;
+    this.bothNodeGroups2 = null;
+    this.stateNodeModules = null;
+    this.stateFills = null;
   }
 
   /** Drop the state-network mode and everything derived from it (#494). */
@@ -1517,24 +1835,33 @@ export class Network extends BaseEngine {
     this.pieColumns.clear(); // the previous network's wedges
   }
 
-  /** Point the engine at `graph` and drop the per-graph caches (LOD tree, resolved style, parent cache).
-   *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
-   *  `data` it does NOT clear the state-network mode. */
-  private setActiveGraph(graph: NetworkGraph): this {
-    this.adoptGraph(graph);
-    return this.rebuild();
-  }
-
-  /** {@link setActiveGraph} without its rebuild: the caller rebuilds once it is done with the new graph. */
+  /** Point the engine at `graph` and drop the per-graph caches (layout, module tree, LOD tree, resolved style,
+   *  parent cache); unlike {@link data} it does NOT clear the state-network mode. The caller rebuilds once it is
+   *  done with the new graph. */
   private adoptGraph(graph: NetworkGraph): void {
     this.haltLayout(); // any worker layout is tied to the previous graph's buffers
     // …and so is everything the previous graph was laid out with.
+    this.dropModuleCaches();
+    this.laidOut = false;
+    this.showGraph(graph);
+  }
+
+  /** Drop what the graph's modules derive for its layouts (#547): the module tree, its springs, the nested discs. */
+  private dropModuleCaches(): void {
     this.moduleTreeCache = null;
     this.moduleSpringsCache = null;
     this.cancelModuleTreeJob();
-    this.laidOut = false;
     this.nestedDiscs = null;
-    this.showGraph(graph);
+  }
+
+  /** Drop the resolved style and what it derives from the flow and the modules (#547): ring and module colours,
+   *  module-boundary widths, link colours. */
+  private dropStyleCaches(): void {
+    this.lodBorderStyle = null; // the tree's ring colours
+    this.moduleAggregateFill = null; // and its module colours (#494)
+    this.boundaryWidths = null; // and its module-boundary widths
+    this.resolvedCache = null;
+    this.linkColors = null;
   }
 
   /**
@@ -1559,9 +1886,7 @@ export class Network extends BaseEngine {
       this.styleOpts = { ...this.styleOpts, nodeRadius: undefined };
     }
     // New topology + position buffer: drop the retained LOD tree and the resolved-style cache.
-    this.lodBorderStyle = null; // the previous graph's tree and its ring colours
-    this.moduleAggregateFill = null; // and its module colours (#494)
-    this.boundaryWidths = null; // and its module-boundary widths
+    this.dropStyleCaches();
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodWorkerSource = null;
@@ -1572,8 +1897,6 @@ export class Network extends BaseEngine {
     this.lodSpatial = false;
     this.lodModules = false;
     this.lodHasGeometry = false;
-    this.resolvedCache = null;
-    this.linkColors = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     this.fitBound = null; // tied to the old graph
   }
@@ -1599,40 +1922,38 @@ export class Network extends BaseEngine {
    * container radii are derived once here.
    *
    * `modules` are checked against the state graph here, as `data()` checks its hierarchy: a record for every
-   * state node, exactly once, or this throws with the engine unchanged. The app's {@link lod} request holds
+   * state node, exactly once, and every `moduleLinks` endpoint a module or leaf of it (#533), or this throws with
+   * the engine unchanged. The app's {@link lod} request holds
    * (`data()` keeps it too); an explicit `modules` in it named the previous network's, so the new network's own
    * modules take its place.
    */
   stateNetwork(graph: StateNetworkGraph, opts: StateNetworkOptions = {}): this {
-    const recordOf = opts.modules ? moduleRecordIndex(graph.state.nodeCount, opts.modules) : null;
+    // Load the network without modules, then the step update() runs (#547): the module checks and the module
+    // handling live there. Checked first, so a bad hierarchy throws with the engine unchanged.
+    const plan = planNetworkUpdate("network.stateNetwork", graph.state.nodeCount, { modules: opts.modules ?? null, moduleLinks: opts.moduleLinks ?? null }, null);
     // Interaction state belongs to the previous network's ids: drop it before the new graph draws.
     if (this.stateData) this.dropNodeInteraction();
     this.clearStateNetwork();
-    this.stateSource = { graph, modules: opts.modules ?? null };
-    // Lumped (#529): the state and both views draw the lumps; the physical view, its pies included, is the same.
-    this.lumpedNet = opts.lump ? lumpStateGraph(graph, opts.modules) : null;
-    this.lumpActive = this.lumpedNet !== null;
-    const level = this.lumpedNet ? newStateLevel(this.lumpedNet.graph, this.lumpedNet.modules) : newStateLevel(graph, opts.modules ?? null, recordOf);
-    this.stateData = level.data;
+    this.stateSource = { graph, modules: null, moduleLinks: null, recordOf: null };
+    // Lumped (#529): the state and both views draw the lumps, which the apply step makes; the physical view, its pies
+    // included, is the same. The state level as given is made when lumping is turned off.
+    this.lumpActive = opts.lump ?? false;
+    const level = this.lumpActive ? null : newStateLevel(graph, null, null, null);
+    this.stateData = graph;
+    this.stateModules = null;
+    this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: level?.layout ?? newViewLayout(graph.state, null) };
+    this.bothGraph = level?.both ?? graph.state; // lumped, the lumps' both graph takes its place below
     this.activeView = opts.view ?? "physical";
     this.rosetteRadius = opts.rosetteRadius ?? null;
-    // The app's LOD request holds (#495), as data() keeps it; an explicit `modules` alias in it was keyed to the
-    // previous state graph, so the new network's own hierarchy takes its place.
-    const request = this.stateLODRequest;
-    this.stateLODRequest = request?.modules ? { ...request, modules: undefined, moduleLinks: undefined } : request;
+    this.stateColorOpts = opts.color;
+    this.statePie = opts.pie;
+    // The app's LOD request holds (#495), as data() keeps it; the apply step drops an explicit `modules` alias in it,
+    // keyed to the previous state graph, so the new network's own hierarchy takes its place.
     this.lodOptions = null;
     this.hierarchy = null;
-    // Without modules (#494): no pies and no module colours; every view still draws.
-    this.stateModules = level.modules;
-    this.stateColorOpts = opts.color;
-    // The pies from the state nodes as given: lumped or not, each wedge's share is the same.
-    this.pieWedges = opts.modules ? physicalPieWedges(graph, opts.modules, opts.pie) : null;
-    this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: level.layout };
-    this.bothGraph = level.both;
-    // Packed when the both view is first shown ({@link syncBoth}), and again on a style change of its radii (#509).
-    this.bothPack = null;
-    this.bothBaked = null;
-    this.containerRadii = null;
+    // Without modules (#494): no pies and no module colours; every view still draws. Packed when the both view is
+    // first shown ({@link syncBoth}), and again on a style change of its radii (#509).
+    this.applyStateUpdate(plan);
     this.applyView(null);
     return this;
   }
@@ -1686,8 +2007,8 @@ export class Network extends BaseEngine {
     const sg = this.stateData;
     const both = this.bothGraph;
     if (!source || !layouts || !sg || !both || on === this.lumpActive) return this;
-    const lumped = (this.lumpedNet ??= lumpStateGraph(source.graph, source.modules));
-    const next = this.otherLevel ?? (on ? newStateLevel(lumped.graph, lumped.modules) : newStateLevel(source.graph, source.modules));
+    const lumped = (this.lumpedNet ??= lumpStateGraph(source.graph, source.modules, source.moduleLinks));
+    const next = this.otherLevel ?? (on ? newStateLevel(lumped.graph, lumped.modules, lumped.moduleLinks) : newStateLevel(source.graph, source.modules, source.moduleLinks));
     const view = this.activeView;
     const statesShown = view !== "physical";
     const sel = statesShown ? this.selectedIds(this.NODE_LAYER) : null;
@@ -1701,15 +2022,8 @@ export class Network extends BaseEngine {
       const from = left.graph.positions;
       const to = next.layout.graph.positions;
       const { offsets, states } = lumped.lumpToState;
-      if (on) {
-        for (let l = 0; l + 1 < offsets.length; l++) {
-          const start = offsets[l]!, end = offsets[l + 1]!;
-          let x = 0, y = 0;
-          for (let i = start; i < end; i++) { const st = states[i]!; x += from[2 * st]!; y += from[2 * st + 1]!; }
-          to[2 * l] = x / (end - start);
-          to[2 * l + 1] = y / (end - start);
-        }
-      } else {
+      if (on) lumpCentroids(to, lumped.lumpToState, from);
+      else {
         // The lumps as the state nodes' "physical" level: a rosette of each lump's state nodes around it.
         const L = lumped.graph.state.nodeCount;
         const around: StateNetworkGraph = { state: next.data.state, physical: left.graph, stateToPhysical: lumped.stateToLump, physicalToState: lumped.lumpToState, physicalCount: L };
@@ -1945,14 +2259,16 @@ export class Network extends BaseEngine {
   }
 
   /** Stop the layout parked by a view switch (#495), and drop any run it would resume: {@link stopLayout}, a new
-   *  state network, or the engine destroyed. */
-  private stopParkedLayouts(): void {
+   *  state network, or the engine destroyed. With `active`, the layout of the view drawn ({@link update}, #547): the
+   *  other views' runs that had not settled run again, warm and from full heat, when their view is shown — the heat
+   *  they had reached belonged to the previous flow and modules. */
+  private stopParkedLayouts(active?: ViewLayout): void {
     const layouts = this.viewLayouts;
     if (!layouts) return;
     for (const layout of [layouts.physical, layouts.state, ...(this.otherLevel ? [this.otherLevel.layout] : [])]) {
       layout.handle?.stop();
       layout.handle = null;
-      layout.interrupted = false;
+      if (!active || layout === active) layout.interrupted = false;
       layout.resume = null;
     }
   }
@@ -3441,13 +3757,17 @@ export class Network extends BaseEngine {
 
   /** The physical-view pie layer (#171): overlapping (≥2-module) physical nodes as instanced pie wedges,
    *  drawn on top of the node discs. Null off the physical view, without pie wedges, or when none overlap. */
-  private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer | null {
+  private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle, nodeBorders: Float32Array | undefined): InstancedLayer | null {
     if (this.activeView !== "physical" || !this.pieWedges) return null;
-    // Draw the pie at the node's INNER radius (inside any constant border), so the "nodes" circle's
-    // border ring shows around the pie exactly as it does around a single-module disc (#171 review).
-    const cb = resolved.constBorder;
-    const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width))) : resolved.nodeRadii;
-    const pie = physicalPieInstances(this.pieWedges, graph.positions, radii, this.pieColors() ?? undefined);
+    // The node's border, by the node layer's own `borders` column of this emit (no copy, one rule with the
+    // disc's, #507): a flow border or node border with no colour given shows through the pie — each wedge
+    // spans the full radius and darkens its own outer band by the border's factor; a border with an explicit
+    // colour shows around the pie, drawn at the node's inner radius (#171 review). A flow border, when
+    // present, is the node's border (the node border is not drawn then), so its factor wins.
+    const flowBorder = resolved.flowBorder;
+    const darken = flowBorder ? flowBorder.darken : resolved.constBorder?.darken;
+    const border = nodeBorders ? { fractions: nodeBorders, darken } : undefined;
+    const pie = physicalPieInstances(this.pieWedges, graph.positions, resolved.nodeRadii, this.pieColors() ?? undefined, border);
     if (pie.count === 0) return null;
     // Unchanged columns go out as the arrays last emitted (one compare pass each, O(wedges), on an emit that is
     // O(wedges) already), so the GPU layer re-uploads only what changed.
@@ -3456,6 +3776,7 @@ export class Network extends BaseEngine {
     pie.radii = cols.float32("radii", pie.radii);
     pie.angles = cols.float32("angles", pie.angles);
     pie.colors = cols.uint8("colors", pie.colors);
+    if (pie.borders) pie.borders = cols.float32("borders", pie.borders);
     if (pie.groups) pie.groups = cols.float32("groups", pie.groups);
     // #175: the per-wedge `selected` flags travel ON the emit (like the nodes' via attachNoLodHighlight).
     // A flag-less emit would zero-fill the GPU column (HighlightBuffers.write) on the next layout/drag
@@ -3463,6 +3784,13 @@ export class Network extends BaseEngine {
     // back the same array and its upload is skipped.
     pie.selected = this.noLodSelectedFor(this.PIE_LAYER);
     return { name: this.PIE_LAYER, primitive: "pie", pie, sizeMode: resolved.sizeMode };
+  }
+
+  /** The node layer's per-node border widths as fractions of the radius (the flow border, else the node
+   *  border), as the instanced-circle shader reads them; undefined without a border (#507). */
+  private nodeBorderFractions(layers: InstancedLayer[]): Float32Array | undefined {
+    for (const l of layers) if (l.name === this.NODE_LAYER && l.primitive === "circles" && !l.circles.bordersPx) return l.circles.borders;
+    return undefined;
   }
 
   /** The `both`-view container layer (#171): faint world-sized discs at each physical node, sized to hold
@@ -3818,6 +4146,16 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * The holders of the node selection under LOD (#538): the modules a selected node is collapsed into, which
+   * the cut rings faintly and keeps undimmed where it draws them. `builds` counts how often they were marked
+   * (once per selection or tree change, never per frame), `holders` how many the last marking found.
+   * Introspection for debugging and tests: a zoom sweep under an unchanged selection leaves `builds` as it was.
+   */
+  get holderStats(): { builds: number; holders: number } {
+    return { builds: this.holders.builds, holders: this.holders.marked.length };
+  }
+
+  /**
    * Which position transport the active layout uses:
    * - `"gpu"` — running on the WebGL GPU path (the handle's `transport` field is `"gpu"`).
    * - `"shared"` — CPU worker, positions stream zero-copy via a `SharedArrayBuffer` (cross-origin isolated page).
@@ -3982,7 +4320,7 @@ export class Network extends BaseEngine {
         // State-network overlays (#171), build-once per emit: the `both`-view physical **container** discs
         // draw UNDER the nodes/links (backdrop), the physical-view **pie** wedges draw ON TOP (cover the disc).
         const container = this.containerLayer();
-        const pie = this.pieInstancedLayer(graph, resolved);
+        const pie = this.pieInstancedLayer(graph, resolved, this.nodeBorderFractions(base));
         return [...(container ? [container] : []), ...base, ...(pie ? [pie] : [])];
       });
       this.registerInstancedLane(this.NET_LANE, {
@@ -4304,14 +4642,17 @@ export class Network extends BaseEngine {
         // children ring in the selection colour too (#162) — matching the kept-link/dim highlight.
         const isSel = lod && this.lodTree && selected?.size ? this.makeSelectedPredicate(this.lodTree, selected) : null;
         const selColored = (g: number): boolean => (isSel ? isSel(g) : !!selected?.has(g));
-        const ringed = ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined);
+        const hovered = this.hoveredIds(this.NODE_LAYER);
+        // A glyph ringed only because it holds a selected node (#538) takes the faint ring.
+        const held = isSel && this.lodTree && selected ? this.holdersOf(this.lodTree, selected) : null;
+        const faint = held ? (g: number): boolean => held[g] === 1 && !selColored(g) && !hovered?.has(g) : undefined;
+        const ringed = ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined, faint);
         const glyphRings: InstancedLayer = { name: ringName, primitive: "circles", sizeMode, circles: offsets ? { ...ringed, offsets: offsetsAt(visible, offsets) } : ringed };
         room.ring = roomAfter(glyphRings.circles.count, room.ring);
         if (!boundaries) {
           room.boundary = 0;
           return [glyphRings];
         }
-        const hovered = this.hoveredIds(this.NODE_LAYER);
         const lit = (g: number): boolean => !!selected?.has(g) || !!hovered?.has(g);
         const circles = rings ? boundaryHighlightCircles(rings, lit, (g) => (selColored(g) ? colors.select : colors.hover), this.transform.k) : none;
         room.boundary = roomAfter(circles.count, room.boundary);
@@ -4323,7 +4664,8 @@ export class Network extends BaseEngine {
   }
 
   /** Highlighted node ids currently on screen: (selection ∪ hover) ∩ frontier (LOD, **ancestor-aware** —
-   *  an expanded selected aggregate's children count, #162) or taken directly (no-LOD). Returns the
+   *  an expanded selected aggregate's children count, #162 — and with the glyphs that hold a selected node,
+   *  #538) or taken directly (no-LOD). Returns the
    *  shared empty sentinel when nothing is highlighted, so the per-frame ring re-emit costs O(1) until
    *  the user selects/hovers something. */
   private highlightVisible(source: InstancedLane | null, lod: boolean): Uint32Array {
@@ -4332,9 +4674,10 @@ export class Network extends BaseEngine {
     const hov = this.hoveredIds(this.NODE_LAYER);
     if (lod && source && this.lodTree) {
       const isSel = sel && sel.size ? this.makeSelectedPredicate(this.lodTree, sel) : null;
+      const held = sel && sel.size ? this.holdersOf(this.lodTree, sel) : null;
       const vis = source.visible;
       const out: number[] = [];
-      for (let i = 0; i < vis.length; i++) { const g = vis[i]!; if ((isSel && isSel(g)) || hov?.has(g)) out.push(g); }
+      for (let i = 0; i < vis.length; i++) { const g = vis[i]!; if ((isSel && isSel(g)) || held?.[g] === 1 || hov?.has(g)) out.push(g); }
       return out.length ? Uint32Array.from(out) : EMPTY_VISIBLE;
     }
     const ids = new Set<number>();
@@ -4525,6 +4868,7 @@ export class Network extends BaseEngine {
    *  the `selected` flag buffers in place — neither rebuilds the full geometry on a click. */
   protected override onLaneSelectionChanged(_layer: string): void {
     this.invalidateNoLodSelected(); // #240: the cached flag columns encode the OLD selection
+    this.holders.stale = true; // #538: and so do the holders (a click toggles the set in place)
     if (this.lodReady() && this.lodTree) this.emitInstancedLane(this.NET_LANE);
     else this.pushLaneHighlight((layer) => this.noLodSelectedFor(layer));
     this.emitInstancedLane(this.NET_HL_LANE);
@@ -4542,6 +4886,25 @@ export class Network extends BaseEngine {
    *  O(frontier·depth) bound), with parent pointers from {@link treeParent}. */
   private makeSelectedPredicate(tree: LODTree, sel: ReadonlySet<string | number>): (g: number) => boolean {
     return ancestorAwareSelected(this.treeParent(tree), (g) => sel.has(g));
+  }
+
+  /** Holder flags of `sel` on `tree` (#538): `flags[g] === 1` when a selected node is collapsed into tree node
+   *  `g`. Marked by the pure {@link markHolders} in O(selected + holders) when the selection or the tree has
+   *  changed since the last call, so the per-frame callers read one byte per frontier glyph. */
+  private holdersOf(tree: LODTree, sel: ReadonlySet<string | number>): Uint8Array {
+    const h = this.holders;
+    if (h.stale || h.tree !== tree || h.sel !== sel) {
+      if (h.flags.length < tree.size) {
+        h.flags = new Uint8Array(tree.size);
+        h.marked.length = 0;
+      }
+      markHolders(this.treeParent(tree), sel, h.flags, h.marked);
+      h.tree = tree;
+      h.sel = sel;
+      h.stale = false;
+      h.builds++;
+    }
+    return h.flags;
   }
 
   /** Parent-pointer array for the LOD tree: the tree's own `parent` (provided-module trees) or one
@@ -5484,12 +5847,17 @@ export class Network extends BaseEngine {
       fadeAlpha: this.fadeAlpha ?? undefined,
     });
     // #162: attach the shader-highlight columns for the frontier nodes — group = tree-node id (the hovered
-    // id matches its own node); selected = ancestor-aware. The shader dims non-highlighted + keeps
+    // id matches its own node); selected = ancestor-aware, or holding a selected node (#538: kept undimmed,
+    // while the link flags above stay the selected nodes' own). The shader dims non-highlighted + keeps
     // selected/hovered from these + the lane uniforms, so a hover/selection never rebuilds these buffers.
     circles.groups = this.lodColumns.float32("nodes.groups", Float32Array.from(frontier));
     if (isSel) {
+      const held = sel ? this.holdersOf(tree, sel) : null;
       const s = new Uint8Array(frontier.length);
-      for (let i = 0; i < frontier.length; i++) s[i] = isSel(frontier[i]!) ? 1 : 0;
+      for (let i = 0; i < frontier.length; i++) {
+        const g = frontier[i]!;
+        s[i] = isSel(g) || held?.[g] === 1 ? 1 : 0;
+      }
       circles.selected = this.lodColumns.uint8("nodes.selected", s);
     }
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
@@ -5954,22 +6322,38 @@ export class Network extends BaseEngine {
     // Always registered (empty in the state view / when no pie wedges) so a view switch clears it.
     const wedges = this.activeView === "physical" ? this.pieWedges : null;
     const pieRGBA = wedges ? this.pieColors() : null; // the WebGL pie's colours (#494)
+    // A flow border or node border with no colour given shows through the pie (#507): each wedge spans the full
+    // radius and its outer band, from the node's inner radius out, is its own drawable (id `bandIds + k`) in its
+    // colour with RGB × the border's factor — the WebGL pie shader's band. A border with an explicit colour shows
+    // around the pie: traced at the INNER radius, as around a single-module disc (#171 review).
+    const bandDarken = darken;
+    const bandIds = wedges ? wedges.end.length : 0;
     const pieIds: number[] = [];
     if (wedges) {
       for (let p = 0; p < wedges.wedgeCount.length; p++) {
-        if (wedges.wedgeCount[p]! >= 2) for (let k = wedges.offset[p]!; k < wedges.offset[p + 1]!; k++) pieIds.push(k);
+        if (wedges.wedgeCount[p]! < 2) continue;
+        for (let k = wedges.offset[p]!; k < wedges.offset[p + 1]!; k++) {
+          pieIds.push(k);
+          if (bandDarken !== undefined) pieIds.push(bandIds + k);
+        }
       }
     }
+    const wedgeCss = (k: number): string => (pieRGBA ? rgbaCss(pieRGBA, k) : DEFAULT_NODE_FILL);
     this.registerLayer({
       name: this.PIE_LAYER,
       data: pieIds,
       ids: pieIds,
       sizeMode: style.sizeMode,
-      fill: (k) => (pieRGBA ? rgbaCss(pieRGBA, k as number) : DEFAULT_NODE_FILL),
+      fill: (id) => {
+        const k = id as number;
+        if (k < bandIds || bandDarken === undefined) return wedgeCss(k);
+        return pieRGBA ? darkenedCss(pieRGBA, k - bandIds, bandDarken) : DEFAULT_NODE_FILL;
+      },
       build: (g) => {
-        // Trace at the INNER radius (inside the border), so each node's black border ring shows around
-        // the pie exactly as around a single-module disc (matches the WebGL pie lane).
-        if (emit && wedges) tracePieWedges(g, wedges, graph.positions, innerRadii, style.sizeMode === "screen");
+        if (!emit || !wedges) return;
+        const screen = style.sizeMode === "screen";
+        if (bandDarken !== undefined) tracePieWedges(g, wedges, graph.positions, style.nodeRadii, screen, { inner: innerRadii, bandIds });
+        else tracePieWedges(g, wedges, graph.positions, innerRadii, screen);
       },
     });
   }

@@ -904,6 +904,39 @@ await net.whenSettled(); // resolves when the transition ends
 The re-clustering call above is the one to use when the camera must not follow the stream: the new map
 is computed first and then eased in, with the camera easing along in the same frames.
 
+### Updating flow and modules
+
+A re-clustering changes only the node flow and the modules. `net.update({ flow, modules, moduleLinks })`
+changes them on the network the engine already holds, so the nodes and links are not loaded again:
+
+```ts
+// Infomap re-ran: new flow and modules for the same nodes.
+net.update({ flow: next.flow, modules: next.nodes, moduleLinks: next.links });
+net.layout({ backend: "worker", nested: { warm: true } }); // optional: settle the new map warm
+```
+
+- A field left out is unchanged, `modules: null` removes the modules and their links, and new modules without
+  `moduleLinks` clear the old links (those name the old modules' paths). Everything is checked first, as
+  `data()` checks it: a bad update throws and leaves the engine unchanged.
+- **Kept:** the positions, the layout state, the camera, the style options (`{ by: "flow" }` and
+  `{ by: "module" }` styles follow the new values), and the selected nodes. **Rebuilt:** the sizes and
+  colours, the module tree and what the LOD cut draws from it, and the module links. A selected module of
+  the old modules is dropped, and the hover is cleared.
+- A running layout stops where it is. `update()` never starts one: continue it warm with `layout()` if you
+  want to.
+- On a [state network](#state-networks-physical--state-views) the arrays are indexed per **state node**.
+  The physical flow, the pies and the module colours follow, and every view keeps its positions and its
+  camera. A view whose run the update stopped before it settled goes on when it is shown again. Lumped,
+  the lumps are made again from the new modules: each starts at its state nodes' centroid, and the state
+  view settles them with a warm run when it next shows them. In a state view already on screen they wait
+  for your `layout()`.
+
+```ts
+net.stateNetwork(graph, { modules: first.nodes, lump: true });
+// …later, re-clustered:
+net.update({ flow: next.stateFlow, modules: next.nodes });
+```
+
 ## State networks: physical ↔ state views
 
 A **state (higher-order / memory) network** adds a layer to a standard network: each **state node**
@@ -979,6 +1012,14 @@ either way, and keeps its layout across the toggle. The state view keeps its pic
 current one's nodes are (each lump at its state nodes' centroid, or a lump's state nodes around it), and a warm
 layout settles it. While lumped, a
 state-level hit's id is a lump's: `net.lumped` maps it to its physical node and its state nodes, and back.
+
+**Module links.** An Infomap state `.ftree` stores its leaf links only inside bottom modules and every coarser link
+once, in its `*Links` sections. Pass those as `stateNetwork(graph, { modules, moduleLinks })`, addressed by path in
+the state-node modules, as for a [plain network's module links](#a-directed-map-of-modules): the **state** view draws
+exactly them between its modules, and its layouts pull along them. Lumped, a module link keeps its module endpoints,
+and a leaf endpoint becomes the lump that holds that state node. The physical and both views have no module links:
+their modules overlap, so a module link has no single physical endpoint there. `moduleLinks` requires `modules`, and
+`stateNetwork()` throws on an endpoint outside the hierarchy.
 
 The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
 of a disc — no wedge texture, no per-fragment loop), so a physical view with many overlapping nodes draws

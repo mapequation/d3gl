@@ -17,6 +17,8 @@ const RING_BORDER_FRAC = 0.16; // border thickness ÷ ring outer radius
 const DEFAULT_SELECT_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — the persistent selection ring
 const DEFAULT_HOVER_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — the transient hover ring (same red as selected)
 const DEFAULT_REMOVE_RING: RGBA = [234, 179, 8, 255]; // yellow (#eab308) — "will be removed" (subtract-marquee preview)
+// A glyph that holds a selected node collapsed into it (#538) rings in the select colour at this share of its alpha.
+const FAINT_ALPHA = 0.45;
 
 function cssToRgba(css: string, fallback: RGBA): RGBA {
   const c = rgb(css);
@@ -25,17 +27,20 @@ function cssToRgba(css: string, fallback: RGBA): RGBA {
 }
 
 /** Resolve the select/hover ring colours from the interaction opts (`selection.selected.stroke` / a
- *  hover {@link HighlightStyle}'s `stroke`), falling back to the red defaults (both `#dc2626`). */
-export function resolveRingColors<D>(opts: InteractiveLayerOptions<D>): { select: RGBA; hover: RGBA; remove: RGBA } {
+ *  hover {@link HighlightStyle}'s `stroke`), falling back to the red defaults (both `#dc2626`). `faint`
+ *  is the select colour at {@link FAINT_ALPHA} of its alpha, for a glyph holding a selected node (#538). */
+export function resolveRingColors<D>(opts: InteractiveLayerOptions<D>): { select: RGBA; hover: RGBA; remove: RGBA; faint: RGBA } {
   const selStroke = opts.selection?.selected?.stroke;
   // The hover ring's stroke comes from the hovered-item style (`hover.hovered.stroke`, or a bare
   // HighlightStyle's `stroke` in the back-compat flat form) — see hoverParts (#162).
   const hovered = hoverParts(opts.hover).hovered;
   const hovStroke = hovered && typeof hovered === "object" && "stroke" in hovered ? hovered.stroke : undefined;
+  const select = selStroke ? cssToRgba(selStroke, DEFAULT_SELECT_RING) : DEFAULT_SELECT_RING;
   return {
-    select: selStroke ? cssToRgba(selStroke, DEFAULT_SELECT_RING) : DEFAULT_SELECT_RING,
+    select,
     hover: hovStroke ? cssToRgba(hovStroke, DEFAULT_HOVER_RING) : DEFAULT_HOVER_RING,
     remove: DEFAULT_REMOVE_RING,
+    faint: [select[0], select[1], select[2], Math.round(select[3] * FAINT_ALPHA)],
   };
 }
 
@@ -44,15 +49,17 @@ export function resolveRingColors<D>(opts: InteractiveLayerOptions<D>): { select
  * `radiusOf` read the glyph's world/screen centre + radius for a source id; `isSelected` picks the
  * persistent select colour over the transient hover colour for ids in the selection set. `isRemove`
  * (optional) overrides both with the `remove` colour for glyphs a subtract-marquee will deselect
- * (#140) — yellow "will be removed", against the hover-coloured "will be added" preview.
+ * (#140) — yellow "will be removed", against the hover-coloured "will be added" preview. `isFaint`
+ * (optional) gives the `faint` colour to glyphs ringed only because they hold a selected node (#538).
  */
 export function ringCircles(
   ids: Uint32Array,
   centerOf: (g: number) => [number, number],
   radiusOf: (g: number) => number,
   isSelected: (g: number) => boolean,
-  colors: { select: RGBA; hover: RGBA; remove?: RGBA },
+  colors: { select: RGBA; hover: RGBA; remove?: RGBA; faint?: RGBA },
   isRemove?: (g: number) => boolean,
+  isFaint?: (g: number) => boolean,
 ): InstancedCirclesData {
   const count = ids.length;
   const centers = new Float32Array(count * 2);
@@ -66,7 +73,7 @@ export function ringCircles(
     centers[k * 2 + 1] = cy;
     radii[k] = radiusOf(g) * RING_OUTER;
     borders[k] = RING_BORDER_FRAC;
-    const col = isRemove?.(g) && colors.remove ? colors.remove : isSelected(g) ? colors.select : colors.hover;
+    const col = isRemove?.(g) && colors.remove ? colors.remove : isFaint?.(g) && colors.faint ? colors.faint : isSelected(g) ? colors.select : colors.hover;
     borderColors[k * 4] = col[0];
     borderColors[k * 4 + 1] = col[1];
     borderColors[k * 4 + 2] = col[2];
