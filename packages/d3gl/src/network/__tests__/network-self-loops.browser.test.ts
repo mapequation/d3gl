@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { network, type NetworkLinkHit } from "../network.js";
+import { network, Network, type NetworkLinkHit } from "../network.js";
 import { buildGraph } from "../graph.js";
 import { DROP_HALF_SPREAD, LOOP_LEG } from "../../core/loop-drop.js";
 import { headLength } from "../../core/arrowhead.js";
@@ -339,4 +339,91 @@ describe("self-link drop export (#505)", () => {
         expect(red, "the export drew no loop (non-vacuity)").toBeGreaterThan(20);
         expect(diff, `${diff} of ${red} loop pixels differ`).toBeLessThanOrEqual(Math.max(4, red * 0.05));
       });
+});
+
+/** A network whose test drives a streamed layout frame by hand: the main thread's half of a worker frame (the
+ *  transport has written the positions; this is its repaint request). */
+class StreamProbe extends Network {
+  streamFrame(): void {
+    this.scheduleLayoutRepaint();
+  }
+}
+
+/** Two animation frames: the engine's coalesced frame has run. */
+const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+
+describe("self-link loops: the LOD angle cache follows every position change (#542)", () => {
+  /** Node 1 below node 0: the loop must then point up, away from it. */
+  const BELOW: [number, number] = [CX, 180];
+  /** Red in the box left of node 0 (where the loop points at first) and above it (where it must point after). */
+  const leftRed = (png: string): Promise<number> => redPixels(png, CX - 40, CY - 14, CX - R - 1, CY + 14);
+  const upRed = (png: string): Promise<number> => redPixels(png, CX - 14, CY - 40, CX + 14, CY - R - 1);
+
+  /** Draw node 0's loop with LOD on (every leaf kept), check it points left, run `move`, and check it now points up. */
+  async function turns(net: Network, g: ReturnType<typeof buildGraph>, move: () => void): Promise<void> {
+    await net.whenReady();
+    net
+      .data(g)
+      .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: 3, arrowSize: ARROW_SIZE, sizeMode: "world" })
+      .lod({ expandPx: 1, declutter: false })
+      .layout({ backend: "positions", positions: POSITIONS });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    await nextFrame();
+    const before = net.toPNG();
+    expect(await leftRed(before), "the loop does not point left at first (non-vacuity)").toBeGreaterThan(20);
+    expect(await upRed(before)).toBe(0);
+    // A zoom frame stamps the angles at this position version, as a user's would.
+    net.setTransform({ k: 1, x: 0.5, y: 0 });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    await nextFrame();
+    move();
+    await nextFrame();
+    const after = net.toPNG();
+    expect(await upRed(after), "the loop did not turn to point up").toBeGreaterThan(20);
+    expect(await leftRed(after), "the loop still points left: its angle is stale").toBe(0);
+  }
+  const graph = () => buildGraph({ nodeCount: 2, source: [0, 0], target: [1, 0], weight: [1, 1], directed: false });
+
+  it("a node-drag of its neighbour turns the loop", async () => {
+    const el = host();
+    const net = network(el, { width: W, height: W, backend: "webgl" });
+    await turns(net, graph(), () => {
+      net.interactive({ draggable: true });
+      const r = el.getBoundingClientRect();
+      const ev = (type: string, x: number, y: number) => el.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+      ev("pointerdown", 140, CY);
+      ev("pointermove", BELOW[0], BELOW[1]);
+      ev("pointerup", BELOW[0], BELOW[1]);
+    });
+    net.destroy();
+  });
+
+  it("a streamed layout frame turns the loop", async () => {
+    const g = graph();
+    const net = new StreamProbe(host(), { width: W, height: W, backend: "webgl" });
+    await turns(net, g, () => {
+      g.positions.set(BELOW, 2);
+      net.streamFrame();
+    });
+    net.destroy();
+  });
+
+  it("layout({ backend: \"positions\" }) with new positions turns the loop", async () => {
+    const net = network(host(), { width: W, height: W, backend: "webgl" });
+    await turns(net, graph(), () => {
+      net.layout({ backend: "positions", positions: new Float32Array([CX, CY, ...BELOW]) });
+    });
+    net.destroy();
+  });
+
+  // `update()` never moves positions (its contract) and rebuilds the loop cache, stamps included: a loop that turned
+  // before it stays turned after it.
+  it("update({ flow }) after new positions keeps the loop turned", async () => {
+    const net = network(host(), { width: W, height: W, backend: "webgl" });
+    await turns(net, graph(), () => {
+      net.layout({ backend: "positions", positions: new Float32Array([CX, CY, ...BELOW]) });
+      net.update({ flow: [0.25, 0.75] });
+    });
+    net.destroy();
+  });
 });
