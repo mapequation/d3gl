@@ -200,19 +200,19 @@ export const pieColumnStats = { bytes: 0 };
 export const loopCenterStats = { bytes: 0 };
 
 /**
- * The loop lane's centres, uploaded as its end offsets are ({@link OffsetColumn}): the whole column when `centers` is a
- * new array; when it is the array last written (refilled in place, the full-detail cache), only the `changed`
- * `[start, end)` ranges; nothing when it is the same array with no ranges. An LOD frame's subset hands back the same
- * array exactly when its values are unchanged (`StableColumns.float32Into`), so a frame that keeps the cut and
- * the positions uploads 0 B. Returns the array to store as the new `last`.
+ * The loop lane's centres: the whole column when `centers` is a new array or comes without `changed` (positions, so a
+ * caller refilling one array in place is never left stale); when it is the array last written and `changed` is given,
+ * only those `[start, end)` ranges (the full-detail cache passes `[0, S)`), and nothing for an empty `changed`. An LOD
+ * frame's subset passes an empty `changed` and hands back the same array exactly when its values are unchanged
+ * (`StableColumns.float32Into`), so a frame that keeps the cut and the positions uploads 0 B. Returns the array to store
+ * as the new `last`.
  */
 function writeLoopCenters(buffer: Buffer, centers: Float32Array, last: Float32Array | undefined, count: number, changed: Uint32Array | undefined): Float32Array {
-  if (centers !== last) {
+  if (centers !== last || !changed) {
     buffer.write(centers);
     loopCenterStats.bytes += centers.byteLength;
     return centers;
   }
-  if (!changed) return centers;
   for (let k = 0; k + 1 < changed.length; k += 2) {
     const start = changed[k] ?? 0, end = Math.min(changed[k + 1] ?? 0, count);
     if (end <= start) continue;

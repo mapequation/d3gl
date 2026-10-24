@@ -284,8 +284,9 @@ export interface InstancedHalfArrowsData {
  * Plain draws only: no `index`, so every column is per loop.
  */
 export interface InstancedLoopColumns {
-  /** [x, y] world centre of each loop's node, length `2 * count`. Uploaded as the end offsets are: when the array is a
-   *  new object, or by {@link offsetsChanged} while it is the one the layer holds. */
+  /** [x, y] world centre of each loop's node, length `2 * count`. Uploaded whole every update, as line positions are,
+   *  unless {@link offsetsChanged} is given while this is the array the layer holds: then only those ranges (none for
+   *  an empty array). */
   centers: Float32Array;
   /**
    * Where each loop leaves its node: the rim point as an offset from its centre (#509), in the layer's size units —

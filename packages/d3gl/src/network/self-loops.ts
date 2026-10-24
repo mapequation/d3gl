@@ -29,6 +29,9 @@ import type { RGBAValue } from "./glyphs.js";
 import type { StableColumns } from "../core/stable-columns.js";
 import { DROP_HALF_SPREAD, loopPieceLength, spreadCot, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../core/loop-drop.js";
 
+/** No in-place ranges: an LOD subset's columns change by reference ({@link selfLoopSubset}). */
+const NO_RANGES = new Uint32Array(0);
+
 /** The direction of a loop whose node has no neighbours to point away from (radians, y down: up-right). */
 export const FALLBACK_ANGLE = -Math.PI / 4;
 /** The loops of a graph: one per node with a self-link, in ascending order of `edges`. */
@@ -201,8 +204,9 @@ export interface SelfLoopCache {
   angles: Float32Array;
   sourceOffsets: Float32Array;
   targetOffsets: Float32Array;
-  /** `[0, S)`: every centre and end offset is rewritten each position frame (#509 in-place range upload). Absent on an LOD
-   *  frame's subset ({@link selfLoopSubset}), whose columns are handed back unchanged when their values are. */
+  /** `[0, S)`: every centre and end offset is rewritten each position frame (#509 in-place range upload). Empty on an LOD
+   *  frame's subset ({@link selfLoopSubset}), whose columns are handed back unchanged exactly when their values are, so
+   *  a held array has nothing to upload. */
   changed?: Uint32Array;
   /** Per-loop `selected` flags (#162), on an LOD frame's subset (the no-LOD lane attaches its own). */
   selected?: Uint8Array;
@@ -547,6 +551,7 @@ export function selfLoopSubset(c: SelfLoopCache, graph: NetworkGraph, m: number,
     angles: angles.subarray(0, m),
     sourceOffsets,
     targetOffsets,
+    changed: NO_RANGES,
     selected,
   };
 }

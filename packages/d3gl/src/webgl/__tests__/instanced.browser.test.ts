@@ -2,11 +2,11 @@ import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import { InstancedCircles, InstancedLines, radiusColumnStats } from "../instanced.js";
+import { InstancedCircles, InstancedLines, InstancedLoops, loopCenterStats, radiusColumnStats } from "../instanced.js";
 import { IndexedLines } from "../indexed-links.js";
 import { arrowHead } from "../../core/arrowhead.js";
 import type { ArrowParams } from "../../core/arrowhead.js";
-import type { InstancedArrowsData } from "../../core/index.js";
+import type { InstancedArrowsData, InstancedLoopsData } from "../../core/index.js";
 import { clipFromView } from "../index.js";
 import { WebGLBackend } from "../webgl-backend.js";
 
@@ -396,6 +396,41 @@ describe("whole arrows on the line lane (#542)", () => {
     expect(radiusColumnStats.buffers - b0).toBe(1);
     expect(radiusColumnStats.bytes - n0).toBe(4 * 3);
     plain.destroy();
+    device.destroy();
+  });
+
+  it("loop centres refilled in place upload whole unless ranges say otherwise (#542)", async () => {
+    const { device } = await setup();
+    const centers = new Float32Array([20, 20, 40, 30, 60, 40]);
+    const data: InstancedLoopsData = {
+      head: "none",
+      arrowSize: 3,
+      centers,
+      startOffsets: new Float32Array(6).fill(4),
+      endOffsets: new Float32Array(6).fill(-4),
+      widths: new Float32Array(3).fill(2),
+      colors: new Uint8Array(12).fill(255),
+      count: 3,
+    };
+    const loops = new InstancedLoops(device, data, W, H);
+    const bytes = (): number => loopCenterStats.bytes;
+    // A caller that refills one array in place each tick, giving no ranges, is never left stale: the whole column.
+    centers[0] = 21;
+    let n0 = bytes();
+    expect(loops.update(device, data)).toBe(true);
+    expect(bytes() - n0).toBe(4 * 6);
+    // Given ranges, only those instances upload; an empty list (an LOD subset whose values held) uploads nothing.
+    n0 = bytes();
+    loops.update(device, { ...data, offsetsChanged: Uint32Array.of(1, 2) });
+    expect(bytes() - n0).toBe(8);
+    n0 = bytes();
+    loops.update(device, { ...data, offsetsChanged: new Uint32Array(0) });
+    expect(bytes() - n0).toBe(0);
+    // A new array uploads whole, ranges or not.
+    n0 = bytes();
+    loops.update(device, { ...data, centers: centers.slice(), offsetsChanged: new Uint32Array(0) });
+    expect(bytes() - n0).toBe(4 * 6);
+    loops.destroy();
     device.destroy();
   });
 });
