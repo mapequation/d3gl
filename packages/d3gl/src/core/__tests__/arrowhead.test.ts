@@ -4,6 +4,7 @@ import {
   arrowOutline,
   arrowShaft,
   barbOverhang,
+  fadedBend,
   headHalfWidth,
   headLength,
   legCubic,
@@ -311,5 +312,112 @@ describe("arrowOutline (one filled shape)", () => {
     expect(arrowOutline(out, 4, p, 2)).toBe(7);
     expect(out[0]).toBe(0);
     expect(out[4]).toBeCloseTo(p.sx + (-(p.ty - p.sy) / Math.hypot(200, 100)) * 1, 4);
+  });
+});
+
+describe("fadedBend (short bent links)", () => {
+  /** ρ = r1 + h and the closed-form floor, computed independently. */
+  function floorOf(bend: number, radius: number, size: number, width: number): { rho: number; floor: number } {
+    const rho = radius + 2 * size;
+    const x = Math.min(0.99, (1.2 * (width / 2 + 2 * Math.sqrt(width))) / rho);
+    return { rho, floor: Math.min(Math.abs(bend), (0.5 * x) / Math.sqrt(1 - x * x)) };
+  }
+  const CASES: [number, number, number][] = [
+    // radius, size, width
+    [12, 4, 2],
+    [5, 3, 1],
+    [20, 6, 8],
+  ];
+
+  it("is the bend itself, bit for bit, once D ≥ 4ρ", () => {
+    for (const [r, size, w] of CASES) {
+      const { rho } = floorOf(1, r, size, w);
+      for (const bend of [0, 0.2, -0.35, 0.5, 1e-7]) {
+        for (const d of [4 * rho, 4 * rho + 1e-9, 10 * rho, 1e6]) expect(Object.is(fadedBend(bend, d, r, size, w), bend)).toBe(true);
+      }
+    }
+  });
+
+  it("is the floor for D ≤ 2ρ, and keeps the sign", () => {
+    for (const [r, size, w] of CASES) {
+      for (const bend of [0.25, 0.5, 2]) {
+        const { rho, floor } = floorOf(bend, r, size, w);
+        expect(floor).toBeLessThan(bend); // the floor binds for these bends
+        for (const d of [0, rho, 1.5 * rho, 2 * rho]) {
+          expect(fadedBend(bend, d, r, size, w)).toBeCloseTo(floor, 12);
+          expect(fadedBend(-bend, d, r, size, w)).toBeCloseTo(-floor, 12);
+        }
+      }
+    }
+    // A bend below the floor stays as it is.
+    expect(fadedBend(0.01, 0, 12, 4, 2)).toBeCloseTo(0.01, 15);
+  });
+
+  it("is continuous across both ends of the fade and monotonic between", () => {
+    for (const [r, size, w] of CASES) {
+      const bend = 0.5;
+      const { rho, floor } = floorOf(bend, r, size, w);
+      const e = 1e-6 * rho;
+      expect(fadedBend(bend, 2 * rho + e, r, size, w)).toBeCloseTo(floor, 9);
+      expect(fadedBend(bend, 4 * rho - e, r, size, w)).toBeCloseTo(bend, 9);
+      let prev = fadedBend(bend, 2 * rho, r, size, w);
+      for (let i = 1; i <= 64; i++) {
+        const b = fadedBend(bend, 2 * rho + (2 * rho * i) / 64, r, size, w);
+        expect(b).toBeGreaterThanOrEqual(prev);
+        expect(b - prev).toBeLessThan(0.05 * (bend - floor)); // no jump
+        prev = b;
+      }
+      // smoothstep's midpoint: halfway between the floor and the bend.
+      expect(fadedBend(bend, 3 * rho, r, size, w)).toBeCloseTo((floor + bend) / 2, 12);
+    }
+  });
+
+  it("keeps an opposite pair's heads apart: each head stays on its own side of the chord", () => {
+    for (const [r, size, w] of CASES) {
+      for (const bend of [0.25, 0.5]) {
+        const { rho } = floorOf(bend, r, size, w);
+        for (const k of [1.2, 1.5, 2, 2.5, 3, 3.5, 4, 6]) {
+          const d = k * rho;
+          // A = (0, 0), B = (d, 0): A→B bends to +y, B→A (the same bend) to −y.
+          const ab = head({ sx: 0, sy: 0, tx: d, ty: 0, radius: r, width: w, size, bend });
+          const ba = head({ sx: d, sy: 0, tx: 0, ty: 0, radius: r, width: w, size, bend });
+          for (let i = 0; i < 3; i++) {
+            expect(ab[2 * i + 1]).toBeGreaterThan(0);
+            expect(ba[2 * i + 1]).toBeLessThan(0);
+          }
+        }
+      }
+    }
+  });
+
+  it("drives the whole arrow: shaft on the faded cubic, head on its end tangent", () => {
+    const p: ArrowParams = { sx: 0, sy: 0, tx: 50, ty: 20, radius: 6, width: 2, size: 4, bend: 0.5 };
+    const beff = fadedBend(p.bend, Math.hypot(50, 20), p.radius, p.size, p.width);
+    expect(beff).toBeLessThan(p.bend); // D ≈ 3.9ρ: in the fade
+    const faded = { ...p, bend: beff };
+    const [ux, uy] = bentEndTangent(p.sx, p.sy, p.tx, p.ty, beff);
+    const h = head(p);
+    expect(h[2]).toBeCloseTo(p.tx - ux * p.radius, 9);
+    expect(h[3]).toBeCloseTo(p.ty - uy * p.radius, 9);
+    const m = 6;
+    const out = new Float64Array(4 * m);
+    arrowShaft(out, 0, p, headLength(p.size), m);
+    const c = linkCubic(faded, p.radius + headLength(p.size));
+    for (let i = 0; i < m; i++) {
+      const [x, y] = cubicAt(c, i / (m - 1));
+      expect(((out[4 * i] ?? 0) + (out[4 * i + 2] ?? 0)) / 2).toBeCloseTo(x, 9);
+      expect(((out[4 * i + 1] ?? 0) + (out[4 * i + 3] ?? 0)) / 2).toBeCloseTo(y, 9);
+    }
+    const outline = new Float64Array(2 * (2 * m + 3));
+    arrowOutline(outline, 0, p, m);
+    for (let k = 0; k < 6; k++) expect(outline[2 * m + k]).toBeCloseTo(h[k] ?? NaN, 12);
+  });
+
+  it("stays finite for a head wider than ρ (x clamps at 0.99), and for a degenerate ρ = 0", () => {
+    const b = fadedBend(5, 1, 1, 0.1, 400);
+    expect(Number.isFinite(b)).toBe(true);
+    expect(b).toBeCloseTo((0.5 * 0.99) / Math.sqrt(1 - 0.99 * 0.99), 12);
+    expect(fadedBend(-0.3, 0, 0, 0, 3)).toBe(-0.3);
+    expect(fadedBend(0, 0, 4, 2, 3)).toBe(0);
   });
 });

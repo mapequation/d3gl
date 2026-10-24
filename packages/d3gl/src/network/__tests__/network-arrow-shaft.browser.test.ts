@@ -60,17 +60,30 @@ const dist = (a: number[], b: number[]): number => Math.max(...a.map((v, i) => M
 type Link = (typeof LINKS)[number];
 
 /** The one-shape assertions on a rendered link from POS[0] to the target, read from its pixels. */
-function expectOneShape(px: PixelBuffer, k: number, sizeMode: "world" | "screen", bend: number, link: Link): void {
+function expectOneShape(
+  px: PixelBuffer,
+  k: number,
+  sizeMode: "world" | "screen",
+  bend: number,
+  link: Link,
+  opts: { src?: { x: number; y: number }; back?: number; stepTolerance?: number } = {},
+): void {
+  const src = opts.src ?? { x: POS[0] ?? 0, y: POS[1] ?? 0 };
   const bg = at(px, 2, 2);
   const ink = (x: number, y: number): boolean => dist(at(px, x, y), bg) > 40;
-  // The expected head in screen px (the geometry is scale-equivariant: solve at screen scale).
+  // The expected head, solved where the renderers solve it (world units, or px in screen sizeMode: the head's
+  // width and a short link's bend fade are not scale-equivariant), then mapped to screen px.
   const s = sizeMode === "world" ? k : 1;
   const t = transformAt(k);
+  const q = sizeMode === "world" ? 1 : k;
+  const ox = sizeMode === "world" ? 0 : t.x;
+  const oy = sizeMode === "world" ? 0 : t.y;
   const head = new Float64Array(6);
   arrowHead(head, 0, {
-    sx: (POS[0] ?? 0) * k + t.x, sy: (POS[1] ?? 0) * k + t.y, tx: TARGET.x * k + t.x, ty: TARGET.y * k + t.y,
-    radius: RADIUS * s, width: link.width * s, size: link.size * s, bend,
+    sx: src.x * q + ox, sy: src.y * q + oy, tx: TARGET.x * q + ox, ty: TARGET.y * q + oy,
+    radius: RADIUS, width: link.width, size: link.size, bend,
   });
+  if (sizeMode === "world") for (let i = 0; i < 6; i++) head[i] = (head[i] ?? 0) * k + (i % 2 ? t.y : t.x);
   const [lx, ly, tx, ty, rx, ry] = Array.from(head) as [number, number, number, number, number, number];
   const mx = (lx + rx) / 2, my = (ly + ry) / 2;
   const len = Math.hypot(tx - mx, ty - my);
@@ -93,7 +106,7 @@ function expectOneShape(px: PixelBuffer, k: number, sizeMode: "world" | "screen"
     expect(ink(0.2 * tx + a * lx + b * rx, 0.2 * ty + a * ly + b * ry), `barb ${a > b ? "left" : "right"} missing`).toBe(true);
   // No gap at the join: the axis from behind the base to the tip, and the shaft's edges across the base.
   // A bent link's shaft runs into the head along the head's axis, so it stays on the axis behind the base.
-  const back = -8;
+  const back = opts.back ?? -8;
   // Sampled at pixel centres: `at` rounds, so a coordinate c reads the pixel covering [c − 0.5, c + 0.5);
   // shift by half (WebGL's toPNG has no AA, so a thin diagonal line can miss a half-pixel-off sample).
   const inkAt = (x: number, y: number): boolean => ink(x - 0.5, y - 0.5);
@@ -111,7 +124,7 @@ function expectOneShape(px: PixelBuffer, k: number, sizeMode: "world" | "screen"
     }
     return e;
   };
-  expect(Math.abs(extent(1) - extent(-1)), "shaft off the head's axis behind the base").toBeLessThanOrEqual(1);
+  expect(Math.abs(extent(1) - extent(-1)), "shaft off the head's axis behind the base").toBeLessThanOrEqual(opts.stepTolerance ?? 1);
   // A translucent link composites once: the axis colour is the same on the shaft, across the join and in the head.
   if (link.name === "translucent") {
     const ref = at(px, mx + back * ux, my + back * uy);
@@ -193,4 +206,126 @@ describe("network: LOD on, a directed line link is the same one shape (#542)", (
               for (let y = 0; y < H; y++) for (let x = 110; x < W; x++) if (dist(at(lod, x, y), at(off, x, y)) > 24) differ++;
               expect(differ, "pixels that differ from the LOD-off link").toBeLessThanOrEqual(2);
             });
+});
+
+/**
+ * Short bent links (#542): within 4ρ of the target (ρ = target radius + head length, in the solve space) a headed
+ * link's bend fades towards the floor where an opposite pair's heads just clear (`fadedBend`), so the curve never
+ * hooks into its head. At D ≈ 3ρ (mid-fade) and D ≈ 2ρ (the floor), straight-bend 0.25 and 0.5: a single link is
+ * still one shape (the same assertions, against the faded head), WebGL draws the same pixels as Canvas, and an
+ * opposite pair's two arrows (each rendered alone) share no pixel. LOD on: a leaf link draws as the LOD-off one.
+ */
+const SHORT_K = 1.6;
+const SHORT_LINK = LINKS[0];
+/**
+ * A short link's shaft is a short curve: behind the base it bends off the head's straight axis line (≈1.7px 8px back
+ * at D = 2ρ in px, ≈0.45px 4px back), so the axis walk starts 4px back, and the across-extent check takes the line's
+ * pixel-grid jitter on a diagonal (a sideways step would be ≥ the line's half-width on one side).
+ */
+const SHORT_CHECKS = { back: -4, stepTolerance: 1.5 };
+
+/** The source end at `f`·ρ from the target (ρ in the solve space: world units, or px in screen sizeMode). */
+function shortPositions(f: number, sizeMode: "world" | "screen"): Float32Array {
+  const rho = RADIUS + 2 * SHORT_LINK.size;
+  const d = (f * rho) / (sizeMode === "screen" ? SHORT_K : 1);
+  return new Float32Array([TARGET.x - d, TARGET.y, TARGET.x, TARGET.y]);
+}
+
+async function renderShort(
+  backend: (typeof BACKENDS)[number],
+  style: NetworkStyle,
+  positions: Float32Array,
+  edges: { source: number[]; target: number[] },
+  lod = false,
+): Promise<PixelBuffer> {
+  const net = network(host(), { width: W, height: H, backend });
+  await net.whenReady();
+  net.data(buildGraph({ nodeCount: 2, ...edges, directed: true })).style(style);
+  if (lod) net.lod({ modules: [{ id: 0, path: [1] }, { id: 1, path: [2] }], expandPx: 1, declutter: false });
+  net.layout({ backend: "positions", positions });
+  net.setTransform(transformAt(SHORT_K));
+  net.syncScreenGeometry();
+  const png = backend === "svg" ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(net.toSVG())}` : net.toPNG();
+  net.destroy();
+  return decodeImage(png, W, H);
+}
+
+const shortStyle = (bend: number, sizeMode: "world" | "screen"): NetworkStyle => ({
+  directed: true,
+  linkStyle: "line",
+  linkBend: bend,
+  sizeMode,
+  nodeRadius: RADIUS,
+  nodeFill: "rgba(0, 0, 0, 0)",
+  linkWidth: SHORT_LINK.width,
+  arrowSize: SHORT_LINK.size,
+  linkStroke: SHORT_LINK.stroke,
+});
+
+/**
+ * WebGL vs Canvas, both ways: every solidly inked pixel (alpha ≥ 128) of one has ink (alpha ≥ 32) within 1px in the
+ * other — the same arrow up to anti-aliasing (WebGL's toPNG fringe is not Canvas's, so colours are not compared).
+ */
+function expectSameAsCanvas(webgl: PixelBuffer, canvas: PixelBuffer): void {
+  const alpha = (p: PixelBuffer, x: number, y: number): number => p.data[4 * (y * W + x) + 3] ?? 0;
+  for (const [a, b, label] of [[webgl, canvas, "WebGL ink missing on Canvas"], [canvas, webgl, "Canvas ink missing on WebGL"]] as const) {
+    let solid = 0;
+    let missing = 0;
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        if (alpha(a, x, y) < 128) continue;
+        solid++;
+        let hit = false;
+        for (let dy = -1; dy <= 1 && !hit; dy++)
+          for (let dx = -1; dx <= 1 && !hit; dx++) hit = y + dy >= 0 && y + dy < H && x + dx >= 0 && x + dx < W && alpha(b, x + dx, y + dy) >= 32;
+        if (!hit) missing++;
+      }
+    expect(solid, "nothing drawn (non-vacuity)").toBeGreaterThan(50);
+    expect(missing, label).toBeLessThanOrEqual(2);
+  }
+}
+
+describe("network: a short bent directed line link fades its bend towards the floor (#542)", () => {
+  const SINGLE = { source: [0], target: [1] };
+  for (const backend of BACKENDS)
+    for (const bend of [0.25, 0.5])
+      for (const [label, f] of [["D ≈ 3ρ", 3], ["D ≈ 2ρ", 2]] as const)
+        for (const sizeMode of ["world", "screen"] as const) {
+          const name = `${backend}, bend ${bend}, ${label}, ${sizeMode}`;
+          const positions = shortPositions(f, sizeMode);
+          const src = { x: positions[0] ?? 0, y: positions[1] ?? 0 };
+          it(`${name}, single: one shape${backend === "webgl" ? ", as Canvas" : ""}`, async () => {
+            const style = shortStyle(bend, sizeMode);
+            const px = await renderShort(backend, style, positions, SINGLE);
+            expectOneShape(px, SHORT_K, sizeMode, bend, SHORT_LINK, { src, ...SHORT_CHECKS });
+            if (backend === "webgl") expectSameAsCanvas(px, await renderShort("canvas", style, positions, SINGLE));
+          });
+          it(`${name}, opposite pair: the two arrows share no pixel${backend === "webgl" ? ", as Canvas" : ""}`, async () => {
+            const style = shortStyle(bend, sizeMode);
+            const ab = await renderShort(backend, style, positions, SINGLE);
+            const ba = await renderShort(backend, style, positions, { source: [1], target: [0] });
+            const bg = at(ab, 2, 2);
+            let shared = 0;
+            for (let y = 0; y < H; y++)
+              for (let x = 0; x < W; x++) if (dist(at(ab, x, y), bg) > 40 && dist(at(ba, x, y), bg) > 40) shared++;
+            expect(shared, "pixels inked by both arrows of the pair").toBe(0);
+            if (backend === "webgl") {
+              const pair = { source: [0, 1], target: [1, 0] };
+              expectSameAsCanvas(await renderShort(backend, style, positions, pair), await renderShort("canvas", style, positions, pair));
+            }
+          });
+        }
+
+  for (const backend of BACKENDS)
+    for (const sizeMode of ["world", "screen"] as const)
+      it(`LOD on, leaf link: ${backend}, bend 0.5, D ≈ 3ρ, ${sizeMode}: one shape, as LOD off`, async () => {
+        const style = shortStyle(0.5, sizeMode);
+        const positions = shortPositions(3, sizeMode);
+        const lod = await renderShort(backend, style, positions, { source: [0], target: [1] }, true);
+        expectOneShape(lod, SHORT_K, sizeMode, 0.5, SHORT_LINK, { src: { x: positions[0] ?? 0, y: positions[1] ?? 0 }, ...SHORT_CHECKS });
+        const off = await renderShort(backend, style, positions, { source: [0], target: [1] });
+        let differ = 0;
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (dist(at(lod, x, y), at(off, x, y)) > 24) differ++;
+        expect(differ, "pixels that differ from the LOD-off link").toBeLessThanOrEqual(2);
+      });
 });

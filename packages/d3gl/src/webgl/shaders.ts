@@ -382,14 +382,24 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
   vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
   vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
   vec2 d = tgt - src;
+  float len = 2.0 * u_arrowSize;                            // headLength
+  float back = a_radius + len;                              // ρ
+  // fadedBend (core/arrowhead.ts): a short link's bend fades towards the floor where an opposite pair's heads
+  // just clear, x = min(0.99, 1.2·H/ρ), floor = ½·x/√(1 − x²), over smoothstep(2ρ, 4ρ, D).
+  float bend = a_bend;
+  if (a_bend != 0.0 && back > 0.0) {
+    float ab = abs(a_bend);
+    float hx = min(0.99, 1.2 * (hw + 2.0 * sqrt(a_width)) / back);
+    float floorBend = min(ab, 0.5 * hx / sqrt(1.0 - hx * hx));
+    float fade = smoothstep(2.0 * back, 4.0 * back, length(d));
+    bend = sign(a_bend) * (ab - (ab - floorBend) * (1.0 - fade));
+  }
   // The legs (core/arrowhead.ts writeShaft): out of each centre towards the quadratic's control mid + ⟂d·bend.
-  vec2 bp = 2.0 * a_bend * vec2(-d.y, d.x);
+  vec2 bp = 2.0 * bend * vec2(-d.y, d.x);
   float ll = length(d + bp);                                // = |−d + 2b·⟂d|
   vec2 u1 = (bp - d) / ll;                                  // out of the target: the head's axis is −u1
   vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the head's normal
   vec2 tip = tgt + u1 * a_radius;
-  float len = 2.0 * u_arrowSize;                            // headLength
-  float back = a_radius + len;
   vec2 base = tgt + u1 * back;                              // E1, the head's base centre
   vec2 pos;
   if (t > 2.5) {
@@ -407,7 +417,7 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
     bool settled = back < 0.5 * ll;
     vec2 l0 = settled ? (d + bp) / ll : v;
     vec2 l1 = settled ? u1 : -v;
-    float leg = settled ? chord * sqrt(1.0 + 4.0 * a_bend * a_bend) / 3.0 : chord / 3.0;
+    float leg = settled ? chord * sqrt(1.0 + 4.0 * bend * bend) / 3.0 : chord / 3.0;
     vec2 p1 = src + leg * l0;
     vec2 p2 = base + leg * l1;
     float u = 1.0 - t;

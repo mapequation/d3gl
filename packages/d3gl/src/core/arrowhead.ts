@@ -69,7 +69,7 @@ export interface ArrowParams {
   width: number;
   /** Arrow size (head length = 2·size). */
   size: number;
-  /** Chord-fraction bend (0 = straight), as `linkBend`. */
+  /** Chord-fraction bend (0 = straight), as `linkBend`; a short link draws it faded ({@link fadedBend}). */
   bend: number;
 }
 
@@ -126,15 +126,50 @@ const CUBIC = new Float64Array(8);
  * `4·samples` numbers at `o`; returns the number of points written (0 for a zero-length link).
  */
 export function arrowShaft(out: PointBuffer, o: number, p: ArrowParams, trim: number, samples: number): number {
-  return writeShaft(out, o, p, trim, samples, false);
+  return writeShaft(out, o, p, arrowBend(p), trim, samples, false);
+}
+
+/**
+ * The bend a headed link actually draws with (#542): a short bent link fades its bend `b` towards a floor, so
+ * the curve never hooks into its own head and an opposite pair (A→B, B→A, bent to opposite sides) stays apart.
+ * In the solve space (world units, or px in screen sizeMode), with `D = |c1 − c0|`, `ρ = radius + headLength(size)`
+ * and `H = headHalfWidth(width)`:
+ *
+ *   `x = min(0.99, 1.2·H/ρ)`,  `b_floor = min(|b|, ½·x/√(1 − x²))`  (½·tan(asin x): the bend at which an
+ *   opposite pair's heads just clear each other),
+ *   `f = smoothstep(2ρ, 4ρ, D)`,  `b_eff = sign(b)·(|b| − (|b| − b_floor)·(1 − f))`.
+ *
+ * So `D ≤ 2ρ` draws `b_floor`, and `D ≥ 4ρ` draws `b` exactly (returned as is). The sign is kept. The GLSL twin
+ * is the start of `HEAD_LINE_BODY` in `webgl/shaders.ts`. Only whole arrows use it: undirected lines,
+ * half-arrows and self-link loops keep their bend.
+ */
+export function fadedBend(bend: number, dist: number, radius: number, size: number, width: number): number {
+  const rho = radius + headLength(size);
+  if (bend === 0 || !(rho > 0) || dist >= 4 * rho) return bend;
+  const ab = Math.abs(bend);
+  const x = Math.min(0.99, (1.2 * headHalfWidth(width)) / rho);
+  const floor = Math.min(ab, (0.5 * x) / Math.sqrt(1 - x * x));
+  const t = Math.min(1, Math.max(0, (dist - 2 * rho) / (2 * rho)));
+  const f = t * t * (3 - 2 * t);
+  return Math.sign(bend) * (ab - (ab - floor) * (1 - f));
+}
+
+/** {@link fadedBend} for an arrow's parameters. */
+function arrowBend(p: ArrowParams): number {
+  return fadedBend(p.bend, Math.hypot(p.tx - p.sx, p.ty - p.sy), p.radius, p.size, p.width);
 }
 
 /** Write the head's three points (left barb, tip, right barb) at `o`; returns 3 (0 for a zero-length link). */
 export function arrowHead(out: PointBuffer, o: number, p: ArrowParams): number {
+  return writeHead(out, o, p, arrowBend(p));
+}
+
+/** {@link arrowHead} with the faded bend `bend` already resolved. */
+function writeHead(out: PointBuffer, o: number, p: ArrowParams, bend: number): number {
   const dx = p.tx - p.sx;
   const dy = p.ty - p.sy;
-  const ex = 0.5 * dx + dy * p.bend;
-  const ey = 0.5 * dy - dx * p.bend;
+  const ex = 0.5 * dx + dy * bend;
+  const ey = 0.5 * dy - dx * bend;
   const el = Math.hypot(ex, ey);
   if (el <= 0) return 0;
   const ux = ex / el;
@@ -163,18 +198,20 @@ export function arrowHead(out: PointBuffer, o: number, p: ArrowParams): number {
  * zero-length link).
  */
 export function arrowOutline(out: PointBuffer, o: number, p: ArrowParams, samples: number): number {
-  const n = writeShaft(out, o, p, headLength(p.size), samples, true);
+  const bend = arrowBend(p);
+  const n = writeShaft(out, o, p, bend, headLength(p.size), samples, true);
   if (n === 0) return 0;
-  arrowHead(out, o + 2 * samples, p);
+  writeHead(out, o + 2 * samples, p, bend);
   return 2 * samples + 3;
 }
 
 /**
- * Shared shaft sampler. `outline = false`: strip order (left, right per sample). `outline = true`:
- * left edge at points `0 … M−1`, right edge reversed at points `M+3 … 2M+2` (the head goes between).
+ * Shared shaft sampler, on the faded bend `bend` ({@link fadedBend}). `outline = false`: strip order (left, right
+ * per sample). `outline = true`: left edge at points `0 … M−1`, right edge reversed at points `M+3 … 2M+2` (the
+ * head goes between).
  */
-function writeShaft(out: PointBuffer, o: number, p: ArrowParams, trim: number, samples: number, outline: boolean): number {
-  const { sx, sy, tx, ty, bend } = p;
+function writeShaft(out: PointBuffer, o: number, p: ArrowParams, bend: number, trim: number, samples: number, outline: boolean): number {
+  const { sx, sy, tx, ty } = p;
   const dx = tx - sx;
   const dy = ty - sy;
   // The legs: from each centre towards the quadratic control C = mid + ⟂d·bend. |d + 2b·⟂d| = |−d + 2b·⟂d|.
