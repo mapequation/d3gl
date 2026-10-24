@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, LOOP_SPREAD, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, loopHalfHeadLength, loopPieceLength, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../../core/loop-drop.js";
+import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, LOOP_SPREAD, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, resolveLoopLength, resolveLoopSpread, loopHalfHeadLength, loopPieceLength, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../../core/loop-drop.js";
 import { PathRecorder } from "../../core/path-recorder.js";
 import { outlineGap } from "../../core/__tests__/outline-gap.js";
 import { headHalfWidth, headLength } from "../../core/arrowhead.js";
@@ -547,3 +547,27 @@ describe("an LOD frame's loops on kept leaves", () => {
   });
 });
 
+describe("selfLinkSpread / selfLinkLength resolution (#542)", () => {
+  it("clamps the spread into [1°, 359°] and the leg to ≥ 0, so a loop's centre and outline stay finite", () => {
+    expect(resolveLoopSpread(undefined)).toBe(LOOP_SPREAD);
+    expect(resolveLoopSpread(Number.NaN)).toBe(LOOP_SPREAD);
+    expect(resolveLoopSpread(40)).toBe(40);
+    expect(resolveLoopSpread(0)).toBe(1);
+    expect(resolveLoopSpread(-30)).toBe(1);
+    expect(resolveLoopSpread(360)).toBe(359);
+    expect(resolveLoopLength(undefined)).toBe(LOOP_LEG);
+    expect(resolveLoopLength(Number.NaN)).toBe(LOOP_LEG);
+    expect(resolveLoopLength(2.5)).toBe(2.5);
+    expect(resolveLoopLength(-1)).toBe(0);
+    // The extremes trace a finite outline: a 0° spread would make cot α infinite.
+    for (const deg of [0, 360]) {
+      const cot = spreadCot((resolveLoopSpread(deg) * Math.PI) / 360);
+      expect(Number.isFinite(cot)).toBe(true);
+      const rec = new PathRecorder();
+      traceLoopArrowOutline(rec, 6, 0, 0, 6, 2, 4, resolveLoopLength(-1), cot, 1);
+      const pts = rec.subpaths.flatMap((sp) => [...sp.points]);
+      expect(pts.length).toBeGreaterThan(0);
+      expect(pts.every(Number.isFinite)).toBe(true);
+    }
+  });
+});

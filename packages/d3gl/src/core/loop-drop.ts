@@ -38,6 +38,25 @@ export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
  *  from its `bends` column. */
 export const LOOP_LEG = 1;
 
+/** The narrowest and widest leg spread a loop is drawn at (degrees): at 0° or 360° its centre is at infinity
+ *  (`cot α = ±∞`), so the outline would be NaN. */
+const LOOP_SPREAD_MIN = 1;
+const LOOP_SPREAD_MAX = 359;
+
+/** A style's `selfLinkSpread` (degrees) as drawn: clamped to [1°, 359°]; absent or NaN ⇒ {@link LOOP_SPREAD}. Once per
+ *  style resolution. */
+export function resolveLoopSpread(deg: number | undefined): number {
+  if (deg === undefined || Number.isNaN(deg)) return LOOP_SPREAD;
+  return Math.min(LOOP_SPREAD_MAX, Math.max(LOOP_SPREAD_MIN, deg));
+}
+
+/** A style's `selfLinkLength` (node radii) as drawn: at least 0 (a negative leg has no loop); absent or NaN ⇒
+ *  {@link LOOP_LEG}. Once per style resolution. */
+export function resolveLoopLength(length: number | undefined): number {
+  if (length === undefined || Number.isNaN(length)) return LOOP_LEG;
+  return Math.max(0, length);
+}
+
 /** `cot α` for half-spread `α` (radians): what the writers and the WebGL loop lane solve the centre with. */
 export function spreadCot(halfSpread: number): number {
   return 1 / Math.tan(halfSpread);
