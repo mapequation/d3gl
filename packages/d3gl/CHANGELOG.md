@@ -1,5 +1,15 @@
 # @mapequation/d3gl
 
+## 0.12.3
+
+### Patch Changes
+
+- [#548](https://github.com/mapequation/d3gl/pull/548) [`42121f9`](https://github.com/mapequation/d3gl/commit/42121f938dca3f01762f787e005d4a4ab5a8eb30) Thanks [@danieledler](https://github.com/danieledler)! - Add `network.update({ flow, modules, moduleLinks })`: re-cluster the network the engine already holds, plain or state, without loading it again. The nodes, links, positions, every view's layout, the camera and the selected nodes are kept, and the sizes, colours, pies, module tree, module links and lumps follow the new flow and modules. A running layout stops where it is, and `update()` never starts one: continue it warm with `layout()`. A selected module of the old modules is dropped, and the hover is cleared. `data(graph, { modules })` and `stateNetwork(graph, { modules })` now share its checks and module handling.
+
+- [#521](https://github.com/mapequation/d3gl/pull/521) [`b30eb84`](https://github.com/mapequation/d3gl/commit/b30eb8413225d1b5c60cfb2cfd7935a43df821e9) Thanks [@danieledler](https://github.com/danieledler)! - State networks: in the physical view, a pie now shows a flow border or node border with no colour given through it: each wedge spans the full node radius and its outer band is the wedge's own colour, darker, as a single-module node's border is its fill's. The same on WebGL, Canvas, SVG and `toSVG()`. With an explicit flow-border or node-border colour, the pie sits inside the border on every backend (WebGL used to draw it over the flow border).
+
+- [#534](https://github.com/mapequation/d3gl/pull/534) [`b0bdacf`](https://github.com/mapequation/d3gl/commit/b0bdacfe193a5ef86c0b17596791e1ef3ed76a3e) Thanks [@danieledler](https://github.com/danieledler)! - State networks: module links ([#533](https://github.com/mapequation/d3gl/issues/533)). `stateNetwork(graph, { modules, moduleLinks })` takes an Infomap state `.ftree`'s module-level links, addressed by path in the state-node modules, as `data(graph, { modules, moduleLinks })` does: the state view draws exactly them between its modules and its layouts pull along them. Lumped, a module endpoint keeps its path and a leaf endpoint becomes the lump that holds that state node; `lumpStateGraph(graph, modules, moduleLinks)` returns them in the lumps' hierarchy (`moduleLinks`). The physical and both views have none. `moduleLinks` requires `modules`, and an endpoint outside the hierarchy throws up front. In a ragged hierarchy (a module with sub-modules and state nodes side by side), a lump's rank now skips its module's sub-module branch numbers, so a lump's path never names a sub-module too.
+
 ## 0.12.2
 
 ### Patch Changes
