@@ -19,7 +19,6 @@ import {
   selfLoopSelected,
   FALLBACK_ANGLE,
   SELF_LOOP_LAYER,
-  SELF_LOOP_ARROW_LAYER,
 } from "../self-loops.js";
 
 /** Self-link loops (#505): one drop per node with a self-link, its duplicates summed. */
@@ -254,7 +253,6 @@ describe("self-loop cache and layers (per-frame cost)", () => {
     for (let f = 0; f < 5; f++) {
       const names = networkLayersFromCache(g, s, cache).map((l) => l.name);
       expect(names).not.toContain(SELF_LOOP_LAYER);
-      expect(names).not.toContain(SELF_LOOP_ARROW_LAYER);
     }
     expect(selfLoopStats.updates).toBe(before);
   });
@@ -269,18 +267,16 @@ describe("self-loop cache and layers (per-frame cost)", () => {
     if (!loops) throw new Error("expected a loop cache");
     expect(loops.loops.count).toBe(2);
     expect([...loops.widths]).toEqual([2, 2]); // node 3's two self-links summed
-    const frame = (): { lines: Float32Array[]; arrows: Float32Array[] } => {
-      const layers = networkLayersFromCache(g, s, cache);
-      const out = { lines: [] as Float32Array[], arrows: [] as Float32Array[] };
-      for (const l of layers) {
-        if (l.name === SELF_LOOP_LAYER && l.primitive === "lines") out.lines = [l.lines.sources, l.lines.widths, l.lines.bends ?? new Float32Array(), l.lines.sourceOffsets ?? new Float32Array()];
-        if (l.name === SELF_LOOP_ARROW_LAYER && l.primitive === "arrows") out.arrows = [l.arrows.sources, l.arrows.sizes, l.arrows.sourceOffsets ?? new Float32Array()];
-      }
+    const frame = (): { lines: Float32Array[]; layers: number } => {
+      const layers = networkLayersFromCache(g, s, cache).filter((l) => l.name === SELF_LOOP_LAYER);
+      const out = { lines: [] as Float32Array[], layers: layers.length };
+      for (const l of layers)
+        if (l.primitive === "lines") out.lines = [l.lines.sources, l.lines.widths, l.lines.bends ?? new Float32Array(), l.lines.sourceOffsets ?? new Float32Array(), l.lines.targetOffsets ?? new Float32Array()];
       return out;
     };
     const a = frame();
-    expect(a.lines.length).toBe(4);
-    expect(a.arrows.length).toBe(3);
+    expect(a.layers).toBe(1); // the directed loop's head is part of its one instance (#542)
+    expect(a.lines.length).toBe(5);
     const u0 = selfLoopStats.updates;
     const i0 = selfLoopStats.instances;
     g.positions.set([0, 5, 10, 5, 20, 5, 30, 5]); // the layout moved every node
@@ -288,17 +284,20 @@ describe("self-loop cache and layers (per-frame cost)", () => {
     expect(selfLoopStats.updates - u0).toBe(1);
     expect(selfLoopStats.instances - i0).toBe(2); // S, not E or N
     a.lines.forEach((arr, k) => expect(b.lines[k]).toBe(arr));
-    a.arrows.forEach((arr, k) => expect(b.arrows[k]).toBe(arr));
     expect(b.lines[0]?.[1]).toBe(5); // the centre moved, in place
   });
 
-  it("the half-arrow style draws one half-arrows loop layer and no separate arrowhead", () => {
+  it("every style draws ONE lines loop layer, its loopHead the variant", () => {
     const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 1], directed: true });
     g.positions.set([0, 0, 10, 0]);
-    const s = style(2, { directed: true, linkStyle: "half-arrow" });
-    const layers = networkLayersFromCache(g, s, noLodStyleCache(g, s));
-    const loopLayers = layers.filter((l) => l.name === SELF_LOOP_LAYER || l.name === SELF_LOOP_ARROW_LAYER);
-    expect(loopLayers.map((l) => l.primitive)).toEqual(["half-arrows"]);
+    const heads = (opts: Parameters<typeof style>[1]): (string | undefined)[] => {
+      const s = style(2, opts);
+      const layers = networkLayersFromCache(g, s, noLodStyleCache(g, s)).filter((l) => l.name === SELF_LOOP_LAYER);
+      return layers.map((l) => (l.primitive === "lines" && l.lines.curve === "drop" ? (l.lines.loopHead ?? "none") : l.primitive));
+    };
+    expect(heads({ directed: true, linkStyle: "half-arrow" })).toEqual(["half"]);
+    expect(heads({ directed: true })).toEqual(["arrow"]);
+    expect(heads({ directed: false })).toEqual(["none"]);
   });
 });
 

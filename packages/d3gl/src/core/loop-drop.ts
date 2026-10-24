@@ -27,9 +27,10 @@ import { barbOverhang, headHalfWidth, legCubic, type PointBuffer } from "./arrow
 
 /** Half the angle between the loop's two legs at the centre (radians). */
 export const DROP_HALF_SPREAD = (20 * Math.PI) / 180;
-/** `cot α`: recovers the loop's centre from its rim ends ({@link solveLoop}); the shaders bake it too. */
+/** `cot α`: recovers the loop's centre from its rim ends ({@link solveLoop}); the WebGL loop lane reads it as `u_loopCot`. */
 export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
-/** The loop's leg length in node radii (`ℓ = L·r`): with {@link DROP_HALF_SPREAD}, the teardrop. */
+/** The loop's leg length in node radii (`ℓ = L·r`): with {@link DROP_HALF_SPREAD}, the teardrop. The writers take `L` as
+ *  an argument (default this), and the WebGL loop lane reads it per loop from its `bends` column. */
 export const LOOP_LEG = 3;
 
 /** The path context a loop traces into (Canvas, SVG, the export recorder). */
@@ -52,10 +53,10 @@ const CUBIC = new Float64Array(8);
 
 /**
  * Solve the loop's frame from its rim ends `(sx, sy)` = `S` and `(tx, ty)` = `T` into {@link FRAME}, and its centre
- * cubic for head length `h` into {@link CUBIC}: `c = S − (n − D/2)`, `r = |n − D/2|`, `u0 = (S − c)/r`,
+ * cubic for head length `h` and leg `L` into {@link CUBIC}: `c = S − (n − D/2)`, `r = |n − D/2|`, `u0 = (S − c)/r`,
  * `u1 = (T − c)/r`, then `legCubic(c, u0, r + h, c, u1, r + h, L·r)`. Returns `r` (0 for coincident ends: no loop).
  */
-function solveLoop(sx: number, sy: number, tx: number, ty: number, h: number): number {
+function solveLoop(sx: number, sy: number, tx: number, ty: number, h: number, leg: number): number {
   const hx = 0.5 * (tx - sx);
   const hy = 0.5 * (ty - sy);
   const nx = -hy * DROP_COT;
@@ -73,17 +74,17 @@ function solveLoop(sx: number, sy: number, tx: number, ty: number, h: number): n
   FRAME[4] = u0y;
   FRAME[5] = u1x;
   FRAME[6] = u1y;
-  legCubic(CUBIC, 0, cx, cy, u0x, u0y, r + h, cx, cy, u1x, u1y, r + h, LOOP_LEG * r);
+  legCubic(CUBIC, 0, cx, cy, u0x, u0y, r + h, cx, cy, u1x, u1y, r + h, leg * r);
   return r;
 }
 
 /**
  * Trace the loop's centre line (the stroked, undirected loop), given its rim ends `(sx, sy)`, `(tx, ty)` and head
  * length `h` (`headLength(arrowSize)`, so the arrow loop runs along the same path): `moveTo(c)`, `lineTo(E0)`,
- * `bezierCurveTo(E0 + ℓ·u0, E1 + ℓ·u1, E1)`, `lineTo(c)`, with `E_k = c + (r + h)·u_k` and `ℓ = L·r`.
+ * `bezierCurveTo(E0 + ℓ·u0, E1 + ℓ·u1, E1)`, `lineTo(c)`, with `E_k = c + (r + h)·u_k` and `ℓ = leg·r`.
  */
-export function traceLoop(ctx: Pick<DropContext, "moveTo" | "lineTo" | "bezierCurveTo">, sx: number, sy: number, tx: number, ty: number, h: number): void {
-  if (solveLoop(sx, sy, tx, ty, h) === 0) return;
+export function traceLoop(ctx: Pick<DropContext, "moveTo" | "lineTo" | "bezierCurveTo">, sx: number, sy: number, tx: number, ty: number, h: number, leg = LOOP_LEG): void {
+  if (solveLoop(sx, sy, tx, ty, h, leg) === 0) return;
   const cx = FRAME[0] ?? 0, cy = FRAME[1] ?? 0;
   ctx.moveTo(cx, cy);
   ctx.lineTo(CUBIC[0] ?? 0, CUBIC[1] ?? 0);
@@ -148,10 +149,10 @@ function writeLoopEdges(out: PointBuffer, o: number, m: number, first: number, s
  * leg and `samples` points on the cubic to `E1`; the left barb `E1 + hw·n`, the tip `T = c + r·u1` on the rim, the
  * right barb `E1 − hw·n` (`n = perp(−u1)`, `hw` = `headHalfWidth(width)`); the right edge (`−width/2`) back to `c`. The
  * head's base is on `E1 = c + (r + h)·u1`, so the shaft's end corners land on it. `h` = `headLength(arrowSize)`.
- * Writes `2·(2·samples + 5)` numbers at `o`; returns the point count `2·samples + 5` (0 for coincident ends).
+ * Writes `2·(2·samples + 5)` numbers at `o`; returns the point count `2·samples + 5` (0 for coincident ends). `leg` = L.
  */
-export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, h: number, samples: number): number {
-  const r = solveLoop(sx, sy, tx, ty, h);
+export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, h: number, samples: number, leg = LOOP_LEG): number {
+  const r = solveLoop(sx, sy, tx, ty, h, leg);
   if (r === 0) return 0;
   const m = Math.max(2, samples | 0);
   writeLoopEdges(out, o, m, width / 2, -width / 2, 2 * m + 4);
@@ -173,10 +174,10 @@ export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: nu
  * itself) and `+width` (the outer edge, on the loop's outside). The inner edge runs `c → E0 → (cubic) → E1` (points
  * `0 … samples`), then the tip `T = c + r·u1` on the rim, the barb `E1 + (width + 2√width)·n` (`n = perp(−u1)`), and
  * the outer edge back from `E1 + width·n` to `c + width·perp(u0)`. Head length `h` = {@link loopHalfHeadLength}.
- * Writes `2·(2·samples + 4)` numbers at `o`; returns the point count `2·samples + 4` (0 for coincident ends).
+ * Writes `2·(2·samples + 4)` numbers at `o`; returns the point count `2·samples + 4` (0 for coincident ends). `leg` = L.
  */
-export function loopHalfArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, samples: number): number {
-  const r = solveLoop(sx, sy, tx, ty, loopHalfHeadLength(width));
+export function loopHalfArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, samples: number, leg = LOOP_LEG): number {
+  const r = solveLoop(sx, sy, tx, ty, loopHalfHeadLength(width), leg);
   if (r === 0) return 0;
   const m = Math.max(2, samples | 0);
   writeLoopEdges(out, o, m, 0, width, 2 * m + 3);
@@ -197,65 +198,3 @@ export function traceOutline(ctx: Pick<DropContext, "moveTo" | "lineTo" | "close
   for (let i = 1; i < n; i++) ctx.lineTo((pts[2 * i] ?? 0) * scale, (pts[2 * i + 1] ?? 0) * scale);
   ctx.closePath();
 }
-
-// ---------------------------------------------------------------------------------------------------------------
-// WebGL (#505 drop, pending the #542 WebGL step): the loop lanes still draw the old centre-to-centre drop cubic from
-// the GLSL below and these constants. The WebGL step replaces this whole block with the {@link legCubic} loop above.
-// ---------------------------------------------------------------------------------------------------------------
-
-/** The old drop's control distance from the centre, in node radii (WebGL lanes only, see the block note). */
-export const DROP_LENGTH = 3.75;
-/** The old drop's control reach beyond the rim, in node radii: the value the drop lanes read from `bends`. */
-export const DROP_REACH = DROP_LENGTH - 1;
-/** The old half-arrow drop's fitted outer control offsets, per unit width (WebGL lane only, see the block note). */
-export const DROP_OUTER_ALONG = 2.35;
-/** See {@link DROP_OUTER_ALONG}. */
-export const DROP_OUTER_ACROSS = 0.74;
-
-const f = (x: number): string => x.toPrecision(9);
-
-/**
- * GLSL for the drop line lane: from `src` / `tgt` (the projected or world rim ends), the chord `d` taken from the end
- * offsets (exact: both centres are one point) and `a_bend` = reach, the sample `p` and tangent `tang` at `t` of the
- * cubic from the centre `cc` back to it.
- * Replaces the quadratic of the ordinary line lane; the ordinary lane's program is untouched.
- */
-export const DROP_LINE_GLSL = `
-  vec2 h = 0.5 * (a_targetOffset - a_sourceOffset);
-  vec2 n = vec2(-h.y, h.x) * ${f(DROP_COT)};
-  vec2 c1 = src + a_bend * (n - h);
-  vec2 c2 = tgt + a_bend * (n + h);
-  vec2 cc = src - (n - h);
-  float u = 1.0 - t;
-  vec2 p = (u * u * u + t * t * t) * cc + 3.0 * u * u * t * c1 + 3.0 * u * t * t * c2;
-  vec2 tang = 3.0 * u * u * (c1 - cc) + 6.0 * u * t * (c2 - c1) + 3.0 * t * t * (cc - c2);`;
-
-/**
- * GLSL for the drop half-arrow lane: from `p0` / `p1` (the two rim ends; `p0` is moved to the centre, where the
- * glyph starts), `width` and `a_bend` = reach, the named
- * anchors of the half-arrow template and the two edge cubics (the old drop, see the block note).
- */
-export const DROP_HALF_ARROW_GLSL = `
-  vec2 h = 0.5 * (a_targetOffset - a_sourceOffset);
-  vec2 n = vec2(-h.y, h.x) * ${f(DROP_COT)};
-  vec2 a0 = n - h;
-  vec2 a3 = n + h;
-  float r = length(a3);
-  vec2 u0 = a0 / r;
-  vec2 u3 = a3 / r;
-  vec2 o0 = vec2(-u0.y, u0.x);
-  vec2 o3 = vec2(u3.y, -u3.x);
-  float tipLength = min(a_bend * r * 0.5, 10.0 * pow(width, 1.0 / 3.0));
-  float tipWidth = 2.0 * sqrt(width);
-  vec2 c1 = p0 + a_bend * a0;
-  vec2 c2 = p1 + a_bend * a3;
-  p0 -= a0;
-  vec2 x02 = p0;
-  vec2 x03 = p0 + width * o0;
-  vec2 x04 = x03;
-  vec2 x11 = p1;
-  vec2 x12 = p1 + tipLength * u3;
-  vec2 x13 = x12 + width * o3;
-  vec2 x14 = x13 + tipWidth * o3;
-  vec2 cp1 = c1 + width * (${f(DROP_OUTER_ALONG)} * u0 + ${f(DROP_OUTER_ACROSS)} * o0);
-  vec2 cp2 = c2 + width * (${f(DROP_OUTER_ALONG)} * u3 + ${f(DROP_OUTER_ACROSS)} * o3);`;

@@ -4,7 +4,6 @@
  * texelFetch + textureSize (recolor = texture update, no geometry change). A
  * parallel R8 flags texture culls hidden drawables (visible flag in bit 0).
  */
-import { DROP_LINE_GLSL, DROP_HALF_ARROW_GLSL } from "../core/loop-drop.js";
 
 // Shader-driven selection/hover highlight for the instanced lanes (#162). Injected into each instanced
 // vertex shader: per-instance `a_group` (node id / link source id) + `a_selected` (0/1), and uniforms
@@ -364,8 +363,6 @@ const QUADRATIC_LINE_GLSL = `
   vec2 p = u * u * src + 2.0 * u * t * ctrl + t * t * tgt;  // B(t)
   vec2 tang = 2.0 * u * (ctrl - src) + 2.0 * t * (tgt - ctrl); // B'(t)`;
 export const INSTANCED_LINE_VS = lineVS(QUADRATIC_LINE_GLSL);
-/** The self-link drop's lane (#505): the line lane with the drop cubic for the quadratic, for the loop layers only. */
-export const DROP_LINE_VS = lineVS(DROP_LINE_GLSL);
 
 // INSTANCED_HEAD_LINE_VS — a line WITH its arrowhead as one instance (#542): the whole arrow is one strip.
 // The twin of `core/arrowhead.ts` `arrowOutline`: the tip sits `a_radius` back from the target along the
@@ -432,6 +429,73 @@ function headLineVS(vs: string): string {
 }
 
 export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
+
+// INSTANCED_LOOP_VS — the self-link loop (#505, #542) as one instance of the line lane: the GLSL twin of
+// `core/loop-drop.ts` (`traceLoop`, `loopArrowOutline`, `loopHalfArrowOutline`), every variant one strip.
+// The loop's two rim ends are its centre plus the end offsets (`sourceOffsets` / `targetOffsets`, size units, any
+// #509 node offset in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
+// T − c = n + D/2 = r·u1. The centre curve is c → E0, the cubic E0, E0 + ℓ·u0, E1 + ℓ·u1, E1 (E_k = c + (r + h)·u_k,
+// ℓ = a_bend·r: `a_bend` is the leg L in node radii), then the variant's end. The template (`loopTemplate`):
+// (−1, ±1) the pair at c with the straight leg's normal ⟂(u0); (t ∈ [0, 1], ±1) the cubic; then the end —
+// undirected (4, ±1) the pair back at c; arrow (2, 1) left barb, (2, −1) right barb, (3, 0) tip (as
+// `headLineTemplate`); half-arrow (3, 0) tip, (2, 1) barb (the last pair, tip and barb: two triangles that tile the
+// one-sided head). Each edge sits `off` along ⟂(travel), the loop's outside: ±w/2 (line), 0 / +w (half-arrow, whose
+// head length is 10·∛w; the line style's is 2·u_arrowSize). The tip is on the rim, T = c + r·u1.
+const LOOP_DECL = `
+uniform float u_arrowSize;  // the line-style head length is 2·u_arrowSize, the undirected loop's too (#542)
+uniform float u_loopCot;    // cot α: recovers the loop's centre from its two rim ends
+uniform float u_loopHalf;   // 1 = the half-arrow band (edges 0 / +w, one-sided head), 0 = the line (±w/2)`;
+const LOOP_BODY = `  float t = a_corner.x;
+  float side = a_corner.y;
+  bool screen = u_screen > 0.5;
+  bool halfArrow = u_loopHalf > 0.5;
+  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
+  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
+  vec2 hd = 0.5 * (a_targetOffset - a_sourceOffset);       // D/2, exact: the two centres are one point
+  vec2 nd = vec2(-hd.y, hd.x) * u_loopCot;
+  vec2 a0 = nd - hd;                                        // S − c = r·u0
+  float r = length(a0);
+  float ir = r > 0.0 ? 1.0 / r : 0.0;                       // coincident ends: every point collapses onto c
+  vec2 u0 = a0 * ir;
+  vec2 u1 = (nd + hd) * ir;
+  vec2 c = 0.5 * (src - a0 + tgt - (nd + hd));              // = S − r·u0 = T − r·u1
+  float off = halfArrow ? (side + 1.0) * 0.5 * a_width : side * 0.5 * a_width;
+  float h = halfArrow ? 10.0 * pow(a_width, 1.0 / 3.0) : 2.0 * u_arrowSize;
+  vec2 e1 = c + (r + h) * u1;                               // E1, the head's base centre
+  vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the end's normal
+  vec2 pos;
+  if (t > 3.5) {
+    pos = c + un * off;                                     // the undirected loop's end, back at c
+  } else if (t > 2.5) {
+    pos = c + r * u1;                                       // the tip, on the rim
+  } else if (t > 1.5) {
+    pos = e1 + un * (off + side * 2.0 * sqrt(a_width));     // a barb: barbOverhang past its edge
+  } else if (t < -0.5) {
+    pos = c + vec2(-u0.y, u0.x) * off;                      // the start, at c
+  } else {
+    vec2 e0 = c + (r + h) * u0;
+    float leg = a_bend * r;
+    vec2 p1 = e0 + leg * u0;
+    vec2 p2 = e1 + leg * u1;
+    float u = 1.0 - t;
+    vec2 p = u * u * u * e0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * e1;
+    vec2 g = u * u * (p1 - e0) + 2.0 * u * t * (p2 - p1) + t * t * (e1 - p2); // B'(t)/3
+    float gl = length(g);
+    vec2 n = gl > 0.0 ? vec2(-g.y, g.x) / gl : un;
+    pos = p + n * off;
+  }
+  gl_Position = screen
+    ? vec4(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0, 0.0, 1.0)
+    : vec4((u_transform * vec3(pos, 1.0)).xy, 0.0, 1.0);
+}`;
+
+function loopVS(vs: string): string {
+  const at = vs.indexOf("  float t = a_corner.x;");
+  if (at < 0 || !vs.includes("\nin float a_bend;")) throw new Error("loopVS: unexpected line shader");
+  return vs.slice(0, at).replace("\nin float a_bend;", `${LOOP_DECL}\nin float a_bend;`) + LOOP_BODY;
+}
+
+export const INSTANCED_LOOP_VS = loopVS(INSTANCED_LINE_VS);
 
 // INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
 // One triangle per instance: per-vertex a_tri = (back, across), tip (0,0); the symmetric template
@@ -524,10 +588,6 @@ vec2 bez(vec2 p0, vec2 c, vec2 p2, float t) {
   float u = 1.0 - t;
   return u * u * p0 + 2.0 * u * t * c + t * t * p2;
 }
-vec2 cub(vec2 p0, vec2 c1, vec2 c2, vec2 p3, float t) {
-  float u = 1.0 - t;
-  return u * u * u * p0 + 3.0 * u * u * t * c1 + 3.0 * u * t * t * c2 + t * t * t * p3;
-}
 vec2 worldToPx(vec2 w) {
   vec2 clip = (u_transform * vec3(w, 1.0)).xy;
   return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
@@ -605,8 +665,6 @@ const QUADRATIC_HALF_ARROW_GLSL = `
   vec2 x13 = x12 + width * left1;
   vec2 x14 = x13 + tipWidth * left1;`;
 export const INSTANCED_HALF_ARROW_VS = halfArrowVS(QUADRATIC_HALF_ARROW_GLSL, "bez(x02, cp1, x12, t)", "bez(x03, cp2, x13, t)");
-/** The self-link drop's half-arrow lane (#505), for the loop layer only. */
-export const DROP_HALF_ARROW_VS = halfArrowVS(DROP_HALF_ARROW_GLSL, "cub(x02, c1, c2, x12, t)", "cub(x03, cp1, cp2, x13, t)");
 
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space

@@ -229,6 +229,54 @@ describe("self-link loops (#505)", () => {
   });
 });
 
+/** The red mask of a rendered frame over the loop's box (1 = link colour at ≥ half coverage), at the frame's own scale. */
+async function frameRedMask(png: string): Promise<Uint8Array> {
+  const img = new Image();
+  img.src = png;
+  await img.decode();
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = W;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("no 2d context");
+  ctx.drawImage(img, 0, 0, W, W);
+  const x0 = Math.floor(APEX_X - 8), y0 = CY - 24;
+  const d = ctx.getImageData(x0, y0, CX - x0, 48).data;
+  const out = new Uint8Array(d.length / 4);
+  for (let i = 0; i < out.length; i++) out[i] = (d[4 * i] ?? 0) > 180 && (d[4 * i + 1] ?? 0) < 90 && (d[4 * i + 2] ?? 0) < 90 && (d[4 * i + 3] ?? 0) > 127 ? 1 : 0;
+  return out;
+}
+
+describe("self-link loops: WebGL draws the Canvas Scene's shape (#542)", () => {
+  for (const sizeMode of SIZE_MODES)
+    for (const v of [{ directed: false }, { directed: true }, { directed: true, linkStyle: "half-arrow" as const }])
+      it(`${sizeMode} / ${v.directed ? (v.linkStyle ?? "line") : "undirected"}: the GPU loop covers the Canvas loop's pixels`, async () => {
+        const gl = await draw({ backend: "webgl", sizeMode, ...v });
+        const cv = await draw({ backend: "canvas", sizeMode, ...v });
+        const ma = await frameRedMask(gl.toPNG());
+        const mb = await frameRedMask(cv.toPNG());
+        gl.destroy();
+        cv.destroy();
+        // A pixel one mask lights is off by more than antialiasing when the other lights none of its 3 × 3
+        // neighbourhood: the Scene flattens its curves within a tolerance, the strip samples them, so their edges may
+        // differ by a pixel, never more.
+        const bw = CX - Math.floor(APEX_X - 8);
+        const near = (m: Uint8Array, i: number): boolean => {
+          const x = i % bw;
+          for (let dy = -1; dy <= 1; dy++)
+            for (let dx = -1; dx <= 1; dx++) if (x + dx >= 0 && x + dx < bw && m[i + dy * bw + dx] === 1) return true;
+          return false;
+        };
+        let red = 0, diff = 0;
+        for (let i = 0; i < ma.length; i++) {
+          red += mb[i] ?? 0;
+          if ((ma[i] === 1 && !near(mb, i)) || (mb[i] === 1 && !near(ma, i))) diff++;
+        }
+        expect(red, "the Canvas loop drew nothing (non-vacuity)").toBeGreaterThan(20);
+        expect(diff, `${diff} of ${red} loop pixels differ by more than a pixel`).toBe(0);
+      });
+});
+
 /** The red mask of an SVG document, rasterized, over the loop's box (1 = link colour). */
 async function svgRedMask(svg: string): Promise<Uint8Array> {
   const img = new Image();

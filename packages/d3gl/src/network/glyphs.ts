@@ -3080,7 +3080,7 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
-    if (s === t) continue; // #505: the loop's arrowhead is emitSelfLoopArrows'
+    if (s === t) continue; // #505: a directed loop is emitSelfLoopArrows' one outline, its head included (#542)
     const sx = graph.positions[s * 2]! * bake;
     const sy = graph.positions[s * 2 + 1]! * bake;
     const tx = graph.positions[t * 2]! * bake;

@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type LayerSpec, type NodeDragSession } from "../map/base-engine.js";
-import { emitSelfLoops, emitSelfLoopArrows, emitSelfLoopHalfArrows, updateSelfLoops, selfLoopOfEdge, selfLoopSelected, selfLoopLayers, selfLoopSubset, keptLeafLoops, makeKeptLoopsScratch, SELF_LOOP_LAYER, SELF_LOOP_ARROW_LAYER, type SelfLoopCache } from "./self-loops.js";
+import { emitSelfLoops, emitSelfLoopArrows, emitSelfLoopHalfArrows, updateSelfLoops, selfLoopOfEdge, selfLoopSelected, selfLoopLayers, selfLoopSubset, keptLeafLoops, makeKeptLoopsScratch, SELF_LOOP_LAYER, type SelfLoopCache } from "./self-loops.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrowLinks, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue, resolveNodeBorder, darkenedCss } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
@@ -844,14 +844,14 @@ const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
 /** The base lane's layers in draw order: the module-boundary rings above every link layer and below the nodes (#471). */
-const LAYER_NAMES = ["leaf-links", "links", "leaf-arrows", "arrows", SELF_LOOP_LAYER, SELF_LOOP_ARROW_LAYER, "module-boundaries", "node-halos", "nodes"] as const;
+const LAYER_NAMES = ["leaf-links", "links", "leaf-arrows", "arrows", SELF_LOOP_LAYER, "module-boundaries", "node-halos", "nodes"] as const;
 /** Base-lane layers the shader highlight (#162) drives — nodes + links (the leaf links too, #447), and the
  *  state-network physical view's pie wedges (#175), which dim/keep exactly like the node discs they sit on (no
  *  recolour). Not the aggregate halos, which carry no group/selected and so render un-dimmed. A name with no
  *  layer on the backend (no pie outside the physical view) is a no-op in `styleInstancedLayer`. The `both`
  *  view's physical containers (#315, #494) dim and keep like the pies: a container is kept while it or one of
  *  its state nodes is selected, and lit while it is hovered. */
-const HL_LAYERS = ["phys-container", "nodes", "leaf-links", "links", "leaf-arrows", "arrows", SELF_LOOP_LAYER, SELF_LOOP_ARROW_LAYER, "pie"] as const;
+const HL_LAYERS = ["phys-container", "nodes", "leaf-links", "links", "leaf-arrows", "arrows", SELF_LOOP_LAYER, "pie"] as const;
 /** The empty `hoverInstances` run (#476), shared: pushed after every base emit, so it must not allocate. */
 const NO_INSTANCES: [number, number] = [0, 0];
 /** The padding between a `both`-view physical node's edge and its outermost state node in screen mode (#509), in
@@ -4471,14 +4471,14 @@ export class Network extends BaseEngine {
 
   /** Flag every link layer (lines/half-arrows; not node circles) into the GPU pick pass (#141) when link
    *  picking is on. A directed line's head is part of its instance (#542), so a head pixel picks its link.
-   *  Mutates the freshly-built layers in place (they're per-emit, never shared). The self-link loops' layers
-   *  (#505) pick from `edgeCount` on, so their ids decode apart from the edges'. */
+   *  Mutates the freshly-built layers in place (they're per-emit, never shared). The self-link loops'
+   *  layer (#505) picks from `edgeCount` on, so its ids decode apart from the edges'. */
   private flagPickableLinks(layers: InstancedLayer[], edgeCount: number): InstancedLayer[] {
     if (this.pickLinksEnabled)
       for (const l of layers)
         if (l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") {
           l.pickable = true;
-          if (l.name === SELF_LOOP_LAYER || l.name === SELF_LOOP_ARROW_LAYER) l.pickBase = edgeCount;
+          if (l.name === SELF_LOOP_LAYER) l.pickBase = edgeCount;
         }
     return layers;
   }
@@ -4503,12 +4503,9 @@ export class Network extends BaseEngine {
         // `both` view (#494): a hovered container (id `stateCount + p`) keeps its state dots lit.
         const groups2 = this.bothGroups2();
         if (groups2) l.circles.groups2 = groups2;
-      } else if (l.name === SELF_LOOP_LAYER || l.name === SELF_LOOP_ARROW_LAYER) {
+      } else if (l.name === SELF_LOOP_LAYER) {
         // The self-link loops (#505): their groups (the loop's node) come with the layer; instance j = loop j.
-        const sel = this.noLodSelectedFor(SELF_LOOP_LAYER);
-        if (l.primitive === "lines") l.lines.selected = sel;
-        else if (l.primitive === "half-arrows") l.halfArrows.selected = sel;
-        else if (l.primitive === "arrows") l.arrows.selected = sel;
+        if (l.primitive === "lines") l.lines.selected = this.noLodSelectedFor(SELF_LOOP_LAYER);
       } else if (l.primitive === "lines" || l.primitive === "half-arrows") {
         // One set of columns per link: a directed line's head dims and lights with its shaft (#542).
         const link = l.primitive === "lines" ? l.lines : l.halfArrows;
@@ -4814,7 +4811,7 @@ export class Network extends BaseEngine {
       this.noLodSelectedNodes = out;
       return out;
     }
-    if (layer === SELF_LOOP_LAYER || layer === SELF_LOOP_ARROW_LAYER) {
+    if (layer === SELF_LOOP_LAYER) {
       // The loops (#505) follow their edge's flag (a loop's node is its source): O(S) on a selection change.
       const loops = this.noLodCache(graph, style).loops?.loops;
       const links = loops ? this.noLodSelectedFor(this.LINK_LAYER) : undefined;
@@ -5299,7 +5296,7 @@ export class Network extends BaseEngine {
     this.pendingOffsetChanges = null;
     for (const l of layers) {
       if (l.primitive === "circles" && l.name === this.NODE_LAYER && l.circles.offsets) l.circles.offsetsChanged = changes.nodes;
-      else if (l.name === SELF_LOOP_LAYER || l.name === SELF_LOOP_ARROW_LAYER) continue; // #505: the loops carry their own ranges
+      else if (l.name === SELF_LOOP_LAYER) continue; // #505: the loops carry their own ranges
       else if (l.primitive === "lines" && l.lines.sourceOffsets) l.lines.endOffsetsChanged = changes.links;
       else if (l.primitive === "half-arrows" && l.halfArrows.sourceOffsets) l.halfArrows.endOffsetsChanged = changes.links;
     }

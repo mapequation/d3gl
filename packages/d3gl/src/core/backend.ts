@@ -152,11 +152,18 @@ export interface InstancedCirclesData {
 /** SoA for a batch of instanced lines (e.g. network links); straight, or bent via {@link bends}. */
 export interface InstancedLinesData {
   /**
-   * `"drop"`: the self-link drop (#505, `core/loop-drop.ts`): a cubic from the source end to the target end whose
-   * end tangents pass through the node centre, with `bends` read as its control reach in node radii. A separate
-   * program, chosen per layer, so an ordinary link layer runs the quadratic lane unchanged. Absent = quadratic.
+   * `"drop"`: the self-link loop (#505, #542, `core/loop-drop.ts`): each instance is ONE loop on its node, given by
+   * its two rim ends (`sources` = `targets` = the node centre, plus {@link sourceOffsets} / {@link targetOffsets}),
+   * drawn on the settled link geometry: centre → `E0`, the leg cubic, `E1`, then {@link loopHead}'s end. `bends` is
+   * read as the leg `L` in node radii, and {@link arrowSize} sets the line style's head length `2·arrowSize` (the
+   * undirected loop's too, so it runs the arrow's path); the half-arrow's is `10·∛width`. A separate program, chosen
+   * per layer, so an ordinary link layer runs its lane unchanged. Absent = a link.
    */
   curve?: "drop";
+  /** `curve: "drop"` only (#542): the loop's end — absent: undirected (stroked), `"arrow"`: the line-style head, the
+   *  tip on the rim, `"half"`: the half-arrow band (one link width on the outside) and its one-sided head. A draw
+   *  setting like `samples`: a change recreates the layer. */
+  loopHead?: "arrow" | "half";
   /** [x, y] world source per line, length `2 * count`. */
   sources: Float32Array;
   /** [x, y] world target per line, length `2 * count`. */
@@ -180,6 +187,7 @@ export interface InstancedLinesData {
    * (`core/arrowhead.ts`): the tip sits {@link radii} back from the target along the curve's end tangent, the head
    * is `2·arrowSize` long and as wide as the half-arrow barb rule makes it. In the layer's size units, like the
    * widths. A draw setting like `samples`: turning the head on or off recreates the layer; absent ⇒ today's line.
+   * On a `curve: "drop"` layer it only sets the loop's head length (see {@link curve}); {@link loopHead} picks the end.
    */
   arrowSize?: number;
   /**
@@ -273,12 +281,6 @@ export interface InstancedArrowsData {
  * the target boundary, bowed around a shared centre curve (see network/half-link.ts). All world units.
  */
 export interface InstancedHalfArrowsData {
-  /**
-   * `"drop"`: the self-link drop (#505, `core/loop-drop.ts`): the drop filled as one half-arrow glyph, its tip on
-   * the rim at the target end, with `bends` read as its control reach in node radii. A separate
-   * program, chosen per layer, so an ordinary link layer runs the quadratic lane unchanged. Absent = quadratic.
-   */
-  curve?: "drop";
   /** [x, y] world source centre per link, length `2 * count`. */
   sources: Float32Array;
   /** [x, y] world target centre per link, length `2 * count`. */

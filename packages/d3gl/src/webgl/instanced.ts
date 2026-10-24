@@ -1,7 +1,8 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, DROP_LINE_VS, DROP_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, INSTANCED_LOOP_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
+import { DROP_COT } from "../core/loop-drop.js";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
 
 /** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
@@ -676,6 +677,30 @@ export function headLineTemplate(samples: number): Float32Array {
   return t;
 }
 
+/** A self-link loop layer's end (#542): the stroked undirected loop, the line-style arrow, or the half-arrow band. */
+export type LoopHead = "none" | "arrow" | "half";
+
+/** The loop variant of a `curve: "drop"` layer, null for an ordinary line layer: fixed per layer (template + uniform). */
+function loopHeadOf(data: InstancedLinesData): LoopHead | null {
+  return data.curve === "drop" ? (data.loopHead ?? "none") : null;
+}
+
+/**
+ * The self-link loop's strip (#542, `INSTANCED_LOOP_VS`): (−1, ±1) the pair at the node centre, the
+ * {@link lineTemplate} cubic samples, then the end — `"none"`: (4, ±1) the pair back at the centre (`2·M + 4`
+ * vertices); `"arrow"`: (2, 1) left barb, (2, −1) right barb, (3, 0) tip, as {@link headLineTemplate} (`2·M + 5`);
+ * `"half"`: (3, 0) tip, (2, 1) barb, whose two triangles off the last pair tile the one-sided head (`2·M + 4`).
+ */
+export function loopTemplate(samples: number, head: LoopHead): Float32Array {
+  const cubic = lineTemplate(samples);
+  const end = head === "none" ? [4, -1, 4, 1] : head === "arrow" ? [2, 1, 2, -1, 3, 0] : [3, 0, 2, 1];
+  const t = new Float32Array(4 + cubic.length + end.length);
+  t.set([-1, -1, -1, 1]);
+  t.set(cubic, 4);
+  t.set(end, 4 + cubic.length);
+  return t;
+}
+
 /** The value the radius attribute reads without a buffer: a WebGL constant attribute, shared and never written. */
 const ZERO_RADIUS = new Float32Array(1);
 
@@ -753,6 +778,8 @@ export class InstancedLines {
   private readonly headed: boolean;
   /** The target radii of a headed layer (#542); null on an unheaded one (no attribute, today's program). */
   private readonly radius: RadiusColumn | null;
+  /** A self-link loop layer's variant (#542, `curve: "drop"`); null on a link layer. Fixed per layer, like `headed`. */
+  private readonly loop: LoopHead | null;
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -761,11 +788,13 @@ export class InstancedLines {
     this._capacity = data.count;
     const samples = Math.max(2, (data.samples ?? 2) | 0);
     this._samples = samples;
-    this.headed = data.arrowSize !== undefined;
+    this.loop = loopHeadOf(data);
+    this.headed = this.loop === null && data.arrowSize !== undefined;
     this.radius = this.headed ? new RadiusColumn() : null;
-    const vs = this.headed ? INSTANCED_HEAD_LINE_VS : data.curve === "drop" ? DROP_LINE_VS : INSTANCED_LINE_VS;
-    const vertexCount = this.headed ? samples * 2 + 3 : samples * 2;
-    this.corner = device.createBuffer({ data: this.headed ? headLineTemplate(samples) : lineTemplate(samples) });
+    const template = this.loop ? loopTemplate(samples, this.loop) : this.headed ? headLineTemplate(samples) : lineTemplate(samples);
+    const vs = this.loop ? INSTANCED_LOOP_VS : this.headed ? INSTANCED_HEAD_LINE_VS : INSTANCED_LINE_VS;
+    const vertexCount = template.length / 2;
+    this.corner = device.createBuffer({ data: template });
     this.source = device.createBuffer({ data: data.sources });
     this.target = device.createBuffer({ data: data.targets });
     this.widthBuf = device.createBuffer({ data: data.widths });
@@ -783,6 +812,8 @@ export class InstancedLines {
       u_pickBase: 0,
       ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
       ...(this.headed ? { u_arrowSize: data.arrowSize ?? 0 } : {}),
+      // A loop's head length (`2·arrowSize`, line style), its centre solve (cot α) and its band (#542).
+      ...(this.loop ? { u_arrowSize: data.arrowSize ?? 0, u_loopCot: DROP_COT, u_loopHalf: this.loop === "half" ? 1 : 0 } : {}),
     };
     const bufferLayout = [
       { name: "a_corner", format: "float32x2" as const },
@@ -871,8 +902,10 @@ export class InstancedLines {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? 2) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
-    if ((data.arrowSize !== undefined) !== this.headed) return false; // head on/off changes the program (#542)
-    if (this.headed) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
+    const loop = loopHeadOf(data);
+    if (loop !== this.loop) return false; // a loop's variant changes its template (#542)
+    if ((loop === null && data.arrowSize !== undefined) !== this.headed) return false; // head on/off changes the program (#542)
+    if (this.headed || loop) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
@@ -1272,7 +1305,7 @@ export class InstancedHalfArrows {
       ...this.hl.attributes(),
     };
     this.model = new Model(device, {
-      vs: data.curve === "drop" ? DROP_HALF_ARROW_VS : INSTANCED_HALF_ARROW_VS,
+      vs: INSTANCED_HALF_ARROW_VS,
       fs: FILL_FS,
       bufferLayout,
       attributes,
@@ -1284,7 +1317,7 @@ export class InstancedHalfArrows {
     });
     if (pick) {
       this.pickModel = new Model(device, {
-        vs: data.curve === "drop" ? DROP_HALF_ARROW_VS : INSTANCED_HALF_ARROW_VS,
+        vs: INSTANCED_HALF_ARROW_VS,
         fs: PICK_FS,
         bufferLayout,
         attributes,
