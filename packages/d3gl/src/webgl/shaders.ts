@@ -386,17 +386,23 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
   float back = a_radius + len;                              // ρ
   // fadedBend (core/arrowhead.ts): a short link's bend fades towards the floor where an opposite pair's heads
   // just clear, x = min(0.99, 1.2·H/ρ), floor = ½·x/√(1 − x²), over smoothstep(2ρ, 4ρ, D).
+  float dl = length(d);
   float bend = a_bend;
-  if (a_bend != 0.0 && back > 0.0) {
-    float ab = abs(a_bend);
-    float hx = min(0.99, 1.2 * (hw + 2.0 * sqrt(a_width)) / back);
-    float floorBend = min(ab, 0.5 * hx / sqrt(1.0 - hx * hx));
-    float fade = smoothstep(2.0 * back, 4.0 * back, length(d));
-    bend = sign(a_bend) * (ab - (ab - floorBend) * (1.0 - fade));
+  float k = 1.0;                                            // √(1 + 4b²), b the faded bend
+  if (a_bend != 0.0) {
+    if (back > 0.0) {
+      float ab = abs(a_bend);
+      float hx = min(0.99, 1.2 * (hw + 2.0 * sqrt(a_width)) / back);
+      float floorBend = min(ab, 0.5 * hx / sqrt(1.0 - hx * hx));
+      float fade = smoothstep(2.0 * back, 4.0 * back, dl);
+      bend = sign(a_bend) * (ab - (ab - floorBend) * (1.0 - fade));
+    }
+    k = sqrt(1.0 + 4.0 * bend * bend);
   }
   // The legs (core/arrowhead.ts writeShaft): out of each centre towards the quadratic's control mid + ⟂d·bend.
   vec2 bp = 2.0 * bend * vec2(-d.y, d.x);
-  float ll = length(d + bp);                                // = |−d + 2b·⟂d|
+  // |±d + 2b·⟂d| = |d|·√(1 + 4b²) exactly (⟂d is perpendicular to d with its length): no third root.
+  float ll = dl * k;
   // Coincident ends (a self-link's edge, or two nodes at one point): no direction, so no arrow, as the TS twin
   // (writeShaft returns 0). Every vertex collapses onto src: a zero-area strip, never a NaN vertex.
   if (!(ll > 0.0)) {
@@ -425,7 +431,7 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
     bool settled = back < 0.5 * ll;
     vec2 l0 = settled ? (d + bp) / ll : v;
     vec2 l1 = settled ? u1 : -v;
-    float leg = settled ? chord * sqrt(1.0 + 4.0 * bend * bend) / 3.0 : chord / 3.0;
+    float leg = settled ? chord * k / 3.0 : chord / 3.0;
     vec2 p1 = src + leg * l0;
     vec2 p2 = base + leg * l1;
     float u = 1.0 - t;
