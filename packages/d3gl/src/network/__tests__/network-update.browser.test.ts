@@ -104,8 +104,8 @@ describe("network.update({ flow, modules, moduleLinks }) (#547)", () => {
     const net = await shown(graph(), MODULES, undefined, true);
     expect(net.pick(150, 150)).toMatchObject({ datum: { aggregate: true, count: 4 } });
     net.update({ modules: PAIRS, moduleLinks: LINKS });
+    expect(net.pick(30, 20)).toMatchObject({ datum: { aggregate: true, count: 2 } }); // builds the deferred tree
     expect(net.lodSource).toBe("modules");
-    expect(net.pick(30, 20)).toMatchObject({ datum: { aggregate: true, count: 2 } });
     expect(pathOf(net.pick(30, 20))).toEqual([1]);
     expect(pathOf(net.pick(150, 160))).toEqual([4]);
     net.destroy();
@@ -141,6 +141,34 @@ describe("network.update({ flow, modules, moduleLinks }) (#547)", () => {
     // The camera holds: node 0 (world 20, 20) is still drawn at screen 2·20 − 10, 2·20 − 20.
     expect(net.pick(30, 20)).toMatchObject({ id: 0 });
     expect(net.pick(140, 140)).toBeNull(); // node 4's place at k = 1: empty at k = 2
+    net.destroy();
+  });
+
+  it("new modules drop a selected module of the old ones and keep the selected nodes; the hover is cleared", async () => {
+    const net = await shown(graph(), MODULES, undefined, true);
+    const el = document.body.lastElementChild as HTMLElement;
+    net.interactive({ selectable: { multi: true }, hover: true });
+    const module = net.pick(150, 150);
+    expect(module).toMatchObject({ datum: { aggregate: true } });
+    const ids = (): number[] => net.selection().map((h) => h.id as number).sort((a, b) => a - b);
+    const both = [0, module?.id as number].sort((a, b) => a - b);
+    const seen: number[][] = [];
+    net.on("select", (hits) => seen.push(hits.map((h) => h.id as number).sort((a, b) => a - b)));
+    net.select("nodes", both);
+    net.update({ flow: FLOW });
+    expect(ids(), "the same modules: the module stays selected").toEqual(both);
+    net.update({ modules: PAIRS });
+    expect(ids(), "a module of the old modules is dropped, a node stays").toEqual([0]);
+    expect(seen.at(-1), "the selection left is announced").toEqual([0]);
+    // The hover is cleared, its tooltip with it, as lump() clears it.
+    net.interactive({ selectable: { multi: true }, hover: true, tooltip: () => "hovered" });
+    const r = el.getBoundingClientRect();
+    el.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 150, clientY: r.top + 150, bubbles: true }));
+    await frames(2);
+    const tip = (): string | undefined => el.querySelector<HTMLElement>(".d3gl-tooltip")?.style.display;
+    expect(tip(), "the tooltip shows while hovered").not.toBe("none");
+    net.update({ flow: FLOW });
+    expect(tip(), "update() cleared the hover").toBe("none");
     net.destroy();
   });
 
