@@ -2,8 +2,8 @@ import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
 import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_HALF_ARROW_VS, INSTANCED_LOOP_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import { DROP_COT } from "../core/loop-drop.js";
-import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
+import { loopStubLength, loopsSpreadCot } from "../core/loop-drop.js";
+import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedHalfArrowsData, InstancedLoopsData, InstancedHighlight } from "../core/index.js";
 
 /** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
  *  `groups2` is the link's OTHER endpoint (target), so an undirected hover matches incident links on either
@@ -684,9 +684,29 @@ export function headLineTemplate(samples: number): Float32Array {
  */
 export type LinkHead = "none" | "arrow" | "half";
 
-/** The line lane's columns: a `lines` layer's, an `arrows` layer's (with `radii`), or a `half-arrows` loop layer's,
- *  read as a line's (one width per loop). */
-export type LineLaneData = InstancedLinesData & { radii?: Float32Array };
+/** The line lane's columns: a `lines` layer's, or an `arrows` layer's (with `radii` and `arrowSize`). A `loops`
+ *  layer's are read into this shape by {@link loopLaneColumns}. */
+export type LineLaneData = InstancedLinesData & { radii?: Float32Array; arrowSize?: number };
+
+/** A `loops` layer's columns as the line program reads them (#542): the node centre at both ends, the rim ends as the
+ *  end offsets, the legs as the bends. Refilled IN PLACE on each update of the layer (`out`), so a loop frame
+ *  allocates nothing; the arrays are the layer's own. */
+function loopLaneColumns(d: InstancedLoopsData, out?: LineLaneData): LineLaneData {
+  if (!out) return { sources: d.centers, targets: d.centers, widths: d.widths, colors: d.colors, bends: d.legs, samples: d.samples, groups: d.groups, selected: d.selected, sourceOffsets: d.startOffsets, targetOffsets: d.endOffsets, endOffsetsChanged: d.offsetsChanged, count: d.count };
+  out.sources = d.centers;
+  out.targets = d.centers;
+  out.widths = d.widths;
+  out.colors = d.colors;
+  out.bends = d.legs;
+  out.samples = d.samples;
+  out.groups = d.groups;
+  out.selected = d.selected;
+  out.sourceOffsets = d.startOffsets;
+  out.targetOffsets = d.endOffsets;
+  out.endOffsetsChanged = d.offsetsChanged;
+  out.count = d.count;
+  return out;
+}
 
 /**
  * The self-link loop's strip (#542, `INSTANCED_LOOP_VS`): (−1, ±1) the pair at the node centre, the
@@ -783,18 +803,25 @@ export class InstancedLines {
   private readonly headed: boolean;
   /** The target radii of a headed layer (#542); null on an unheaded one (no attribute, today's program). */
   private readonly radius: RadiusColumn | null;
-  /** A self-link loop layer's variant (#542, `curve: "drop"`); null on a link layer. Fixed per layer, like `headed`. */
+  /** A `loops` layer's head (#542); null on a link layer. Fixed per layer, like `headed`. */
   private readonly loop: LinkHead | null;
+  /** A `loops` layer's columns in the line program's shape ({@link loopLaneColumns}), refilled per update; null on a
+   *  link layer. Its two ends are one centre, so `target` is `source` (one buffer, one upload). */
+  private readonly loopColumns: LineLaneData | null;
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
-  constructor(device: Device, data: LineLaneData, width = 0, height = 0, pick = false, head: LinkHead = "none") {
+  /** A link layer (`lines`, or `arrows` with `head: "arrow"`), or a `loops` layer, whose own `head` then applies. */
+  constructor(device: Device, input: LineLaneData | InstancedLoopsData, width = 0, height = 0, pick = false, head: LinkHead = "none") {
+    const loops = "centers" in input ? input : null;
+    const data = "centers" in input ? loopLaneColumns(input) : input;
+    this.loopColumns = loops ? data : null;
     this.count = data.count;
     this._capacity = data.count;
     const samples = Math.max(2, (data.samples ?? 2) | 0);
     this._samples = samples;
-    this.head = head;
-    this.loop = data.curve === "drop" ? head : null;
+    this.head = loops ? loops.head : head;
+    this.loop = loops ? loops.head : null;
     this.headed = this.loop === null && head === "arrow";
     this.radius = this.headed ? new RadiusColumn() : null;
     const template = this.loop ? loopTemplate(samples, this.loop) : this.headed ? headLineTemplate(samples) : lineTemplate(samples);
@@ -802,7 +829,7 @@ export class InstancedLines {
     const vertexCount = template.length / 2;
     this.corner = device.createBuffer({ data: template });
     this.source = device.createBuffer({ data: data.sources });
-    this.target = device.createBuffer({ data: data.targets });
+    this.target = loops ? this.source : device.createBuffer({ data: data.targets });
     this.widthBuf = device.createBuffer({ data: data.widths });
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ straight (control on the chord).
@@ -818,8 +845,8 @@ export class InstancedLines {
       u_pickBase: 0,
       ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
       ...(this.headed ? { u_arrowSize: data.arrowSize ?? 0 } : {}),
-      // A loop's head length (`2·arrowSize`, line style), its centre solve (cot α) and its band (#542).
-      ...(this.loop ? { u_arrowSize: data.arrowSize ?? 0, u_loopCot: data.loopCot ?? DROP_COT, u_loopHalf: this.loop === "half" ? 1 : 0 } : {}),
+      // A loop's straight pieces past the rim (`h`), its centre solve (cot α) and its band (#542).
+      ...(loops ? { u_loopStub: loopStubLength(loops), u_loopCot: loopsSpreadCot(loops.spread), u_loopHalf: loops.head === "half" ? 1 : 0 } : {}),
     };
     const bufferLayout = [
       { name: "a_corner", format: "float32x2" as const },
@@ -904,25 +931,32 @@ export class InstancedLines {
    * The pick model tracks the same instance buffers (shared references), so endpoint moves are
    * automatically reflected in the pick pass — ids/count are unchanged, only positions moved.
    */
-  update(device: Device, data: LineLaneData, head: LinkHead = "none"): boolean {
+  update(device: Device, input: LineLaneData | InstancedLoopsData, head: LinkHead = "none"): boolean {
+    // A link layer and a loop layer run different programs and templates, as do two heads (#542): recreate.
+    let data: LineLaneData;
+    if ("centers" in input) {
+      if (!this.loopColumns || input.head !== this.loop) return false;
+      data = loopLaneColumns(input, this.loopColumns);
+      this.uniforms["u_loopStub"] = loopStubLength(input);
+      this.uniforms["u_loopCot"] = loopsSpreadCot(input.spread);
+    } else {
+      if (this.loopColumns || head !== this.head) return false;
+      data = input;
+      if (this.headed) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
+    }
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? 2) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
-    if (head !== this.head) return false; // the primitive picks the program and template (#542)
-    const loop = data.curve === "drop" ? head : null;
-    if (loop !== this.loop) return false; // loop on/off changes the template (#542)
-    if (this.headed || loop) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
-    if (loop) this.uniforms["u_loopCot"] = data.loopCot ?? DROP_COT;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
-      this.target.destroy();
+      if (this.target !== this.source) this.target.destroy();
       this.widthBuf.destroy();
       this.color.destroy();
       this.bend.destroy();
       this._capacity = grownCapacity(data.count, this._capacity);
       this.source = grownBuffer(device, data.sources, data.count, this._capacity);
-      this.target = grownBuffer(device, data.targets, data.count, this._capacity);
+      this.target = this.loopColumns ? this.source : grownBuffer(device, data.targets, data.count, this._capacity);
       this.widthBuf = grownBuffer(device, data.widths, data.count, this._capacity);
       this.color = grownBuffer(device, data.colors, data.count, this._capacity);
       this.bend = grownBuffer(device, data.bends ?? new Float32Array(data.count), data.count, this._capacity);
@@ -952,7 +986,7 @@ export class InstancedLines {
       // Sub-update: endpoints are freshly allocated each frame ⇒ always upload; style-derived buffers
       // (widths/colours/bends) skip when their array reference is unchanged (the position-only fast path, #179).
       this.source.write(data.sources);
-      this.target.write(data.targets);
+      if (this.target !== this.source) this.target.write(data.targets);
       this._lastWidths = writeIfChanged(this.widthBuf, data.widths, this._lastWidths);
       this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
       if (data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
@@ -978,7 +1012,7 @@ export class InstancedLines {
     this.pickModel?.destroy();
     this.corner.destroy();
     this.source.destroy();
-    this.target.destroy();
+    if (this.target !== this.source) this.target.destroy();
     this.widthBuf.destroy();
     this.color.destroy();
     this.bend.destroy();

@@ -4487,9 +4487,10 @@ export class Network extends BaseEngine {
   private flagPickableLinks(layers: InstancedLayer[], edgeCount: number): InstancedLayer[] {
     if (this.pickLinksEnabled)
       for (const l of layers)
-        if (l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") {
+        if (l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") l.pickable = true;
+        else if (l.primitive === "loops") {
           l.pickable = true;
-          if (l.name === SELF_LOOP_LAYER) l.pickBase = edgeCount;
+          l.pickBase = edgeCount;
         }
     return layers;
   }
@@ -4514,10 +4515,9 @@ export class Network extends BaseEngine {
         // `both` view (#494): a hovered container (id `stateCount + p`) keeps its state dots lit.
         const groups2 = this.bothGroups2();
         if (groups2) l.circles.groups2 = groups2;
-      } else if (l.name === SELF_LOOP_LAYER) {
+      } else if (l.primitive === "loops") {
         // The self-link loops (#505): their groups (the loop's node) come with the layer; instance j = loop j.
-        const loops = l.primitive === "lines" ? l.lines : l.primitive === "arrows" ? l.arrows : l.primitive === "half-arrows" ? l.halfArrows : null;
-        if (loops) loops.selected = this.noLodSelectedFor(SELF_LOOP_LAYER);
+        l.loops.selected = this.noLodSelectedFor(SELF_LOOP_LAYER);
       } else if (l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") {
         // One set of columns per link: a whole arrow's head dims and lights with its shaft (#542).
         const link = l.primitive === "lines" ? l.lines : l.primitive === "arrows" ? l.arrows : l.halfArrows;
@@ -5301,14 +5301,13 @@ export class Network extends BaseEngine {
   }
 
   /** Hand the next no-LOD emit the offset ranges a state node drag rewrote in place (#509), once: on the node
-   *  circles and on every link layer that carries end offsets. O(layers). */
+   *  circles and on every link layer that carries end offsets (the `loops` layer carries its own, #505). O(layers). */
   private attachOffsetChanges(layers: InstancedLayer[]): void {
     const changes = this.pendingOffsetChanges;
     if (!changes) return;
     this.pendingOffsetChanges = null;
     for (const l of layers) {
       if (l.primitive === "circles" && l.name === this.NODE_LAYER && l.circles.offsets) l.circles.offsetsChanged = changes.nodes;
-      else if (l.name === SELF_LOOP_LAYER) continue; // #505: the loops carry their own ranges
       else if (l.primitive === "lines" && l.lines.sourceOffsets) l.lines.endOffsetsChanged = changes.links;
       else if (l.primitive === "arrows" && l.arrows.sourceOffsets) l.arrows.endOffsetsChanged = changes.links;
       else if (l.primitive === "half-arrows" && l.halfArrows.sourceOffsets) l.halfArrows.endOffsetsChanged = changes.links;

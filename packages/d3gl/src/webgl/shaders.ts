@@ -442,17 +442,18 @@ export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
 
 // INSTANCED_LOOP_VS — the self-link loop (#505, #542) as one instance of the line lane: the GLSL twin of
 // `core/loop-drop.ts` (`traceLoop`, `loopArrowOutline`, `loopHalfArrowOutline`), every variant one strip.
-// The loop's two rim ends are its centre plus the end offsets (`sourceOffsets` / `targetOffsets`, size units, any
-// #509 node offset in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
+// A `loops` layer (`InstancedLoopsData`) on the lane: `a_source` = `a_target` its node centre (one buffer), and its
+// two rim ends are that centre plus the end offsets (`startOffsets` / `endOffsets`, size units, any #509 node offset
+// in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
 // T − c = n + D/2 = r·u1. The centre curve is c → E0, the cubic E0, E0 + ℓ·u0, E1 + ℓ·u1, E1 (E_k = c + (r + h)·u_k,
-// ℓ = a_bend·r: `a_bend` is the leg L in node radii), then the variant's end. The template (`loopTemplate`):
+// ℓ = a_bend·r: `a_bend` is the layer's `legs`, L in node radii), then the variant's end. The template (`loopTemplate`):
 // (−1, ±1) the pair at c with the straight leg's normal ⟂(u0); (t ∈ [0, 1], ±1) the cubic; then the end —
 // undirected (4, ±1) the pair back at c; arrow (2, 1) left barb, (2, −1) right barb, (3, 0) tip (as
 // `headLineTemplate`); half-arrow (3, 0) tip, (2, 1) barb (the last pair, tip and barb: two triangles that tile the
 // one-sided head). Each edge sits `off` along ⟂(travel), the loop's outside: ±w/2 (line), 0 / +w (half-arrow, whose
-// head length is 10·∛w; the line style's is 2·u_arrowSize). The tip is on the rim, T = c + r·u1.
+// head length is 10·∛w; otherwise h = u_loopStub). The tip is on the rim, T = c + r·u1.
 const LOOP_DECL = `
-uniform float u_arrowSize;  // the line-style head length is 2·u_arrowSize, the undirected loop's too (#542)
+uniform float u_loopStub;   // h: the straight pieces past the rim (the stub, or the arrowhead's length, #542)
 uniform float u_loopCot;    // cot α: recovers the loop's centre from its two rim ends
 uniform float u_loopHalf;   // 1 = the half-arrow band (edges 0 / +w, one-sided head), 0 = the line (±w/2)`;
 const LOOP_BODY = `  float t = a_corner.x;
@@ -470,7 +471,7 @@ const LOOP_BODY = `  float t = a_corner.x;
   vec2 u1 = (nd + hd) * ir;
   vec2 c = 0.5 * (src - a0 + tgt - (nd + hd));              // = S − r·u0 = T − r·u1
   float off = halfArrow ? (side + 1.0) * 0.5 * a_width : side * 0.5 * a_width;
-  float h = halfArrow ? 10.0 * pow(a_width, 1.0 / 3.0) : 2.0 * u_arrowSize;
+  float h = halfArrow ? 10.0 * pow(a_width, 1.0 / 3.0) : u_loopStub;
   vec2 e1 = c + (r + h) * u1;                               // E1, the head's base centre
   vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the end's normal
   vec2 pos;

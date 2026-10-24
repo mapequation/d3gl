@@ -6,13 +6,14 @@ import type {
   InstancedLinesData,
   InstancedArrowsData,
   InstancedHalfArrowsData,
+  InstancedLoopsData,
   VectorLayer,
 } from "./backend.js";
 import { PathRecorder } from "./path-recorder.js";
 import { arrowOutline, headLength } from "./arrowhead.js";
 import { DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
-import { DROP_COT, LOOP_LEG, loopArrowOutline, loopHalfArrowOutline, traceLoop, traceOutline } from "./loop-drop.js";
+import { LOOP_LEG, loopArrowOutline, loopHalfArrowOutline, loopStubLength, loopsSpreadCot, traceLoop, traceOutline } from "./loop-drop.js";
 import { bezierControl, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
 
@@ -184,10 +185,7 @@ export function pieToDrawables(
 /** Instanced lines → one stroked path per line (straight, or a quadratic bow for `bends`). World
  *  endpoints with a per-line width, so screen sizeMode needs no bake (the width alone is in px). The end
  *  offsets (#509) move each end by `offset · offsetScale` world units: `1 / k` on a screen layer, 1 on a world one
- *  (the bend is a fraction of the chord, so the bow on the moved ends is the one the shader draws in px). An undirected
- *  `"drop"` layer (#505, #542 self-link loops) traces each loop with {@link traceLoop}: head length
- *  `headLength(arrowSize)`, leg `bends` (L) and `loopCot` as the shader reads them, scaled with the offsets (the loop is linear in
- *  its ends and `h`, so the loop on the moved ends is the one the shader draws in px). */
+ *  (the bend is a fraction of the chord, so the bow on the moved ends is the one the shader draws in px). */
 export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): DrawableVector[] {
   const out: DrawableVector[] = [];
   const { sourceOffsets: so, targetOffsets: to } = l;
@@ -198,13 +196,10 @@ export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): Drawab
     const ty = (l.targets[e * 2 + 1] ?? 0) + offsetAt(to, e * 2 + 1, offsetScale);
     const r = styleRow(l, e);
     const bend = l.bends ? (l.bends[r] ?? 0) : 0;
-    const loopHead = l.curve === "drop" ? headLength(l.arrowSize ?? 0) * offsetScale : 0;
-    const leg = l.bends ? (l.bends[r] ?? LOOP_LEG) : LOOP_LEG;
     out.push(
       drawable(e, {
         subpaths: record((ctx) => {
-          if (l.curve === "drop") traceLoop(ctx, sx, sy, tx, ty, loopHead, leg, l.loopCot ?? DROP_COT);
-          else if (bend) {
+          if (bend) {
             ctx.moveTo(sx, sy);
             const [cx, cy] = bezierControl(sx, sy, tx, ty, bend);
             ctx.quadraticCurveTo(cx, cy, tx, ty);
@@ -262,30 +257,40 @@ export function arrowsToDrawables(l: InstancedArrowsData, bake = 1): DrawableVec
 }
 
 /**
- * Filled self-link loops (#542, an `arrows` or `half-arrows` layer with `curve: "drop"`) → one closed outline per
- * loop, the loop lane's twin: {@link loopArrowOutline} (head length `headLength(arrowSize)`) or, with `half`,
- * {@link loopHalfArrowOutline}, leg `bends` (L), centre solve `loopCot`. A half-arrow loop's columns are read as a
- * line's (one width per loop). `bake` as {@link arrowsToDrawables}: solve in px (×k) on a screen layer and emit ÷k.
+ * Self-link loops (#505, #542) → one drawable per loop, the loop lane's twin, with its centre solve
+ * ({@link loopsSpreadCot}), legs and `h` ({@link loopStubLength}) as the shader reads them. A headless loop is ONE
+ * stroked path ({@link traceLoop}) whose ends move by `offset / bake` world units, as {@link linesToDrawables}' do (the
+ * loop is linear in its ends and `h`, so the loop on the moved ends is the one the shader draws in px). A headed loop
+ * is ONE filled outline, {@link loopArrowOutline} or {@link loopHalfArrowOutline}, solved in px (×k) on a screen
+ * layer and emitted ÷k, as {@link arrowsToDrawables}.
  */
-export function loopsToDrawables(l: InstancedLinesData, half: boolean, bake = 1): DrawableVector[] {
+export function loopsToDrawables(l: InstancedLoopsData, bake = 1): DrawableVector[] {
   const inv = 1 / bake;
   const samples = Math.max(2, (l.samples ?? 2) | 0);
   const pts = new Float64Array(2 * (2 * samples + 5));
-  const h = headLength(l.arrowSize ?? 0);
-  const cot = l.loopCot ?? DROP_COT;
-  const { sourceOffsets: so, targetOffsets: to } = l;
+  const h = loopStubLength(l);
+  const cot = loopsSpreadCot(l.spread);
+  const { startOffsets: so, endOffsets: to } = l;
   const out: DrawableVector[] = [];
   for (let e = 0; e < l.count; e++) {
-    const sx = (l.sources[e * 2] ?? 0) * bake + offsetAt(so, e * 2, 1);
-    const sy = (l.sources[e * 2 + 1] ?? 0) * bake + offsetAt(so, e * 2 + 1, 1);
-    const tx = (l.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1);
-    const ty = (l.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1);
-    const r = styleRow(l, e);
-    const width = l.widths[r] ?? 0;
-    const leg = l.bends ? (l.bends[r] ?? LOOP_LEG) : LOOP_LEG;
-    const n = half ? loopHalfArrowOutline(pts, 0, sx, sy, tx, ty, width, samples, leg, cot) : loopArrowOutline(pts, 0, sx, sy, tx, ty, width, h, samples, leg, cot);
+    const width = l.widths[e] ?? 0;
+    const leg = l.legs[e] ?? LOOP_LEG;
+    const color = rgbaAt(l.colors, e);
+    if (l.head === "none") {
+      const cx = l.centers[e * 2] ?? 0;
+      const cy = l.centers[e * 2 + 1] ?? 0;
+      const sx = cx + offsetAt(so, e * 2, inv), sy = cy + offsetAt(so, e * 2 + 1, inv);
+      const tx = cx + offsetAt(to, e * 2, inv), ty = cy + offsetAt(to, e * 2 + 1, inv);
+      out.push(drawable(e, { subpaths: record((ctx) => traceLoop(ctx, sx, sy, tx, ty, h * inv, leg, cot)), stroke: color, lineWidth: width }));
+      continue;
+    }
+    const cx = (l.centers[e * 2] ?? 0) * bake;
+    const cy = (l.centers[e * 2 + 1] ?? 0) * bake;
+    const sx = cx + offsetAt(so, e * 2, 1), sy = cy + offsetAt(so, e * 2 + 1, 1);
+    const tx = cx + offsetAt(to, e * 2, 1), ty = cy + offsetAt(to, e * 2 + 1, 1);
+    const n = l.head === "half" ? loopHalfArrowOutline(pts, 0, sx, sy, tx, ty, width, samples, leg, cot) : loopArrowOutline(pts, 0, sx, sy, tx, ty, width, h, samples, leg, cot);
     // `record` traces synchronously, so the one scratch serves every loop.
-    if (n > 0) out.push(drawable(e, { subpaths: record((ctx) => traceOutline(ctx, pts, n, inv)), fill: linkColor(l, e) }));
+    if (n > 0) out.push(drawable(e, { subpaths: record((ctx) => traceOutline(ctx, pts, n, inv)), fill: color }));
   }
   return out;
 }
@@ -349,10 +354,14 @@ export function instancedVectorLayers(
         out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: linesToDrawables(layer.lines, 1 / bake) });
         break;
       case "arrows":
-        out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: layer.arrows.curve === "drop" ? loopsToDrawables(layer.arrows, false, bake) : arrowsToDrawables(layer.arrows, bake) });
+        out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: arrowsToDrawables(layer.arrows, bake) });
         break;
       case "half-arrows":
-        out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: layer.halfArrows.curve === "drop" ? loopsToDrawables(layer.halfArrows, true, bake) : halfArrowsToDrawables(layer.halfArrows, bake) });
+        out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: halfArrowsToDrawables(layer.halfArrows, bake) });
+        break;
+      case "loops":
+        // A headless loop is stroked like a line (its layer's sizeMode); a headed one is a filled outline, baked.
+        out.push({ name: layer.name, sizeMode: layer.loops.head === "none" || bake === 1 ? layer.sizeMode : "world", drawables: loopsToDrawables(layer.loops, bake) });
         break;
     }
   }

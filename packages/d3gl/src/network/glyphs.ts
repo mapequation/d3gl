@@ -2395,7 +2395,7 @@ export interface SuperEdgesData {
  * A `line`-style link batch (#542): headless lines, or, with `radii` and `arrowSize` (a directed style), whole
  * arrows. Built in one place per path and drawn as the layer {@link lineBatchLayer} picks.
  */
-export type LineBatch = InstancedLinesData & { radii?: Float32Array };
+export type LineBatch = InstancedLinesData & { radii?: Float32Array; arrowSize?: number };
 
 /** Whether a `line`-style batch carries its heads (#542): then it is an `arrows` layer's data. */
 export function isArrowBatch(b: LineBatch): b is InstancedArrowsData {

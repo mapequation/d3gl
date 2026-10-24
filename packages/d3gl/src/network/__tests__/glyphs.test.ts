@@ -248,7 +248,7 @@ describe("networkLayers", () => {
     // Undirected links are headless lines.
     const u = networkLayers(g, { ...s, directed: false })[0];
     if (u?.primitive !== "lines") throw new Error("expected a lines layer");
-    expect(u.lines.arrowSize).toBeUndefined();
+    expect("arrowSize" in u.lines).toBe(false);
   });
 
   it("emits only nodes when there are no edges", () => {

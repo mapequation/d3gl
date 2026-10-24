@@ -23,14 +23,15 @@
  * The writers are scalar math into module scratch and the caller's output buffer: no allocation per loop. Perp
  * convention as `arrowhead.ts`: `perp(v) = (−v.y, v.x)`, and `+perp(travel)` is the loop's OUTSIDE.
  */
-import { barbOverhang, headHalfWidth, legCubic, type PointBuffer } from "./arrowhead.js";
+import { barbOverhang, headHalfWidth, headLength, legCubic, type PointBuffer } from "./arrowhead.js";
+import type { InstancedLoopHead } from "./backend.js";
 
 /** The angle between the loop's two legs at the centre (degrees): the default of the network style's `selfLinkSpread`. */
 export const LOOP_SPREAD = 40;
 /** Half the angle between the loop's two legs at the centre (radians): the default `α`, half {@link LOOP_SPREAD}. */
 export const DROP_HALF_SPREAD = (LOOP_SPREAD * Math.PI) / 360;
 /** `cot α`: recovers the loop's centre from its rim ends ({@link solveLoop}); the WebGL loop lane reads it as `u_loopCot`.
- *  The default; the writers take `cot α` as an argument ({@link loopCot}). */
+ *  The default; the writers take `cot α` as an argument ({@link spreadCot}). */
 export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
 /** The loop's leg length in node radii (`ℓ = L·r`): with {@link DROP_HALF_SPREAD}, the teardrop. The default of the
  *  network style's `selfLinkLength`: the writers take `L` as an argument, and the WebGL loop lane reads it per loop
@@ -38,8 +39,19 @@ export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
 export const LOOP_LEG = 3;
 
 /** `cot α` for half-spread `α` (radians): what the writers and the WebGL loop lane solve the centre with. */
-export function loopCot(halfSpread: number): number {
+export function spreadCot(halfSpread: number): number {
   return 1 / Math.tan(halfSpread);
+}
+
+/** `cot α` of a `loops` layer's `spread` (radians, the full angle; absent ⇒ {@link DROP_COT}). */
+export function loopsSpreadCot(spread: number | undefined): number {
+  return spread === undefined ? DROP_COT : spreadCot(spread / 2);
+}
+
+/** The length `h` a `loops` layer's straight pieces run past the rim ({@link InstancedLoopHead}): its `stubLength`, its
+ *  arrowhead's length, or 0 for the half-arrow head, whose `h` is per loop (`10·∛width`, the lane's and the writer's own). */
+export function loopStubLength(head: InstancedLoopHead): number {
+  return head.head === "none" ? head.stubLength : head.head === "arrow" ? headLength(head.arrowSize) : 0;
 }
 
 /** The path context a loop traces into (Canvas, SVG, the export recorder). */
@@ -92,7 +104,7 @@ function solveLoop(sx: number, sy: number, tx: number, ty: number, h: number, le
  * Trace the loop's centre line (the stroked, undirected loop), given its rim ends `(sx, sy)`, `(tx, ty)` and head
  * length `h` (`headLength(arrowSize)`, so the arrow loop runs along the same path): `moveTo(c)`, `lineTo(E0)`,
  * `bezierCurveTo(E0 + ℓ·u0, E1 + ℓ·u1, E1)`, `lineTo(c)`, with `E_k = c + (r + h)·u_k` and `ℓ = leg·r`. `cot` = `cot α`
- * of the ends' half-spread ({@link loopCot}).
+ * of the ends' half-spread ({@link spreadCot}).
  */
 export function traceLoop(ctx: Pick<DropContext, "moveTo" | "lineTo" | "bezierCurveTo">, sx: number, sy: number, tx: number, ty: number, h: number, leg = LOOP_LEG, cot = DROP_COT): void {
   if (solveLoop(sx, sy, tx, ty, h, leg, cot) === 0) return;

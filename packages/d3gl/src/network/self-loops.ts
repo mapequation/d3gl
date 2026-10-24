@@ -7,9 +7,8 @@
  *   the settled link cubic (`legCubic`), its far end round: a teardrop given by its two rim ends. On Canvas / SVG
  *   it is ONE shape in the `links` group: a stroked path (undirected), a filled arrow outline (directed `line`
  *   style, its tip on the rim) or a filled half-arrow outline. On WebGL it is the same ONE shape: one instance of
- *   the `lines`, `arrows` or `half-arrows` layer (the variant) with its two ends set off the node centre by
- *   `sourceOffsets` / `targetOffsets` (#509), drawn by the line lane's `curve: "drop"` program in the loop layer
- *   only, so ordinary links run their program unchanged.
+ *   the `loops` layer ({@link InstancedLoopsData}, its `head` the variant) with its two rim ends set off the node
+ *   centre (#509), drawn by the line lane's loop program, so ordinary links run their program unchanged.
  * - `θ` points away from the node's neighbours: opposite the weighted mean of the unit vectors to them, or
  *   {@link FALLBACK_ANGLE} when they cancel (or the node has none).
  *
@@ -25,10 +24,10 @@
  * position frame ({@link updateSelfLoops}) is O(S + Σ degree of the looped nodes), in place: no allocation.
  */
 import type { NetworkGraph } from "./graph.js";
-import type { InstancedLayer, GroupBuilder } from "../core/index.js";
+import type { InstancedLayer, InstancedLoopHead, InstancedLoopsData, GroupBuilder } from "../core/index.js";
 import type { RGBAValue } from "./glyphs.js";
 import type { StableColumns } from "../core/stable-columns.js";
-import { DROP_HALF_SPREAD, LOOP_LEG, loopArrowOutline, loopCot, loopHalfArrowOutline, traceLoop, traceOutline } from "../core/loop-drop.js";
+import { DROP_HALF_SPREAD, LOOP_LEG, loopArrowOutline, loopHalfArrowOutline, spreadCot, traceLoop, traceOutline } from "../core/loop-drop.js";
 import { headLength } from "../core/arrowhead.js";
 
 /** The direction of a loop whose node has no neighbours to point away from (radians, y down: up-right). */
@@ -185,14 +184,17 @@ export interface SelfLoopCache {
   colors: Uint8Array;
   /** #162 highlight group per loop: its node (a loop is incident to its node at both ends). */
   groups: Float32Array;
-  /** The leg `L` in node radii per loop (`selfLinkLength`): the loop lane reads it from its `bends` column. */
+  /** The leg `L` in node radii per loop (`selfLinkLength`): the `loops` layer's `legs` column. */
   legs: Float32Array;
   /** Half the angle between the legs, `α` (radians, half of `selfLinkSpread`): where {@link loopEnds} puts the ends. */
   halfSpread: number;
-  /** `cot α`: the writers and the WebGL lane (`u_loopCot`) recover each loop's centre from its ends with it. */
-  loopCot: number;
+  /** `cot α`: the Scene writers recover each loop's centre from its ends with it (the `loops` layer takes `2α`). */
+  spreadCot: number;
   /** The line style's head length is `headLength(arrowSize)`, the undirected loop's too (#542). */
   arrowSize: number;
+  /** The `loops` layer's head (per style version): the variant, with the undirected loop's straight pieces as long
+   *  as the arrow's head. */
+  head: InstancedLoopHead;
   // Position columns (rewritten in place each position frame).
   centres: Float32Array;
   angles: Float32Array;
@@ -234,8 +236,9 @@ export function selfLoopCache(graph: NetworkGraph, style: SelfLoopStyle): SelfLo
     groups: Float32Array.from(loops.nodes),
     legs: new Float32Array(S).fill(style.selfLinkLength),
     halfSpread,
-    loopCot: loopCot(halfSpread),
+    spreadCot: spreadCot(halfSpread),
     arrowSize: style.arrowSize,
+    head: halfArrow ? { head: "half" } : style.directed ? { head: "arrow", arrowSize: style.arrowSize } : { head: "none", stubLength: headLength(style.arrowSize) },
     centres: new Float32Array(2 * S),
     angles: new Float32Array(S),
     sourceOffsets: new Float32Array(2 * S),
@@ -280,35 +283,28 @@ export const SELF_LOOP_LAYER = "self-loops";
 
 /**
  * The instanced layer that draws the loops on WebGL, over the cache's current columns (call {@link updateSelfLoops}
- * first): ONE layer whose `curve: "drop"` program draws each loop as the Scene's one shape (#542), its primitive the
- * variant (`lines` undirected, `arrows` the line style's arrow, `half-arrows` the half-arrow), its `bends` the leg
- * `L`, its `loopCot` the legs' spread, its `arrowSize` the line style's head length. Instance `i` is loop `i`; its
- * pick resolves to `loops.edges[i]`. O(1): no array is built.
+ * first): ONE `loops` layer that draws each loop as the Scene's one shape (#542), its `head` the variant (`none`
+ * undirected, `arrow` the line style's arrow, `half` the half-arrow), its `legs` the leg `L`, its `spread` the legs'
+ * angle `2α`. Instance `i` is loop `i`; its pick resolves to `loops.edges[i]`. O(1): no array is built.
  */
 export function selfLoopLayers(c: SelfLoopCache, pickable?: true, pickBase?: number): InstancedLayer[] {
   const pick = pickBase === undefined ? {} : { pickable, pickBase };
-  const { centres, sourceOffsets, targetOffsets, changed, sizeMode } = c;
-  const loops = {
-    curve: "drop" as const,
-    loopCot: c.loopCot,
-    arrowSize: c.arrowSize,
-    sources: centres,
-    targets: centres,
+  const loops: InstancedLoopsData = {
+    ...c.head,
+    centers: c.centres,
+    startOffsets: c.sourceOffsets,
+    endOffsets: c.targetOffsets,
+    offsetsChanged: c.changed,
     widths: c.widths,
     colors: c.colors,
-    bends: c.legs,
+    legs: c.legs,
+    spread: 2 * c.halfSpread,
     samples: LOOP_SAMPLES,
     groups: c.groups,
     selected: c.selected,
-    sourceOffsets,
-    targetOffsets,
-    endOffsetsChanged: changed,
     count: c.loops.count,
   };
-  // `radii` is unused by a loop (its tip is on the rim): the cache's node radii stand in, never uploaded.
-  if (c.halfArrow) return [{ name: SELF_LOOP_LAYER, primitive: "half-arrows", sizeMode, ...pick, halfArrows: { ...loops, radii: c.radii } }];
-  if (c.arrowheads) return [{ name: SELF_LOOP_LAYER, primitive: "arrows", sizeMode, ...pick, arrows: { ...loops, radii: c.radii } }];
-  return [{ name: SELF_LOOP_LAYER, primitive: "lines", sizeMode, ...pick, lines: loops }];
+  return [{ name: SELF_LOOP_LAYER, primitive: "loops", sizeMode: c.sizeMode, ...pick, loops }];
 }
 
 /** Per-loop `selected` flags (#162) from the per-edge link flags: a loop is selected with its edge. O(S). */
@@ -334,7 +330,7 @@ export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache, idBase = 0): vo
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const screen = c.sizeMode === "screen";
   const h = headLength(c.arrowSize);
-  const cot = c.loopCot;
+  const cot = c.spreadCot;
   for (let i = 0; i < loops.count; i++) {
     const px = centres[2 * i] ?? 0;
     const py = centres[2 * i + 1] ?? 0;
@@ -352,7 +348,7 @@ export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake =
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
-    const n = loopHalfArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, LOOP_SAMPLES, c.legs[i] ?? LOOP_LEG, c.loopCot);
+    const n = loopHalfArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, LOOP_SAMPLES, c.legs[i] ?? LOOP_LEG, c.spreadCot);
     if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
   }
 }
@@ -367,7 +363,7 @@ export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, 
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
-    const n = loopArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, h, LOOP_SAMPLES, c.legs[i] ?? LOOP_LEG, c.loopCot);
+    const n = loopArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, h, LOOP_SAMPLES, c.legs[i] ?? LOOP_LEG, c.spreadCot);
     if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
   }
 }
@@ -520,8 +516,9 @@ export function selfLoopSubset(c: SelfLoopCache, graph: NetworkGraph, m: number,
     groups,
     legs,
     halfSpread: c.halfSpread,
-    loopCot: c.loopCot,
+    spreadCot: c.spreadCot,
     arrowSize: c.arrowSize,
+    head: c.head,
     centres,
     angles: angles.subarray(0, m),
     sourceOffsets,
