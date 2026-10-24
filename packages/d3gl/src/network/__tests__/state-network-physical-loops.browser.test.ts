@@ -9,8 +9,8 @@ import { DROP_HALF_SPREAD, DROP_LENGTH } from "../../core/loop-drop.js";
  *
  * Physical node A (0, at x = 60) holds state nodes 0 and 1; physical node B (1, at x = 140) holds state node 2.
  * State links 0 → 2 and 1 → 2 cross from A to B; 0 → 1 stays in A. A's loop points away from B, towards −x. The
- * drop is a cubic from the rim at ±DROP_HALF_SPREAD with its controls DROP_LENGTH·r out along the same legs, so
- * its far end (the cubic's midpoint) sits `r·cos(θ)·(1 + 3·DROP_LENGTH)/4` left of A's centre, outside the node.
+ * drop is a cubic from the centre back to the centre with its controls DROP_LENGTH·r out along ±DROP_HALF_SPREAD,
+ * so its far end (the cubic's midpoint) sits `0.75·DROP_LENGTH·cos(θ)·r` left of A's centre, outside the node.
  */
 
 const W = 200;
@@ -18,7 +18,7 @@ const BACKENDS = ["webgl", "canvas", "svg"] as const;
 const R = 10;
 const CX = 60;
 const CY = 100;
-const APEX_X = CX - (R * Math.cos(DROP_HALF_SPREAD) * (1 + 3 * DROP_LENGTH)) / 4;
+const APEX_X = CX - 0.75 * DROP_LENGTH * Math.cos(DROP_HALF_SPREAD) * R;
 const POSITIONS = new Float32Array([CX, CY, 140, CY]);
 
 function host(): HTMLElement {
