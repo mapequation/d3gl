@@ -54,6 +54,27 @@ new one, titled by the rule and citing the issue). Put a rule here only if most 
 - **Up-to-date documentation.** Keep the website's prose and examples in step with the library. Every
   major feature is highlighted on the landing page and has a minimal example that shows it working.
 
+### Enforcing efficient rendering
+
+These rules make the first value checkable. They apply to every option you propose and every PR you open.
+
+1. **No recommendation without its cost, in the same message.** For each option, state how run time and
+   memory grow, with which data (all drawables, the drawn/visible set, a subset such as self-links), how
+   often the work runs (per frame, or only on a topology, style or data change), and whether a user would
+   notice it at ≈1M with reductions off. Check it against the actual call path in the code, not from
+   memory; never call a cost negligible or "cheaper than the upload" without measuring it.
+2. **Per frame is the default.** Positions, the transform, the LOD drawn set and the selection change every
+   frame (layout streaming, zoom, node-drag), and the instanced-layer data carries positions. Treat anything
+   derived from them as per-frame work until you have traced the call site and shown it runs less often.
+3. **Briefs carry the checklist.** Every delegated task that touches the rendering path states rules 1–2
+   and requires per-frame work and memory to stay the same or go down, reported with before/after numbers
+   (which functions run per frame, bytes per drawable).
+4. **Every PR gets an independent audit before it is marked ready.** A fresh agent that did not write the
+   code reviews the whole diff against these core values (per-frame paths, memory, complexity growth, the
+   other backends), and the per-frame perf guards the PR touches are re-run one at a time on a quiet machine
+   (check `uptime`). Put the audit's findings and the guard numbers in the PR's Performance section; the
+   audit report, not your summary of it, is what I review.
+
 ## Library first
 
 d3gl is the product; the website examples and consumer code are its clients. When user-facing code can
