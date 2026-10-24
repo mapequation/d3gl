@@ -25,6 +25,8 @@
  * in, so a link keeps its shape at every zoom in both size modes.
  */
 
+import { barbOverhang } from "./arrowhead.js";
+
 /** Absolute half-link bend for a chord-fraction `bend` (#296): `bend`·|centre chord|, as the half-arrow shader computes it. */
 export function chordBend(x0: number, y0: number, x1: number, y1: number, bend: number): number {
   return bend * Math.hypot(x1 - x0, y1 - y0);
@@ -144,7 +146,7 @@ export function halfLinkGeometry(p: HalfLinkParams): HalfLinkGeometry | null {
   // (Use the reference's exact `Math.pow(x, 1/3)` / `Math.pow(x, 1/2)` — not cbrt/sqrt — so the
   // golden test matches `example.svg` to the last bit.)
   const tipLength = Math.min(lBetween / 3, 10 * Math.pow(width, 1 / 3));
-  const tipWidth = 2 * Math.pow(width, 1 / 2);
+  const tipWidth = barbOverhang(width);
   const oppositeTipLength = Math.min(lBetween / 3, 10 * Math.pow(oppositeWidth, 1 / 3));
 
   // Bend: the side is fixed by the link direction (so a reciprocal pair bows consistently to one

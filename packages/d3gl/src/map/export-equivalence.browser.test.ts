@@ -101,6 +101,9 @@ const CASES: { name: string; style: NetworkStyle }[] = [
   { name: "arrows (straight)", style: ARROWS },
   { name: "arrows (bent — the end-tangent branch)", style: BENT_ARROWS },
   { name: "half-arrows", style: HALF_ARROWS },
+  // #542: shaft + head as one outline; a line wider than 2·size still ends inside its head.
+  { name: "wide arrows", style: { ...ARROWS, linkWidth: 12, arrowSize: 5 } },
+  { name: "wide bent arrows", style: { ...BENT_ARROWS, linkWidth: 12, arrowSize: 5 } },
 ];
 
 /**

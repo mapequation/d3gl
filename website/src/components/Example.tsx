@@ -171,9 +171,10 @@ function RangeSlider(props: {
   const display = labelAt(live);
   // Reserve a stable readout width from the widest possible label so growing digits never
   // shift the slider (and the controls after it). tabular-nums keeps each digit fixed-width.
-  const widest = spec.display
-    ? spec.display.reduce((a, b) => (b.length > a.length ? b : a), "")
-    : String(spec.max);
+  // Without display labels, the widest is an end of the range at the step's precision (0.05 → "0.50", not "0.5").
+  const decimals = String(spec.step).split(".")[1]?.length ?? 0;
+  const ends = [spec.min.toFixed(decimals), spec.max.toFixed(decimals)];
+  const widest = (spec.display ?? ends).reduce((a, b) => (b.length > a.length ? b : a), "");
   return (
     <div className={`flex h-6 items-center gap-1.5${disabled ? " opacity-40" : ""}`} aria-disabled={disabled || undefined}>
       <span className="text-muted-foreground text-[11px]">{spec.label}</span>

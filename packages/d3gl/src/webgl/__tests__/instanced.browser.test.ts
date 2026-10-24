@@ -2,7 +2,11 @@ import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import { InstancedCircles, InstancedLines, InstancedArrows } from "../instanced.js";
+import { InstancedCircles, InstancedLines, InstancedArrows, radiusColumnStats } from "../instanced.js";
+import { IndexedLines } from "../indexed-links.js";
+import { arrowHead } from "../../core/arrowhead.js";
+import type { ArrowParams } from "../../core/arrowhead.js";
+import type { InstancedLinesData } from "../../core/index.js";
 import { clipFromView } from "../index.js";
 import { WebGLBackend } from "../webgl-backend.js";
 
@@ -225,6 +229,199 @@ describe("instanced shader highlight (#162)", () => {
     expect(red[0]!).toBeGreaterThan(red[1]! + 30); // R clearly dominant
     expect(red[0]!).toBeGreaterThan(red[2]! + 30);
     lines.destroy();
+    device.destroy();
+  });
+});
+
+/** The pixel under world/px point (x, y) at k = 1 (row 0 of the read-back is the bottom). */
+function at(device: Device, framebuffer: Framebuffer, x: number, y: number) {
+  return px(device, framebuffer, Math.floor(x), H - 1 - Math.floor(y));
+}
+
+type Layer = { render(pass: ReturnType<Device["beginRenderPass"]>): void; renderPick(pass: ReturnType<Device["beginRenderPass"]>): void };
+function draw(device: Device, framebuffer: Framebuffer, layer: Layer, pick = false): void {
+  const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 0] });
+  if (pick) layer.renderPick(pass);
+  else layer.render(pass);
+  pass.end();
+  device.submit();
+}
+const pickId = (c: ArrayLike<number>): number => (c[0] ?? 0) + 256 * (c[1] ?? 0) + 65536 * (c[2] ?? 0) - 1;
+
+// #542: a headed line is ONE strip, shaft + head, the twin of core/arrowhead.ts `arrowOutline`.
+describe("InstancedLines with an arrowhead (#542)", () => {
+  // A straight arrow (4,32)→(60,32): width 4, radius 6, size 5 ⇒ tip x = 54, base x = 44, head half-width 2 + 2·√4 = 6.
+  const straight = (alpha: number): InstancedLinesData => ({
+    sources: new Float32Array([4, 32]),
+    targets: new Float32Array([60, 32]),
+    widths: new Float32Array([4]),
+    colors: new Uint8Array([0, 0, 255, alpha]),
+    radii: new Float32Array([6]),
+    arrowSize: 5,
+    count: 1,
+  });
+
+  function checkStraight(device: Device, framebuffer: Framebuffer, scale: number): void {
+    const p = (x: number, y: number) => at(device, framebuffer, x * scale, y * scale);
+    expect(p(52, 32)[3]).toBeGreaterThan(0); // the head reaches the tip …
+    expect(p(54, 32)[3]).toBe(0); // … and stops there: tip = target − dir·radius
+    expect(p(57, 32)[3]).toBe(0); // no shaft between the tip and the target
+    expect(p(52, 33)[3]).toBe(0); // no line edge beside the tip (the head is narrower than the line here)
+    expect(p(52, 34)[3]).toBe(0);
+    expect(p(45, 36)[3]).toBeGreaterThan(0); // the barbs stick out beyond the line on both sides
+    expect(p(45, 27)[3]).toBeGreaterThan(0);
+    // No gap and no double blend: every pixel along the arrow and across the shaft–head join has the single-layer alpha.
+    for (let x = 5; x < 53; x++) expect(Math.abs((p(x, 32)[3] ?? 0) - 128), `x=${x}`).toBeLessThanOrEqual(2);
+    for (let x = 40; x < 48; x++) for (const y of [30, 31, 32, 33]) expect(Math.abs((p(x, y)[3] ?? 0) - 128), `${x},${y}`).toBeLessThanOrEqual(2);
+  }
+
+  it("world sizeMode: tip at target − radius, no line beside the tip, no gap, a translucent arrow blends once", async () => {
+    const { device, framebuffer } = await setup();
+    const lines = new InstancedLines(device, straight(128), W, H);
+    lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+    draw(device, framebuffer, lines);
+    checkStraight(device, framebuffer, 1);
+    lines.destroy();
+    device.destroy();
+  });
+
+  it("screen sizeMode: width, radius and size in px around the projected ends", async () => {
+    const { device, framebuffer } = await setup();
+    const d = straight(128);
+    // Ends at half the coordinates under k = 2 project to the world test's px.
+    const lines = new InstancedLines(device, { ...d, sources: new Float32Array([2, 16]), targets: new Float32Array([30, 16]) }, W, H);
+    lines.setTransform(clipFromView({ k: 2, x: 0, y: 0 }, W, H));
+    lines.setSizeMode("screen");
+    draw(device, framebuffer, lines);
+    checkStraight(device, framebuffer, 1);
+    lines.destroy();
+    device.destroy();
+  });
+
+  it("a bent line gets a full symmetric head on its own end tangent, with the tip on the node boundary", async () => {
+    const { device, framebuffer } = await setup();
+    const a: ArrowParams = { sx: 8, sy: 36, tx: 56, ty: 36, radius: 5, width: 3, size: 4, bend: 0.25 };
+    const lines = new InstancedLines(
+      device,
+      {
+        sources: new Float32Array([a.sx, a.sy]),
+        targets: new Float32Array([a.tx, a.ty]),
+        widths: new Float32Array([a.width]),
+        colors: new Uint8Array([255, 0, 0, 255]),
+        bends: new Float32Array([a.bend]),
+        samples: 16,
+        radii: new Float32Array([a.radius]),
+        arrowSize: a.size,
+        count: 1,
+      },
+      W,
+      H,
+    );
+    lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+    draw(device, framebuffer, lines);
+    const h = new Float64Array(6);
+    arrowHead(h, 0, a); // left barb, tip, right barb
+    const [lx, ly, tx, ty, rx, ry] = Array.from(h);
+    const ux = (tx - (lx + rx) / 2) / 8; // head axis (length 2·size = 8)
+    const uy = (ty - (ly + ry) / 2) / 8;
+    expect(Math.hypot(tx - a.tx, ty - a.ty)).toBeCloseTo(a.radius, 5);
+    expect(at(device, framebuffer, tx - 2 * ux, ty - 2 * uy)[0]).toBeGreaterThan(200); // just behind the tip
+    expect(at(device, framebuffer, tx + 2 * ux, ty + 2 * uy)[3]).toBe(0); // past the tip: nothing
+    // Both barbs drawn (a full head, not the one-sided half head), each a little inside its corner.
+    for (const [bx, by] of [[lx, ly], [rx, ry]] as const) {
+      const cx = (lx + rx) / 2, cy = (ly + ry) / 2; // base centre
+      const ix = cx + 0.65 * (bx - cx) + 1.2 * ux, iy = cy + 0.65 * (by - cy) + 1.2 * uy;
+      expect(at(device, framebuffer, ix, iy)[0], `barb ${bx},${by}`).toBeGreaterThan(100);
+    }
+    lines.destroy();
+    device.destroy();
+  });
+
+  it("a pick on a head pixel returns the line's own id (+ pick base); absent radii put the tip on the target", async () => {
+    const { device, framebuffer } = await setup();
+    const lines = new InstancedLines(
+      device,
+      {
+        sources: new Float32Array([4, 12, 4, 40]),
+        targets: new Float32Array([60, 12, 60, 40]),
+        widths: new Float32Array([2, 2]),
+        colors: new Uint8Array([0, 0, 255, 255, 0, 0, 255, 255]),
+        arrowSize: 5,
+        count: 2,
+      },
+      W,
+      H,
+      true,
+    );
+    lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+    draw(device, framebuffer, lines, true);
+    expect(pickId(at(device, framebuffer, 58, 40))).toBe(1); // the head near the target (radius 0)
+    expect(pickId(at(device, framebuffer, 52, 42))).toBe(1); // a barb, beyond the line's width
+    expect(pickId(at(device, framebuffer, 52, 14))).toBe(0);
+    lines.setPickBase(100);
+    draw(device, framebuffer, lines, true);
+    expect(pickId(at(device, framebuffer, 52, 42))).toBe(101);
+    lines.destroy();
+    device.destroy();
+  });
+
+  it("indexed lane: the radius comes from an r32float edge table; head pixels pick the edge id", async () => {
+    const { device, framebuffer } = await setup();
+    const lines = new IndexedLines(
+      device,
+      {
+        index: new Float32Array([1]),
+        tableCount: 2,
+        sources: new Float32Array([4, 32]),
+        targets: new Float32Array([60, 32]),
+        widths: new Float32Array([1, 4]),
+        colors: new Uint8Array([255, 0, 0, 255, 0, 0, 255, 128]),
+        radii: new Float32Array([0, 6]),
+        arrowSize: 5,
+        count: 1,
+      },
+      W,
+      H,
+      true,
+    );
+    lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+    draw(device, framebuffer, lines);
+    checkStraight(device, framebuffer, 1);
+    draw(device, framebuffer, lines, true);
+    expect(pickId(at(device, framebuffer, 50, 32))).toBe(1);
+    expect(pickId(at(device, framebuffer, 45, 36))).toBe(1);
+    lines.destroy();
+    device.destroy();
+  });
+
+  it("costs 4 B/instance (radius) and uploads no radius on a position frame; unheaded lines add nothing", async () => {
+    const { device } = await setup();
+    const base = straight(255);
+    const radii = new Float32Array([6, 6, 6]);
+    const data: InstancedLinesData = {
+      ...base,
+      sources: new Float32Array(6),
+      targets: new Float32Array(6).fill(30),
+      widths: new Float32Array(3).fill(2),
+      colors: new Uint8Array(12).fill(255),
+      radii,
+      count: 3,
+    };
+    const b0 = radiusColumnStats.buffers, n0 = radiusColumnStats.bytes;
+    const lines = new InstancedLines(device, data, W, H);
+    expect(radiusColumnStats.buffers - b0).toBe(1);
+    expect(radiusColumnStats.bytes - n0).toBe(4 * 3);
+    // A position frame: new ends, the same radii ⇒ no radius upload; a new size is a uniform.
+    expect(lines.update(device, { ...data, sources: new Float32Array(6).fill(1), arrowSize: 7 })).toBe(true);
+    expect(radiusColumnStats.bytes - n0).toBe(4 * 3);
+    // Turning the head off changes the program: the caller recreates.
+    expect(lines.update(device, { ...data, arrowSize: undefined })).toBe(false);
+    lines.destroy();
+    const plain = new InstancedLines(device, { ...data, arrowSize: undefined, radii: undefined }, W, H);
+    plain.update(device, { ...data, arrowSize: undefined, radii: undefined, sources: new Float32Array(6).fill(2) });
+    expect(radiusColumnStats.buffers - b0).toBe(1);
+    expect(radiusColumnStats.bytes - n0).toBe(4 * 3);
+    plain.destroy();
     device.destroy();
   });
 });

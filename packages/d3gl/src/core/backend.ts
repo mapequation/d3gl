@@ -151,6 +151,22 @@ export interface InstancedCirclesData {
 
 /** SoA for a batch of instanced lines (e.g. network links); straight, or bent via {@link bends}. */
 export interface InstancedLinesData {
+  /**
+   * `"drop"`: the self-link loop (#505, #542, `core/loop-drop.ts`): each instance is ONE loop on its node, given by
+   * its two rim ends (`sources` = `targets` = the node centre, plus {@link sourceOffsets} / {@link targetOffsets}),
+   * drawn on the settled link geometry: centre → `E0`, the leg cubic, `E1`, then {@link loopHead}'s end. `bends` is
+   * read as the leg `L` in node radii, and {@link arrowSize} sets the line style's head length `2·arrowSize` (the
+   * undirected loop's too, so it runs the arrow's path); the half-arrow's is `10·∛width`. A separate program, chosen
+   * per layer, so an ordinary link layer runs its lane unchanged. Absent = a link.
+   */
+  curve?: "drop";
+  /** `curve: "drop"` only (#542): the loop's end — absent: undirected (stroked), `"arrow"`: the line-style head, the
+   *  tip on the rim, `"half"`: the half-arrow band (one link width on the outside) and its one-sided head. A draw
+   *  setting like `samples`: a change recreates the layer. */
+  loopHead?: "arrow" | "half";
+  /** `curve: "drop"` only: `cot α`, `α` half the angle between a loop's legs, with which its centre is recovered from
+   *  its two rim ends (`core/loop-drop.ts`). One value per layer (a uniform). Absent ⇒ `DROP_COT` (α = 20°). */
+  loopCot?: number;
   /** [x, y] world source per line, length `2 * count`. */
   sources: Float32Array;
   /** [x, y] world target per line, length `2 * count`. */
@@ -169,6 +185,19 @@ export interface InstancedLinesData {
    * setting, not per-instance; bent layers raise it, straight layers keep `2` to stay cheap at scale.
    */
   samples?: number;
+  /**
+   * Arrow size (#542): set ⇒ every line of the layer is drawn WITH its arrowhead, shaft + head as one shape
+   * (`core/arrowhead.ts`): the tip sits {@link radii} back from the target along the curve's end tangent, the head
+   * is `2·arrowSize` long and as wide as the half-arrow barb rule makes it. In the layer's size units, like the
+   * widths. A draw setting like `samples`: turning the head on or off recreates the layer; absent ⇒ today's line.
+   * On a `curve: "drop"` layer it only sets the loop's head length (see {@link curve}); {@link loopHead} picks the end.
+   */
+  arrowSize?: number;
+  /**
+   * Headed lines only (#542): the target node's radius per line (per edge with `index`), in size units. Absent ⇒ 0
+   * (the tip on the target point) with no buffer and no upload. Uploaded only when the array is a new object.
+   */
+  radii?: Float32Array;
   /** Per-instance highlight group (#162): the link's **source** node id, matched against `u_hoverGroup`
    *  / used to index the selected set so the vertex shader recolours a highlighted node's links. Length `count`. */
   groups?: Float32Array;

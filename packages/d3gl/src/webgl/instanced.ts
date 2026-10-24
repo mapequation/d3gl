@@ -1,7 +1,8 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, INSTANCED_LOOP_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
+import { DROP_COT } from "../core/loop-drop.js";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
 
 /** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
@@ -663,6 +664,91 @@ export function lineTemplate(samples: number): Float32Array {
   return t;
 }
 
+/**
+ * {@link lineTemplate} with the arrowhead appended (#542): (2, 1) left barb, (2, -1) right barb, (3, 0) tip.
+ * The strip's two triangles from the shaft's last pair to the barbs lie on the head's base (zero area), so
+ * `2·M + 3` vertices draw shaft + head as one strip with no overlap (`INSTANCED_HEAD_LINE_VS`).
+ */
+export function headLineTemplate(samples: number): Float32Array {
+  const shaft = lineTemplate(samples);
+  const t = new Float32Array(shaft.length + 6);
+  t.set(shaft);
+  t.set([2, 1, 2, -1, 3, 0], shaft.length);
+  return t;
+}
+
+/** A self-link loop layer's end (#542): the stroked undirected loop, the line-style arrow, or the half-arrow band. */
+export type LoopHead = "none" | "arrow" | "half";
+
+/** The loop variant of a `curve: "drop"` layer, null for an ordinary line layer: fixed per layer (template + uniform). */
+function loopHeadOf(data: InstancedLinesData): LoopHead | null {
+  return data.curve === "drop" ? (data.loopHead ?? "none") : null;
+}
+
+/**
+ * The self-link loop's strip (#542, `INSTANCED_LOOP_VS`): (−1, ±1) the pair at the node centre, the
+ * {@link lineTemplate} cubic samples, then the end — `"none"`: (4, ±1) the pair back at the centre (`2·M + 4`
+ * vertices); `"arrow"`: (2, 1) left barb, (2, −1) right barb, (3, 0) tip, as {@link headLineTemplate} (`2·M + 5`);
+ * `"half"`: (3, 0) tip, (2, 1) barb, whose two triangles off the last pair tile the one-sided head (`2·M + 4`).
+ */
+export function loopTemplate(samples: number, head: LoopHead): Float32Array {
+  const cubic = lineTemplate(samples);
+  const end = head === "none" ? [4, -1, 4, 1] : head === "arrow" ? [2, 1, 2, -1, 3, 0] : [3, 0, 2, 1];
+  const t = new Float32Array(4 + cubic.length + end.length);
+  t.set([-1, -1, -1, 1]);
+  t.set(cubic, 4);
+  t.set(end, 4 + cubic.length);
+  return t;
+}
+
+/** The value the radius attribute reads without a buffer: a WebGL constant attribute, shared and never written. */
+const ZERO_RADIUS = new Float32Array(1);
+
+/** Radius-column uploads of headed lines (#542), for the per-frame guards: `buffers` created and `bytes` written.
+ *  An unheaded layer adds to neither; a frame whose radii are the array last written adds 0 bytes. */
+export const radiusColumnStats = { buffers: 0, bytes: 0 };
+
+/**
+ * A headed line layer's per-instance target radius `a_radius` (#542), 4 B per instance: an instance buffer
+ * written only when the array is a new object (like the style columns, #179), or without data the WebGL
+ * constant 0 (no buffer, no upload; the tip then sits on the target point).
+ */
+class RadiusColumn {
+  static readonly layout = [{ name: "a_radius", format: "float32" as const, stepMode: "instance" as const }];
+  private buffer: Buffer | null = null;
+  private last: Float32Array | undefined;
+  private room = 0;
+
+  sync(device: Device, models: readonly Model[], data: Float32Array | undefined, count: number, capacity: number, init = false): void {
+    if (!data) {
+      if (!this.buffer && !init) return;
+      this.buffer?.destroy();
+      this.buffer = null;
+      this.last = undefined;
+      this.room = 0;
+      for (const m of models) m.setConstantAttributes({ a_radius: ZERO_RADIUS });
+      return;
+    }
+    if (data === this.last && this.room >= count) return;
+    radiusColumnStats.bytes += data.byteLength;
+    this.last = data;
+    if (this.buffer && this.room >= count) {
+      this.buffer.write(data);
+      return;
+    }
+    this.buffer?.destroy();
+    this.room = Math.max(count, capacity);
+    this.buffer = grownBuffer(device, data, count, this.room);
+    radiusColumnStats.buffers++;
+    for (const m of models) m.setAttributes({ a_radius: this.buffer });
+  }
+
+  destroy(): void {
+    this.buffer?.destroy();
+    this.buffer = null;
+  }
+}
+
 export class InstancedLines {
   count: number;
   /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
@@ -688,6 +774,12 @@ export class InstancedLines {
   private bend: Buffer;
   /** The ends' offsets (#509); the constant zero without them. */
   private readonly ends = new EndOffsets();
+  /** Drawn with its arrowhead (#542, `arrowSize` set): fixed per layer, a change recreates (like `samples`). */
+  private readonly headed: boolean;
+  /** The target radii of a headed layer (#542); null on an unheaded one (no attribute, today's program). */
+  private readonly radius: RadiusColumn | null;
+  /** A self-link loop layer's variant (#542, `curve: "drop"`); null on a link layer. Fixed per layer, like `headed`. */
+  private readonly loop: LoopHead | null;
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
@@ -696,7 +788,13 @@ export class InstancedLines {
     this._capacity = data.count;
     const samples = Math.max(2, (data.samples ?? 2) | 0);
     this._samples = samples;
-    this.corner = device.createBuffer({ data: lineTemplate(samples) });
+    this.loop = loopHeadOf(data);
+    this.headed = this.loop === null && data.arrowSize !== undefined;
+    this.radius = this.headed ? new RadiusColumn() : null;
+    const template = this.loop ? loopTemplate(samples, this.loop) : this.headed ? headLineTemplate(samples) : lineTemplate(samples);
+    const vs = this.loop ? INSTANCED_LOOP_VS : this.headed ? INSTANCED_HEAD_LINE_VS : INSTANCED_LINE_VS;
+    const vertexCount = template.length / 2;
+    this.corner = device.createBuffer({ data: template });
     this.source = device.createBuffer({ data: data.sources });
     this.target = device.createBuffer({ data: data.targets });
     this.widthBuf = device.createBuffer({ data: data.widths });
@@ -713,6 +811,9 @@ export class InstancedLines {
       u_viewport: [width, height],
       u_pickBase: 0,
       ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
+      ...(this.headed ? { u_arrowSize: data.arrowSize ?? 0 } : {}),
+      // A loop's head length (`2·arrowSize`, line style), its centre solve (cot α) and its band (#542).
+      ...(this.loop ? { u_arrowSize: data.arrowSize ?? 0, u_loopCot: data.loopCot ?? DROP_COT, u_loopHalf: this.loop === "half" ? 1 : 0 } : {}),
     };
     const bufferLayout = [
       { name: "a_corner", format: "float32x2" as const },
@@ -722,6 +823,7 @@ export class InstancedLines {
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
       { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
       ...this.ends.layout,
+      ...(this.headed ? RadiusColumn.layout : []),
       ...this.hl.layout,
     ];
     const attributes = {
@@ -734,31 +836,32 @@ export class InstancedLines {
       ...this.hl.attributes(),
     };
     this.model = new Model(device, {
-      vs: INSTANCED_LINE_VS,
+      vs,
       fs: FILL_FS,
       bufferLayout,
       attributes,
       uniforms: this.uniforms,
       parameters: BLEND,
       topology: "triangle-strip",
-      vertexCount: samples * 2,
+      vertexCount,
       instanceCount: this.count,
     });
     // Pick twin: identical geometry + shared instance buffers/uniforms, PICK_FS writes gl_InstanceID.
     if (pick) {
       this.pickModel = new Model(device, {
-        vs: INSTANCED_LINE_VS,
+        vs,
         fs: PICK_FS,
         bufferLayout,
         attributes,
         uniforms: this.uniforms,
         parameters: NO_BLEND,
         topology: "triangle-strip",
-        vertexCount: samples * 2,
+        vertexCount,
         instanceCount: this.count,
       });
     }
     this.ends.init(device, this.models(), data, this._capacity);
+    this.radius?.sync(device, this.models(), data.radii, data.count, this._capacity, true);
   }
 
   /** The fill model and its pick twin, which share the instance attributes. */
@@ -799,6 +902,11 @@ export class InstancedLines {
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? 2) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
+    const loop = loopHeadOf(data);
+    if (loop !== this.loop) return false; // a loop's variant changes its template (#542)
+    if ((loop === null && data.arrowSize !== undefined) !== this.headed) return false; // head on/off changes the program (#542)
+    if (this.headed || loop) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
+    if (loop) this.uniforms["u_loopCot"] = data.loopCot ?? DROP_COT;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
@@ -845,6 +953,7 @@ export class InstancedLines {
       this.hl.write(data);
     }
     this.ends.sync(device, this.models(), data, this._capacity);
+    this.radius?.sync(device, this.models(), data.radii, data.count, this._capacity);
     this.count = data.count;
     this.model.setInstanceCount(data.count);
     this.pickModel?.setInstanceCount(data.count);
@@ -868,6 +977,7 @@ export class InstancedLines {
     this.color.destroy();
     this.bend.destroy();
     this.ends.destroy();
+    this.radius?.destroy();
     this.hl.destroy();
   }
 }

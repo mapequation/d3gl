@@ -204,6 +204,7 @@ function styleColumns(layers: readonly InstancedLayer[]): Map<string, ArrayBuffe
       put("lines.widths", l.lines.widths);
       put("lines.colors", l.lines.colors);
       put("lines.bends", l.lines.bends);
+      put("lines.radii", l.lines.radii);
       put("lines.groups", l.lines.groups);
       put("lines.groups2", l.lines.groups2);
       put("lines.selected", l.lines.selected);

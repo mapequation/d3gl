@@ -137,19 +137,18 @@ describe("state network both view: state nodes sized by the state view's spec, i
 
           // D4: offset columns only in screen mode, on the state nodes and both ends of every link.
           const links = spy.last.get("links");
-          const arrows = spy.last.get("arrows");
           const lineEnds = links?.primitive === "lines" ? links.lines : null;
-          const arrowEnds = arrows?.primitive === "arrows" ? arrows.arrows : null;
+          // #542: a directed link's head rides on its line instance (its ends, its offsets); no arrows layer.
+          expect(spy.last.has("arrows")).toBe(false);
+          expect(lineEnds?.arrowSize).toBeGreaterThan(0);
           if (sizeMode === "screen") {
             expect(nodes.offsets?.length).toBe(2 * graph.state.nodeCount);
             expect(lineEnds?.sourceOffsets?.length).toBe(2 * graph.state.edgeCount);
             expect(lineEnds?.targetOffsets?.length).toBe(2 * graph.state.edgeCount);
-            expect(arrowEnds?.sourceOffsets?.length).toBe(2 * graph.state.edgeCount);
-            expect(arrowEnds?.targetOffsets?.length).toBe(2 * graph.state.edgeCount);
           } else {
             expect(nodes.offsets).toBeUndefined();
             expect(lineEnds?.sourceOffsets).toBeUndefined();
-            expect(arrowEnds?.targetOffsets).toBeUndefined();
+            expect(lineEnds?.targetOffsets).toBeUndefined();
           }
 
           // Each state node's position: its physical node (the anchor) in screen mode, plus its offset in world mode.
