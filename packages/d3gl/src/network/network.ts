@@ -6238,8 +6238,10 @@ export class Network extends BaseEngine {
       data: edgeIds,
       ids: edgeIds,
       sizeMode: filled ? "world" : linkMode,
-      // A filled link keeps the stroke's pick pad, so a thin one is as easy to hover as a stroked one.
+      // A filled link keeps the stroke's pick pad, so a thin one is as easy to hover as a stroked one. Baked
+      // in screen mode, its world-unit pad is 1/bake: 1 px at the bake zoom, re-set by each zoom-end re-bake.
       padFillPick: filled,
+      pickTolerance: 1 / (halfArrow ? bake : arrowBake),
       ...(filled ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit || !drawLinks) return;
@@ -6420,7 +6422,9 @@ export class Network extends BaseEngine {
       ids: seIds,
       // A half-arrow or a directed line is one filled shape (baked to world in screen mode); a plain line keeps the sizeMode.
       sizeMode: filled ? "world" : style.sizeMode,
+      // The pick pad is 1 px at the bake zoom (1/bake world units), as on the full-detail path.
       padFillPick: filled,
+      pickTolerance: 1 / (isHalf ? seBake : arrowBake),
       ...(isHalf
         ? { fill: (_d, i) => (i >= seCount ? loopCss(i) : se.halfArrows ? rgbaCss(se.halfArrows.colors, i) : "") }
         : arrowLine

@@ -228,6 +228,10 @@ export interface LayerSpec<D = unknown> {
   pickable?: boolean;
   /** When true, a fill also hits within the pick tolerance of its outline, as a stroke does (filled links, #542). */
   padFillPick?: boolean;
+  /** The pick pad (the stroke's inflation and {@link padFillPick}'s band) in the layer's own units: px for a
+   *  "screen" layer, world units for a "world" one. Default 1. A world layer baked from px geometry at zoom k
+   *  passes 1/k, so its pad stays 1 px at the bake zoom, as a screen layer's (#542). */
+  pickTolerance?: number;
   /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
   selection?: SelectionOptions;
   /** Hover-highlight for this layer: `true`/style/fn, or a `{ hovered?, others? }` object (#162). */
@@ -927,7 +931,7 @@ export abstract class BaseEngine {
     else this.specs.push(spec);
     // pickable:false skips the hit index entirely (no Entry-per-drawable) — for big
     // non-interactive layers. pick() simply can't return that layer (get()?.pick → skip).
-    if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name), 1, spec.sizeMode === "screen", spec.padFillPick === true));
+    if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name), spec.pickTolerance ?? 1, spec.sizeMode === "screen", spec.padFillPick === true));
     else this.hitIndexes.delete(spec.name);
     // A rebuild (rotation/projection) re-projected the source geometry: rebuild the
     // overlay from the stored ids so the highlight tracks it. (A re-DECLARED layer had
