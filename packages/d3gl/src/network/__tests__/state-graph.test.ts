@@ -1,11 +1,24 @@
 import { describe, it, expect } from "vitest";
 import { buildStateGraph, lumpStateGraph } from "../state-graph.js";
+import { buildModuleLODTree, type ModuleLink } from "../modules.js";
+import type { LODTopology } from "../lod.js";
 
 /** Directed physical edge → weight, for order-independent assertions on the aggregation. */
 function physEdges(g: { source: Uint32Array; target: Uint32Array; weight: Float32Array }): Map<string, number> {
   const m = new Map<string, number>();
   for (let e = 0; e < g.source.length; e++) m.set(`${g.source[e]}->${g.target[e]}`, g.weight[e]!);
   return m;
+}
+
+/** All directed super-edges as sorted `[source, target, flow]` triples, flows rounded to 1e-6. */
+function superEdges(tree: LODTopology): [number, number, number][] {
+  const out: [number, number, number][] = [];
+  const { superEdgeOffset: offset, superEdgeTarget: target, superEdgeFlow: flow } = tree;
+  if (!offset || !target || !flow) return out;
+  for (let g = 0; g < tree.size; g++) {
+    for (let k = offset[g] ?? 0; k < (offset[g + 1] ?? 0); k++) out.push([g, target[k] ?? -1, Math.round((flow[k] ?? 0) * 1e6) / 1e6]);
+  }
+  return out.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
 }
 
 describe("buildStateGraph", () => {
@@ -150,5 +163,79 @@ describe("lumpStateGraph (#529)", () => {
   it("throws on a record out of range or a state node with no record", () => {
     expect(() => lumpStateGraph(sg, [...modules, { id: 5, path: [1, 4] }])).toThrow(/out of range/);
     expect(() => lumpStateGraph(sg, modules.slice(1))).toThrow(/no module record for state node 0/);
+  });
+});
+
+describe("lumpStateGraph with module links (#533)", () => {
+  // The #529 fixture above: lumps A·1 = {0,1} [1,1], A·2 = {2} [2,1], B·1 = {3} [1,2], B·2 = {4} [2,2].
+  const sg = buildStateGraph({
+    stateCount: 5,
+    stateToPhysical: [0, 0, 0, 1, 1],
+    source: [0, 0, 1, 2, 4, 2],
+    target: [1, 3, 3, 4, 0, 0],
+    weight: [7, 2, 1, 4, 5, 6],
+    nodeFlow: [0.1, 0.2, 0.3, 0.15, 0.25],
+    directed: true,
+  });
+  const modules = [
+    { id: 0, path: [1, 1] },
+    { id: 1, path: [1, 2] },
+    { id: 2, path: [2, 1] },
+    { id: 3, path: [1, 3] },
+    { id: 4, path: [2, 2] },
+  ];
+  const paths = (links: readonly ModuleLink[] | null) => links?.map((l) => [Array.from(l.source), Array.from(l.target), l.flow]);
+
+  it("keeps a module endpoint's path and maps a leaf endpoint to the path of the lump that holds it", () => {
+    const links: ModuleLink[] = [
+      { source: [1], target: [2], flow: 0.4 },
+      { source: [1, 3], target: [2], flow: 0.1 }, // state 3 → lump B·1, ranked [1, 2]
+      { source: [2, 1], target: [1, 1], flow: 0.05 }, // state 2 → lump A·2 [2, 1]; state 0 → lump A·1 [1, 1]
+    ];
+    const { moduleLinks } = lumpStateGraph(sg, modules, links);
+    expect(paths(moduleLinks)).toEqual([[[1], [2], 0.4], [[1, 2], [2], 0.1], [[2, 1], [1, 1], 0.05]]);
+    expect(paths(lumpStateGraph(sg, modules).moduleLinks), "no module links given: none").toBeUndefined();
+  });
+
+  it("feeds the lumped module tree's super-edges: each link at its own endpoints, nothing else added", () => {
+    const links: ModuleLink[] = [{ source: [1, 3], target: [2], flow: 0.1 }];
+    const lumped = lumpStateGraph(sg, modules, links);
+    const records = lumped.modules ?? [];
+    const without = superEdges(buildModuleLODTree(4, records, lumped.graph.state));
+    const tree = buildModuleLODTree(4, records, lumped.graph.state, lumped.moduleLinks ?? undefined);
+    const m1 = tree.parent?.[0] ?? -1; // lump A·1's module, [1]
+    const m2 = tree.parent?.[1] ?? -1; // lump A·2's module, [2]
+    // Each super-edge's flow less its flow without the link: the link from lump B·1 (state 3's) into module 2, which
+    // module 1 holds, so its module → module edge carries it too.
+    const added = superEdges(tree)
+      .map(([s, t, f]): [number, number, number] => [s, t, Math.round((f - (without.find((w) => w[0] === s && w[1] === t)?.[2] ?? 0)) * 1e6) / 1e6])
+      .filter((e) => e[2] !== 0);
+    expect(added).toEqual([[2, m2, 0.1], [m1, m2, 0.1]]);
+  });
+
+  it("gives a ragged module's lumps ranks its sub-modules do not use, so a leaf endpoint names the lump", () => {
+    // Module 1 holds sub-modules 1:1, 1:2 and the leaf 1:3 (state 4), as Infomap numbers a ragged module's children.
+    const ragged = buildStateGraph({ stateCount: 5, stateToPhysical: [0, 1, 2, 3, 4], source: [0], target: [1], directed: true });
+    const records = [
+      { id: 0, path: [1, 1, 1] },
+      { id: 1, path: [1, 1, 2] },
+      { id: 2, path: [1, 2, 1] },
+      { id: 3, path: [2, 1] },
+      { id: 4, path: [1, 3] },
+    ];
+    const links: ModuleLink[] = [{ source: [1, 2], target: [1, 3], flow: 0.05 }];
+    const lumped = lumpStateGraph(ragged, records, links);
+    const lump4 = lumped.stateToLump[4] ?? -1;
+    const path4 = lumped.modules?.[lump4]?.path ?? [];
+    expect(Array.from(path4), "not [1, 1]: that is sub-module 1:1").toEqual([1, 3]);
+    expect(paths(lumped.moduleLinks)).toEqual([[[1, 2], [1, 3], 0.05]]);
+    const tree = buildModuleLODTree(5, lumped.modules ?? [], undefined, lumped.moduleLinks ?? undefined);
+    const m12 = tree.parent?.[lumped.stateToLump[2] ?? -1] ?? -1;
+    expect(superEdges(tree)).toEqual([[m12, lump4, 0.05]]);
+  });
+
+  it("throws on module links without modules, or with an endpoint outside the hierarchy", () => {
+    expect(() => lumpStateGraph(sg, null, [{ source: [1], target: [2], flow: 1 }])).toThrow(/requires modules/);
+    expect(() => lumpStateGraph(sg, modules, [{ source: [9], target: [2], flow: 1 }])).toThrow(/endpoint 9 is not in the module tree/);
   });
 });
