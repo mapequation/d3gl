@@ -267,7 +267,8 @@ export function loopsToDrawables(l: InstancedLoopsData, bake = 1): DrawableVecto
       const cy = l.centers[e * 2 + 1] ?? 0;
       const sx = cx + offsetAt(so, e * 2, inv), sy = cy + offsetAt(so, e * 2 + 1, inv);
       const tx = cx + offsetAt(to, e * 2, inv), ty = cy + offsetAt(to, e * 2 + 1, inv);
-      out.push(drawable(e, { subpaths: record((ctx) => traceLoop(ctx, sx, sy, tx, ty, loopPieceLength(l.arrowSize, width) * inv, leg, cot)), stroke: color, lineWidth: width }));
+      const subpaths = record((ctx) => traceLoop(ctx, sx, sy, tx, ty, loopPieceLength(l.arrowSize, width) * inv, leg, cot));
+      if (subpaths.length > 0) out.push(drawable(e, { subpaths, stroke: color, lineWidth: width }));
       continue;
     }
     const cx = (l.centers[e * 2] ?? 0) * bake;

@@ -171,4 +171,26 @@ describe("instancedVectorLayers (#200)", () => {
     );
     expect(out.map((l) => l.name)).toEqual(["links", "nodes"]);
   });
+
+  it("loops: a degenerate loop (its two ends at one point) is skipped for every head, as the headed ones are (#542)", () => {
+    for (const head of ["none", "arrow", "half"] as const) {
+      const layer: InstancedLayer = {
+        name: "self-loops",
+        primitive: "loops",
+        loops: {
+          head,
+          arrowSize: 4,
+          // Loop 0 leaves and returns at the same rim point (a zero-radius node): nothing to trace. Loop 1 is a real loop.
+          centers: Float32Array.from([0, 0, 50, 50]),
+          startOffsets: Float32Array.from([0, 0, 6, 0]),
+          endOffsets: Float32Array.from([0, 0, 0, 6]),
+          widths: Float32Array.from([2, 2]),
+          colors: Uint8Array.from([1, 2, 3, 255, 4, 5, 6, 255]),
+          count: 2,
+        },
+      };
+      const [out] = instancedVectorLayers([layer], 1);
+      expect(out?.drawables.map((d) => d.subpaths.length > 0), head).toEqual([true]);
+    }
+  });
 });
