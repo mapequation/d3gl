@@ -1,6 +1,6 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, DROP_LINE_VS, DROP_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
 
@@ -763,7 +763,7 @@ export class InstancedLines {
     this._samples = samples;
     this.headed = data.arrowSize !== undefined;
     this.radius = this.headed ? new RadiusColumn() : null;
-    const vs = this.headed ? INSTANCED_HEAD_LINE_VS : INSTANCED_LINE_VS;
+    const vs = this.headed ? INSTANCED_HEAD_LINE_VS : data.curve === "drop" ? DROP_LINE_VS : INSTANCED_LINE_VS;
     const vertexCount = this.headed ? samples * 2 + 3 : samples * 2;
     this.corner = device.createBuffer({ data: this.headed ? headLineTemplate(samples) : lineTemplate(samples) });
     this.source = device.createBuffer({ data: data.sources });
@@ -1272,7 +1272,7 @@ export class InstancedHalfArrows {
       ...this.hl.attributes(),
     };
     this.model = new Model(device, {
-      vs: INSTANCED_HALF_ARROW_VS,
+      vs: data.curve === "drop" ? DROP_HALF_ARROW_VS : INSTANCED_HALF_ARROW_VS,
       fs: FILL_FS,
       bufferLayout,
       attributes,
@@ -1284,7 +1284,7 @@ export class InstancedHalfArrows {
     });
     if (pick) {
       this.pickModel = new Model(device, {
-        vs: INSTANCED_HALF_ARROW_VS,
+        vs: data.curve === "drop" ? DROP_HALF_ARROW_VS : INSTANCED_HALF_ARROW_VS,
         fs: PICK_FS,
         bufferLayout,
         attributes,

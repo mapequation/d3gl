@@ -151,6 +151,12 @@ export interface InstancedCirclesData {
 
 /** SoA for a batch of instanced lines (e.g. network links); straight, or bent via {@link bends}. */
 export interface InstancedLinesData {
+  /**
+   * `"drop"`: the self-link drop (#505, `core/loop-drop.ts`): a cubic from the source end to the target end whose
+   * end tangents pass through the node centre, with `bends` read as its control reach in node radii. A separate
+   * program, chosen per layer, so an ordinary link layer runs the quadratic lane unchanged. Absent = quadratic.
+   */
+  curve?: "drop";
   /** [x, y] world source per line, length `2 * count`. */
   sources: Float32Array;
   /** [x, y] world target per line, length `2 * count`. */
@@ -267,6 +273,12 @@ export interface InstancedArrowsData {
  * the target boundary, bowed around a shared centre curve (see network/half-link.ts). All world units.
  */
 export interface InstancedHalfArrowsData {
+  /**
+   * `"drop"`: the self-link drop (#505, `core/loop-drop.ts`): the drop filled as one half-arrow glyph, its tip on
+   * the rim at the target end, with `bends` read as its control reach in node radii. A separate
+   * program, chosen per layer, so an ordinary link layer runs the quadratic lane unchanged. Absent = quadratic.
+   */
+  curve?: "drop";
   /** [x, y] world source centre per link, length `2 * count`. */
   sources: Float32Array;
   /** [x, y] world target centre per link, length `2 * count`. */
