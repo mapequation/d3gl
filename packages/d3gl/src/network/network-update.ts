@@ -20,8 +20,8 @@ export interface NetworkUpdatePlan {
 /**
  * Check a change to the flow and the modules of a network of `nodeCount` nodes that holds `held` (#547), as
  * `data()` checks its hierarchy: a flow value per node, a module record for every node exactly once, and every
- * module link endpoint a module or leaf of the hierarchy it ends up with. A field left out is unchanged; new
- * modules keep the held module links (checked against them); `modules: null` removes the modules and their links.
+ * module link endpoint a module or leaf of the hierarchy it ends up with. A field left out is unchanged, except that
+ * new modules without `moduleLinks` clear the held module links; `modules: null` removes the modules and their links.
  * Throws, prefixed with `who`, on a bad change. O(nodes + total path length + module links), and nothing is
  * changed: the caller applies the plan only once it has passed.
  */
@@ -38,7 +38,9 @@ export function planNetworkUpdate(who: string, nodeCount: number, opts: NetworkU
     if (moduleLinks) throw new Error(`${who}: moduleLinks requires modules`);
     return { flow: nextFlow, hierarchy: null };
   }
-  const nextLinks = moduleLinks === undefined ? held?.moduleLinks : (moduleLinks ?? undefined);
+  // New modules clear the held module links unless new ones come with them: those are addressed in the old
+  // partition's paths, and an old path that happens to exist in the new modules would draw a wrong link.
+  const nextLinks = moduleLinks !== undefined ? (moduleLinks ?? undefined) : modules === undefined ? held?.moduleLinks : undefined;
   // Held records were checked when they were set; new ones are checked here.
   const recordOf = modules === undefined && held ? held.recordOf : moduleRecordIndex(nodeCount, nextModules);
   if (nextLinks) checkModuleLinks(nodeCount, nextModules, nextLinks);

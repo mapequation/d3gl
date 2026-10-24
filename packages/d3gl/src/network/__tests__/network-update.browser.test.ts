@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { network, type Network, type NetworkHit, type NetworkStyle } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
-import { buildStateGraph } from "../state-graph.js";
 import type { ModuleLink, ModuleNode } from "../modules.js";
 
 /**
@@ -117,7 +116,7 @@ describe("network.update({ flow, modules, moduleLinks }) (#547)", () => {
     const net = await shown(graph(), MODULES, links, true);
     net.update({ flow: FLOW });
     expect(net.toSVG()).toBe(await loadedSVG(FLOW, MODULES, links, true));
-    net.update({ modules: PAIRS, moduleLinks: null });
+    net.update({ modules: PAIRS }); // new modules clear the held module links
     expect(net.toSVG()).toBe(await loadedSVG(FLOW, PAIRS, undefined, true));
     net.destroy();
   });
@@ -174,12 +173,9 @@ describe("network.update({ flow, modules, moduleLinks }) (#547)", () => {
     net.destroy();
   });
 
-  it("throws with no network loaded, and on a state network for now", async () => {
+  it("throws with no network loaded", async () => {
     const net = await engine();
     expect(() => net.update({ flow: FLOW })).toThrow(/network\.update: no network loaded/);
-    const state = buildStateGraph({ stateCount: 2, stateToPhysical: [0, 1], source: [0], target: [1], nodeFlow: [1, 1], directed: true });
-    net.stateNetwork(state);
-    expect(() => net.update({ flow: [1, 1] })).toThrow(/state networks are not supported yet/);
     net.destroy();
   });
 });

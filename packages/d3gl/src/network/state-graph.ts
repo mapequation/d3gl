@@ -165,12 +165,21 @@ function mergeGroups(graph: NetworkGraph, groupOf: Uint32Array, groupCount: numb
     weight[i] = w;
     i++;
   }
-  let flow: Float32Array | undefined;
-  if (graph.flow) {
-    flow = new Float32Array(groupCount);
-    for (let s = 0; s < graph.nodeCount; s++) flow[groupOf[s]!] = flow[groupOf[s]!]! + graph.flow[s]!;
-  }
+  const flow = graph.flow ? groupFlow(graph.flow, groupOf, groupCount) : undefined;
   return buildGraph({ nodeCount: groupCount, source, target, weight, nodeFlow: flow, directed: graph.directed });
+}
+
+/**
+ * Each group's flow, the sum of its members' (#547): a physical node's from its state nodes' (`groupOf` =
+ * {@link StateNetworkGraph.stateToPhysical}), a lump's from its state nodes'. O(members).
+ */
+export function groupFlow(flow: ArrayLike<number>, groupOf: ArrayLike<number>, groupCount: number): Float32Array {
+  const out = new Float32Array(groupCount);
+  for (let s = 0; s < groupOf.length; s++) {
+    const g = groupOf[s] ?? 0;
+    out[g] = (out[g] ?? 0) + (flow[s] ?? 0);
+  }
+  return out;
 }
 
 /**
