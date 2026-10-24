@@ -169,6 +169,18 @@ export interface InstancedLinesData {
    * setting, not per-instance; bent layers raise it, straight layers keep `2` to stay cheap at scale.
    */
   samples?: number;
+  /**
+   * Arrow size (#542): set ⇒ every line of the layer is drawn WITH its arrowhead, shaft + head as one shape
+   * (`core/arrowhead.ts`): the tip sits {@link radii} back from the target along the curve's end tangent, the head
+   * is `2·arrowSize` long and as wide as the half-arrow barb rule makes it. In the layer's size units, like the
+   * widths. A draw setting like `samples`: turning the head on or off recreates the layer; absent ⇒ today's line.
+   */
+  arrowSize?: number;
+  /**
+   * Headed lines only (#542): the target node's radius per line (per edge with `index`), in size units. Absent ⇒ 0
+   * (the tip on the target point) with no buffer and no upload. Uploaded only when the array is a new object.
+   */
+  radii?: Float32Array;
   /** Per-instance highlight group (#162): the link's **source** node id, matched against `u_hoverGroup`
    *  / used to index the selected set so the vertex shader recolours a highlighted node's links. Length `count`. */
   groups?: Float32Array;

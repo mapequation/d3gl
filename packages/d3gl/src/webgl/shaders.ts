@@ -359,6 +359,58 @@ void main() {
   }
 }`;
 
+// INSTANCED_HEAD_LINE_VS — a line WITH its arrowhead as one instance (#542): the whole arrow is one strip.
+// The twin of `core/arrowhead.ts` `arrowOutline`: the tip sits `a_radius` back from the target along the
+// curve's end tangent; the head is `2·u_arrowSize` long and `a_width/2 + 2·sqrt(a_width)` wide each side
+// (the half-arrow barb rule, `barbOverhang`); the shaft is trimmed at the head's BASE and its last sample
+// snaps onto the base with the head's normal. The template (`headLineTemplate`) is the line's `(t, side)`
+// samples, then (2, 1) left barb, (2, -1) right barb, (3, 0) tip: the two triangles that join the shaft's
+// last pair to the barbs are collinear (all on the base edge, zero area), so one strip draws shaft + head
+// with no overlap and a translucent arrow blends once. Units follow sizeMode like the line (px or world).
+const HEAD_LINE_DECL = `
+uniform float u_arrowSize;  // head length = 2·u_arrowSize (#542)
+in float a_radius;          // per-instance target radius: the tip sits this far back from the target`;
+const HEAD_LINE_BODY = `  float t = a_corner.x;
+  float side = a_corner.y;
+  float hw = a_width * 0.5;
+  bool screen = u_screen > 0.5;
+  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
+  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
+  vec2 d = tgt - src;
+  vec2 ctrl = 0.5 * (src + tgt) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
+  vec2 e = tgt - ctrl;                                      // B'(1) / 2
+  vec2 ux = normalize(e);
+  vec2 un = vec2(-ux.y, ux.x);
+  vec2 tip = tgt - ux * a_radius;
+  float len = 2.0 * u_arrowSize;                            // headLength
+  vec2 base = tip - ux * len;
+  vec2 pos;
+  if (t > 2.5) {
+    pos = tip;
+  } else if (t > 1.5) {
+    pos = base + un * side * (hw + 2.0 * sqrt(a_width));    // headHalfWidth: the barbs
+  } else if (t >= 1.0) {
+    pos = base + un * side * hw;                            // the shaft's end, snapped onto the base
+  } else {
+    float tt = t * clamp(1.0 - (a_radius + len) / (2.0 * length(e)), 0.0, 1.0); // trimParam
+    float u = 1.0 - tt;
+    vec2 p = u * u * src + 2.0 * u * tt * ctrl + tt * tt * tgt;
+    vec2 dir = normalize(2.0 * u * (ctrl - src) + 2.0 * tt * (tgt - ctrl));
+    pos = p + vec2(-dir.y, dir.x) * side * hw;
+  }
+  gl_Position = screen
+    ? vec4(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0, 0.0, 1.0)
+    : vec4((u_transform * vec3(pos, 1.0)).xy, 0.0, 1.0);
+}`;
+
+function headLineVS(vs: string): string {
+  const at = vs.indexOf("  float t = a_corner.x;");
+  if (at < 0 || !vs.includes("\nin float a_bend;")) throw new Error("headLineVS: unexpected line shader");
+  return vs.slice(0, at).replace("\nin float a_bend;", `${HEAD_LINE_DECL}\nin float a_bend;`) + HEAD_LINE_BODY;
+}
+
+export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
+
 // INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
 // One triangle per instance: per-vertex a_tri = (back, across), tip (0,0); the symmetric template
 // has base (2,-1)/(2,1), the half template (2,0)/(2,1) (one-sided, for bent map links so reciprocal
@@ -596,16 +648,23 @@ const SELECTED_FETCH = `
   a_selected = edgeFetch(u_edgeSelected).r > 0.0 ? 1.0 : 0.0;`;
 
 /** Lines by edge (the ends stay per-instance attributes); style0 (width, bend, group, group2); colour; selected. */
-export const INDEXED_LINE_VS = indexedVS(
-  INSTANCED_LINE_VS,
-  ["a_width", "a_color", "a_bend", ...HL_FIELDS],
-  ["u_edgeStyle0", "u_edgeColor", "u_edgeSelected"],
-  `
+const LINE_FETCH = `
   vec4 s = edgeFetch(u_edgeStyle0);
   a_width = s.x;
   a_bend = s.y;
   a_group = s.z;
-  a_group2 = s.w;${SELECTED_FETCH}`,
+  a_group2 = s.w;${SELECTED_FETCH}`;
+const LINE_FIELDS = ["a_width", "a_color", "a_bend", ...HL_FIELDS];
+const LINE_SAMPLERS = ["u_edgeStyle0", "u_edgeColor", "u_edgeSelected"];
+export const INDEXED_LINE_VS = indexedVS(INSTANCED_LINE_VS, LINE_FIELDS, LINE_SAMPLERS, LINE_FETCH);
+
+/** Headed lines by edge (#542): the line's tables plus an r32float target-radius table. */
+export const INDEXED_HEAD_LINE_VS = indexedVS(
+  INSTANCED_HEAD_LINE_VS,
+  [...LINE_FIELDS, "a_radius"],
+  [...LINE_SAMPLERS, "u_edgeRadius"],
+  `${LINE_FETCH}
+  a_radius = edgeFetch(u_edgeRadius).r;`,
 );
 
 /** Arrowheads by edge: style0 (size, radius, bend, group); style1 (group2); colour; selected. */

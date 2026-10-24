@@ -9,6 +9,7 @@ import type {
   VectorLayer,
 } from "./backend.js";
 import { PathRecorder } from "./path-recorder.js";
+import { arrowOutline } from "./arrowhead.js";
 import { DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
 import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
@@ -213,6 +214,44 @@ export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): Drawab
 }
 
 /**
+ * Headed instanced lines (#542, `arrowSize` set) → one filled outline per line: shaft + head as ONE closed
+ * polygon ({@link arrowOutline}, the GPU strip's twin), so a translucent arrow blends once. `bake` as
+ * {@link arrowsToDrawables}: solve in px (×k) on a screen layer and emit ÷k, end offsets unscaled in the solve space.
+ */
+export function headedLinesToDrawables(l: InstancedLinesData, bake = 1): DrawableVector[] {
+  const inv = 1 / bake;
+  const samples = Math.max(2, (l.samples ?? 2) | 0);
+  const pts = new Float64Array(2 * (2 * samples + 3));
+  const { sourceOffsets: so, targetOffsets: to } = l;
+  const out: DrawableVector[] = [];
+  for (let e = 0; e < l.count; e++) {
+    const r = styleRow(l, e);
+    const n = arrowOutline(pts, 0, {
+      sx: (l.sources[e * 2] ?? 0) * bake + offsetAt(so, e * 2, 1),
+      sy: (l.sources[e * 2 + 1] ?? 0) * bake + offsetAt(so, e * 2 + 1, 1),
+      tx: (l.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1),
+      ty: (l.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1),
+      radius: l.radii ? (l.radii[r] ?? 0) : 0,
+      width: l.widths[r] ?? 0,
+      size: l.arrowSize ?? 0,
+      bend: l.bends ? (l.bends[r] ?? 0) : 0,
+    }, samples);
+    if (n === 0) continue;
+    out.push(
+      drawable(e, {
+        subpaths: record((ctx) => {
+          ctx.moveTo((pts[0] ?? 0) * inv, (pts[1] ?? 0) * inv);
+          for (let i = 1; i < n; i++) ctx.lineTo((pts[2 * i] ?? 0) * inv, (pts[2 * i + 1] ?? 0) * inv);
+          ctx.closePath();
+        }),
+        fill: linkColor(l, e),
+      }),
+    );
+  }
+  return out;
+}
+
+/**
  * Instanced arrowheads → one filled triangle per arrow, tip set back to the target node's boundary.
  * `bake` mirrors the Scene twin's screen-sizeMode trick: solve in pixel space (×k) and emit ÷k, so
  * the world-coordinate output reproduces the constant-pixel GPU render under the view's ×k transform.
@@ -311,7 +350,8 @@ export function instancedVectorLayers(
         out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: pieToDrawables(layer.pie, screen, tolerance) });
         break;
       case "lines":
-        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: linesToDrawables(layer.lines, 1 / bake) });
+        if (layer.lines.arrowSize !== undefined) out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: headedLinesToDrawables(layer.lines, bake) });
+        else out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: linesToDrawables(layer.lines, 1 / bake) });
         break;
       case "arrows":
         out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: arrowsToDrawables(layer.arrows, bake) });

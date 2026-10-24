@@ -153,6 +153,12 @@ A zoom frame with LOD off uploads nothing before and after (assert in network-sw
   head stays only in the `half-arrow` style. Reason: bug seen 2026-10-23 — with `linkStyle: "line"` and a bend, the
   separately drawn heads look one-sided, bend more than their lines and some sit outside their line. Check whether
   that bug is on main (not only on the #528/#536 branches) and add a pixel test for it.
+- **Shaft ends at the head's base on every backend (coordinator, 2026-10-24, step 2).** All backends draw the
+  `arrowOutline` shape: the shaft is trimmed at the head's BASE (trim = `headLength`), not at the setback `s`.
+  With the head always wider than the line (barb rule) there is no line edge beside the tip and no gap, and nothing
+  overlaps, so translucent links never double-blend. The WebGL strip is the shaft samples (last pair snapped onto the
+  base), then left barb, right barb, tip: the two joining triangles lie on the base (zero area), so one strip per
+  link, one draw call per layer. `shaftSetback` is no longer used by any renderer (kept for its tests).
 - Timing: start after the user's quota reset (2026-10-24 evening), step 1 first; steps 2–5 after #528/#536 merge.
 
 ## Risks

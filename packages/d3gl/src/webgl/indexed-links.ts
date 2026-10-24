@@ -1,8 +1,8 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass, Texture } from "@luma.gl/core";
-import { INDEXED_LINE_VS, INDEXED_ARROW_VS, INDEXED_HALF_ARROW_VS, FILL_FS, PICK_FS } from "./shaders.js";
+import { INDEXED_LINE_VS, INDEXED_HEAD_LINE_VS, INDEXED_ARROW_VS, INDEXED_HALF_ARROW_VS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import { ARROW_TEMPLATE, HALF_ARROW_TEMPLATE, HALF_ARROW_SAMPLES, END_OFFSETS, halfArrowTemplate, lineTemplate, offsetLayout, zeroOffsets } from "./instanced.js";
+import { ARROW_TEMPLATE, HALF_ARROW_TEMPLATE, HALF_ARROW_SAMPLES, END_OFFSETS, halfArrowTemplate, headLineTemplate, lineTemplate, offsetLayout, zeroOffsets } from "./instanced.js";
 import type { InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
 
 /**
@@ -36,7 +36,7 @@ export const indexedLinkStats = { tableBytes: 0, tablesBuilt: 0, instanceBytes: 
 /** Texels per table row: the tables are `width × rows`, `rows` ≤ the device's largest texture side. */
 const TABLE_WIDTH = 4096;
 
-type TableFormat = "rgba32float" | "rgba8unorm" | "r8unorm";
+type TableFormat = "rgba32float" | "r32float" | "rgba8unorm" | "r8unorm";
 
 /** One per-edge table: the uniform it binds to, its texel format, the source arrays it is packed from (the
  *  upload skips while every one is the same object), and the packer that writes `rows × width` texels. */
@@ -47,7 +47,7 @@ interface TableSpec {
   pack: (out: Float32Array | Uint8Array, n: number) => void;
 }
 
-const CHANNELS: Record<TableFormat, number> = { rgba32float: 4, rgba8unorm: 4, r8unorm: 1 };
+const CHANNELS: Record<TableFormat, number> = { rgba32float: 4, r32float: 1, rgba8unorm: 4, r8unorm: 1 };
 
 interface Table {
   texture: Texture;
@@ -58,7 +58,7 @@ interface Table {
 /** A table's texels for `rows × width` entries, packed afresh (never retained: the texture holds them). */
 function texels(format: TableFormat, entries: number): Float32Array | Uint8Array {
   const size = entries * CHANNELS[format];
-  return format === "rgba32float" ? new Float32Array(size) : new Uint8Array(size);
+  return format === "rgba32float" || format === "r32float" ? new Float32Array(size) : new Uint8Array(size);
 }
 
 function sameRefs(a: readonly unknown[], b: readonly unknown[]): boolean {
@@ -358,7 +358,21 @@ function lineSpecs(d: InstancedLinesData): TableSpec[] {
     },
     colorSpec(d.colors),
     selectedSpec(d.selected),
+    ...(d.arrowSize !== undefined ? [radiusSpec(d.radii)] : []),
   ];
+}
+
+/** A headed line layer's target radii (#542): one r32float texel (4 B) per edge; zeros without `radii`. */
+function radiusSpec(radii: Float32Array | undefined): TableSpec {
+  return {
+    name: "u_edgeRadius",
+    format: "r32float",
+    refs: [radii],
+    pack: (out, n) => {
+      if (!radii) out.fill(0, 0, n);
+      else out.set(radii.subarray(0, n));
+    },
+  };
 }
 
 function arrowSpecs(d: InstancedArrowsData): TableSpec[] {
@@ -465,16 +479,24 @@ export class IndexedLines extends IndexedLinks {
   protected readonly draw: IndexedLinkDraw;
   protected readonly template: Buffer;
   private readonly samples: number;
+  /** Drawn with its arrowhead (#542, `arrowSize` set): fixed per layer, a change recreates. */
+  private readonly headed: boolean;
   constructor(device: Device, data: InstancedLinesData, width = 0, height = 0, pick = false) {
     const { inst, tableCount } = instancesOf(data);
     super(tableCount);
     this.samples = Math.max(2, (data.samples ?? 2) | 0);
-    this.template = device.createBuffer({ data: lineTemplate(this.samples) });
-    this.draw = new IndexedLinkDraw(device, { vs: INDEXED_LINE_VS, template: this.template, templateName: "a_corner", ends: ["a_source", "a_target"], vertexCount: this.samples * 2, topology: "triangle-strip" }, inst, tableCount, lineSpecs(data), width, height, pick);
+    this.headed = data.arrowSize !== undefined;
+    this.template = device.createBuffer({ data: this.headed ? headLineTemplate(this.samples) : lineTemplate(this.samples) });
+    const vs = this.headed ? INDEXED_HEAD_LINE_VS : INDEXED_LINE_VS;
+    const vertexCount = this.headed ? this.samples * 2 + 3 : this.samples * 2;
+    this.draw = new IndexedLinkDraw(device, { vs, template: this.template, templateName: "a_corner", ends: ["a_source", "a_target"], vertexCount, topology: "triangle-strip" }, inst, tableCount, lineSpecs(data), width, height, pick);
+    if (this.headed) this.draw.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
   }
-  /** `false` when the data is not indexed or its sample count changed: the caller recreates. */
+  /** `false` when the data is not indexed or its sample count or head changed: the caller recreates. */
   update(_device: Device, data: InstancedLinesData): boolean {
     if (!data.index || Math.max(2, (data.samples ?? 2) | 0) !== this.samples) return false;
+    if ((data.arrowSize !== undefined) !== this.headed) return false;
+    if (this.headed) this.draw.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
     const { inst, tableCount } = instancesOf(data);
     this.tableCount = tableCount;
     this.draw.update(inst, tableCount, lineSpecs(data));

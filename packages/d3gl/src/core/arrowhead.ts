@@ -44,7 +44,8 @@ export function headLength(size: number): number {
 /**
  * Distance back from the tip where the head is exactly as wide as the line: the shaft ends there.
  * The head tapers linearly, so `s = length · (width/2) / halfWidth`; it is always `< length` for a
- * positive size (the head is wider than the line), and 0 for a zero-width line.
+ * positive size (the head is wider than the line), and 0 for a zero-width line. No renderer trims here
+ * (all end the shaft at the head's base, #542 step 2); kept as the reference for the tests' geometry.
  */
 export function shaftSetback(width: number, size: number): number {
   const h = headHalfWidth(width);
@@ -87,8 +88,9 @@ export interface ArrowParams {
 /**
  * Write the shaft's edge pairs (left, right per sample — triangle-strip order, the WebGL twin) for a
  * shaft trimmed `trim` back from the tip. `samples ≥ 2`: samples `0 … samples−2` lie on the curve at
- * `t = t1·i/(samples−1)`, the last is snapped to `tip − dir·trim` with the head's normal. Pass
- * `trim = shaftSetback(width, size)` for the strip (end corners on the head's side edges). Writes
+ * `t = t1·i/(samples−1)`, the last is snapped to `tip − dir·trim` with the head's normal. Every backend
+ * passes `trim = headLength(size)` (#542 step 2: the shaft ends on the head's base, as in
+ * {@link arrowOutline} and the WebGL strip). Writes
  * `4·samples` numbers at `o`; returns the number of points written (0 for a zero-length link).
  */
 export function arrowShaft(out: PointBuffer, o: number, p: ArrowParams, trim: number, samples: number): number {
