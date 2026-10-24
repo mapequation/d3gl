@@ -4,6 +4,7 @@ import { buildGraph } from "../graph.js";
 import { keptLoopStats, selfLoopStats } from "../self-loops.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost, zoomSteps } from "../../__tests__/engine-sweep.js";
+import { loopCenterStats } from "../../webgl/instanced.js";
 
 /**
  * Self-link loops (#505) at ≈1M nodes (docs/agents/performance.md), LOD off and on, on WebGL, through the real
@@ -153,8 +154,9 @@ const TIMEOUT = perfBudget(180_000 + N / 2);
 /** The looped hub's degree: a star whose centre has a self-link (fixed, ≥ 10⁵: the degree is what is guarded). */
 const HUB_DEGREE = 100_000;
 
-/** Per zoom frame of an LOD-on sweep over the looped hub: the loop instances written, the neighbours read. */
-async function hubLeg(): Promise<{ perFrame: { instances: number; neighbours: number }[]; row: number }> {
+/** Per zoom frame of an LOD-on sweep over the looped hub: the loop instances written, the neighbours read, the loop
+ *  centre bytes uploaded. */
+async function hubLeg(): Promise<{ perFrame: { instances: number; neighbours: number; centerBytes: number }[]; row: number }> {
   const host = perfHost(W, H);
   const net: Network = network(host, { width: W, height: H, backend: "webgl" });
   try {
@@ -181,13 +183,14 @@ async function hubLeg(): Promise<{ perFrame: { instances: number; neighbours: nu
       .lod({})
       .layout({ backend: "positions", positions });
     net.setTransform({ k: 1, x: 0, y: 0 });
-    const perFrame: { instances: number; neighbours: number }[] = [];
+    const perFrame: { instances: number; neighbours: number; centerBytes: number }[] = [];
     const steps = zoomSteps(W, H);
     for (const t of [...steps, ...steps.slice().reverse()]) {
       const inst = selfLoopStats.instances;
       const nb = selfLoopStats.neighbours;
+      const cb = loopCenterStats.bytes;
       net.setTransform(t);
-      perFrame.push({ instances: selfLoopStats.instances - inst, neighbours: selfLoopStats.neighbours - nb });
+      perFrame.push({ instances: selfLoopStats.instances - inst, neighbours: selfLoopStats.neighbours - nb, centerBytes: loopCenterStats.bytes - cb });
     }
     // One solve of the hub's angle reads its CSR row: its HUB_DEGREE neighbours and its self-link (skipped).
     return { perFrame, row: (graph.csr.offsets[1] ?? 0) - (graph.csr.offsets[0] ?? 0) };
@@ -377,6 +380,10 @@ describe(`self-link loops per frame (#505) at N=${N.toLocaleString()}, S=${S.toL
       // draws it, unless the registration's frame already did), and every other frame copies it.
       const total = perFrame.reduce((a, f) => a + f.neighbours, 0);
       expect(total, `neighbours read over the sweep, per frame ${perFrame.map((f) => f.neighbours).join("/")}`).toBeLessThanOrEqual(row);
+      // A zoom frame that keeps the drawn loop (the same cut of it, the positions unmoved) uploads 0 loop-centre bytes.
+      const kept = perFrame.filter((f, i) => i > 0 && f.instances > 0 && (perFrame[i - 1]?.instances ?? 0) === f.instances);
+      expect(kept.length, "no two consecutive zoom frames drew the hub's loop").toBeGreaterThanOrEqual(1);
+      expect(kept.map((f) => f.centerBytes), "loop-centre bytes on frames that kept the loop").toEqual(kept.map(() => 0));
       console.log(`  LOD on, hub of degree ${HUB_DEGREE}: loop drawn on ${drawn}/${perFrame.length} zoom frames, ${total} neighbours read`);
     },
     perfBudget(180_000),

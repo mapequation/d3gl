@@ -5612,7 +5612,8 @@ export class Network extends BaseEngine {
    * cache's style, this frame's centres and ends); null for a graph without self-links. Call after
    * {@link frontierSuperEdges}, whose gather stamped the kept leaves. O(min(S, frontier)) to list them, then
    * O(m) for the m drawn, plus the degree of each whose angle is stale (positions moved since it was solved: never on
-   * a zoom frame); a frame that changes none of their values uploads nothing.
+   * a zoom frame); a frame that changes none of their values uploads nothing, the centres included (the loop lane
+   * uploads them only as a new array, which `StableColumns` hands out only for changed values).
    */
   private lodLoopSubsetFor(tree: LODTree, graph: NetworkGraph, style: ResolvedNetworkStyle, frontier: Uint32Array, linkSelected: Uint8Array | undefined): SelfLoopCache | null {
     const c = this.noLodCache(graph, style).loops;

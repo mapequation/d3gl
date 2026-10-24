@@ -195,6 +195,33 @@ function writeIfChanged<T extends ArrayBufferView>(buffer: Buffer, arr: T, last:
  *  update. A frame whose columns are the arrays last written adds 0; a position frame adds the centres alone. */
 export const pieColumnStats = { bytes: 0 };
 
+/** Loop-lane centre uploads (#542), for the per-frame guards: bytes written by an in-place {@link InstancedLoops}
+ *  update. A frame whose centres are the array last written, with no in-place ranges, adds 0. */
+export const loopCenterStats = { bytes: 0 };
+
+/**
+ * The loop lane's centres, uploaded as its end offsets are ({@link OffsetColumn}): the whole column when `centers` is a
+ * new array; when it is the array last written (refilled in place, the full-detail cache), only the `changed`
+ * `[start, end)` ranges; nothing when it is the same array with no ranges. An LOD frame's subset hands back the same
+ * array exactly when its values are unchanged (`StableColumns.float32Into`), so a frame that keeps the cut and
+ * the positions uploads 0 B. Returns the array to store as the new `last`.
+ */
+function writeLoopCenters(buffer: Buffer, centers: Float32Array, last: Float32Array | undefined, count: number, changed: Uint32Array | undefined): Float32Array {
+  if (centers !== last) {
+    buffer.write(centers);
+    loopCenterStats.bytes += centers.byteLength;
+    return centers;
+  }
+  if (!changed) return centers;
+  for (let k = 0; k + 1 < changed.length; k += 2) {
+    const start = changed[k] ?? 0, end = Math.min(changed[k + 1] ?? 0, count);
+    if (end <= start) continue;
+    buffer.write(centers.subarray(2 * start, 2 * end), 8 * start);
+    loopCenterStats.bytes += 8 * (end - start);
+  }
+  return centers;
+}
+
 /** {@link writeIfChanged} for the pie lane's columns, counting the bytes into {@link pieColumnStats}. */
 function writePieColumn<T extends ArrayBufferView>(buffer: Buffer, arr: T, last: T): T {
   if (arr !== last) pieColumnStats.bytes += arr.byteLength;
@@ -1002,6 +1029,7 @@ export class InstancedLoops {
   /** How every loop ends, fixed per layer: a change recreates (another template). */
   readonly head: InstancedLoopHead["head"];
   /** Last-uploaded style columns (#179): a sub-update skips a buffer whose array is unchanged. */
+  private _lastCenters?: Float32Array;
   private _lastWidths?: Float32Array;
   private _lastColors?: Uint8Array;
   private model: Model;
@@ -1026,6 +1054,7 @@ export class InstancedLoops {
     const vertexCount = template.length / 2;
     this.corner = device.createBuffer({ data: template });
     this.center = device.createBuffer({ data: data.centers });
+    this._lastCenters = data.centers;
     this.widthBuf = device.createBuffer({ data: data.widths });
     this.color = device.createBuffer({ data: data.colors });
     this._lastWidths = data.widths;
@@ -1112,14 +1141,16 @@ export class InstancedLoops {
       this.center = grownBuffer(device, data.centers, data.count, this._capacity);
       this.widthBuf = grownBuffer(device, data.widths, data.count, this._capacity);
       this.color = grownBuffer(device, data.colors, data.count, this._capacity);
+      this._lastCenters = data.centers;
       this._lastWidths = data.widths;
       this._lastColors = data.colors;
       const columns = { a_center: this.center, a_width: this.widthBuf, a_color: this.color };
       this.model.setAttributes({ ...columns, ...this.hl.recreate(data, this._capacity) });
       this.pickModel?.setAttributes({ ...columns, ...this.hl.attributes() });
     } else {
-      // Sub-update: the centres always upload (a position frame); the style columns skip an unchanged array (#179).
-      this.center.write(data.centers);
+      // Sub-update: the centres upload when new or rewritten in place (the ends' ranges); the style columns skip an
+      // unchanged array (#179).
+      this._lastCenters = writeLoopCenters(this.center, data.centers, this._lastCenters, data.count, data.offsetsChanged);
       this._lastWidths = writeIfChanged(this.widthBuf, data.widths, this._lastWidths);
       this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
       this.hl.write(data);

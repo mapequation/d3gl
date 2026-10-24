@@ -170,7 +170,7 @@ const LOOP_SAMPLES = 24;
  * A graph's loops for one resolved style: the style columns, built once per style version ({@link selfLoopCache}),
  * and the position columns, rewritten IN PLACE by {@link updateSelfLoops} on every position frame. The layers
  * hand the renderer these same arrays every frame: the style columns then skip their upload (reference
- * identity), the centres upload as every link's ends do, and the end offsets upload by the `[0, S)` range.
+ * identity), and the centres and end offsets upload by the `[0, S)` range.
  */
 export interface SelfLoopCache {
   loops: SelfLoopIndex;
@@ -201,7 +201,7 @@ export interface SelfLoopCache {
   angles: Float32Array;
   sourceOffsets: Float32Array;
   targetOffsets: Float32Array;
-  /** `[0, S)`: every end offset is rewritten each position frame (#509 in-place range upload). Absent on an LOD
+  /** `[0, S)`: every centre and end offset is rewritten each position frame (#509 in-place range upload). Absent on an LOD
    *  frame's subset ({@link selfLoopSubset}), whose columns are handed back unchanged when their values are. */
   changed?: Uint32Array;
   /** Per-loop `selected` flags (#162), on an LOD frame's subset (the no-LOD lane attaches its own). */
