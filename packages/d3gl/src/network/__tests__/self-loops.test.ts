@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { DROP_HALF_SPREAD, DROP_LENGTH, DROP_REACH, dropControls, dropEndTangent, traceDropHalfArrow } from "../../core/loop-drop.js";
+import { DROP_HALF_SPREAD, DROP_LENGTH, DROP_REACH, dropEndTangent, traceDrop, traceDropHalfArrow } from "../../core/loop-drop.js";
 import { StableColumns } from "../../core/stable-columns.js";
 import {
   keptLeafLoops,
@@ -84,7 +84,7 @@ describe("self-loop geometry", () => {
     expect(angles[1]).toBeCloseTo(FALLBACK_ANGLE, 6);
   });
 
-  it("puts both ends on the rim, both end tangents through the centre, and the round far end along θ", () => {
+  it("starts and ends at the centre with radial legs, symmetric about θ, its far end ¾·L·cos α out", () => {
     const loops = buildSelfLoopIndex([0], [0], [1], 1);
     if (!loops) throw new Error("expected loops");
     const r = 7;
@@ -95,23 +95,40 @@ describe("self-loop geometry", () => {
         const to = new Float32Array(2);
         loopEnds(loops, [theta], [r], so, to);
         const sx = (so[0] ?? 0) + ox, sy = (so[1] ?? 0) + oy, tx = (to[0] ?? 0) + ox, ty = (to[1] ?? 0) + oy;
+        // The rim ends carry the legs' directions; the arrowhead tip is the second.
         expect(Math.hypot(sx - ox, sy - oy)).toBeCloseTo(r, 4);
         expect(Math.hypot(tx - ox, ty - oy)).toBeCloseTo(r, 4);
-        const [c1x, c1y, c2x, c2y] = dropControls(sx, sy, tx, ty, DROP_REACH);
-        // End tangents (P1 − P0, P3 − P2) parallel to the radius (P − c): their cross product is 0.
+        const seg: number[][] = [];
+        traceDrop({ moveTo: (x, y) => void seg.push([x, y]), bezierCurveTo: (a, b, c, d, x, y) => void seg.push([a, b], [c, d], [x, y]) }, sx, sy, tx, ty, DROP_REACH);
+        const [[p0x, p0y] = [], [c1x = 0, c1y = 0] = [], [c2x = 0, c2y = 0] = [], [p3x, p3y] = []] = seg;
+        // Centre to centre, like an ordinary link.
+        expect(p0x).toBeCloseTo(ox, 4);
+        expect(p0y).toBeCloseTo(oy, 4);
+        expect(p3x).toBeCloseTo(ox, 4);
+        expect(p3y).toBeCloseTo(oy, 4);
+        // Radial legs: out along the source end's radius, back in along the target end's, at DROP_LENGTH radii.
         const cross = (ax: number, ay: number, bx: number, by: number): number => ax * by - ay * bx;
-        expect(cross(c1x - sx, c1y - sy, sx - ox, sy - oy) / r ** 2).toBeCloseTo(0, 5);
-        expect(cross(tx - c2x, ty - c2y, tx - ox, ty - oy) / r ** 2).toBeCloseTo(0, 5);
-        // Out along the first leg, back IN along the second: P1 beyond P0, P2 beyond P3, at DROP_LENGTH radii.
-        expect(Math.hypot(c1x - ox, c1y - oy)).toBeCloseTo(DROP_LENGTH * r, 4);
-        expect(Math.hypot(c2x - ox, c2y - oy)).toBeCloseTo(DROP_LENGTH * r, 4);
-        const [ex, ey] = dropEndTangent(sx, sy, tx, ty);
-        expect(ex * (tx - ox) + ey * (ty - oy)).toBeCloseTo(-r, 4); // the arrowhead points into the node
-        // The far end, B(½) = (P0 + 3P1 + 3P2 + P3) / 8, lies on θ beyond the rim.
-        const ax = (sx + 3 * c1x + 3 * c2x + tx) / 8 - ox;
-        const ay = (sy + 3 * c1y + 3 * c2y + ty) / 8 - oy;
-        expect(Math.hypot(ax, ay)).toBeCloseTo((r * Math.cos(DROP_HALF_SPREAD) * (2 + 6 * DROP_LENGTH)) / 8, 4);
+        expect(cross(c1x - ox, c1y - oy, sx - ox, sy - oy) / r ** 2).toBeCloseTo(0, 5);
+        expect(cross(c2x - ox, c2y - oy, tx - ox, ty - oy) / r ** 2).toBeCloseTo(0, 5);
+        expect((c1x - ox) * (sx - ox) + (c1y - oy) * (sy - oy)).toBeCloseTo(DROP_LENGTH * r * r, 3);
+        expect((c2x - ox) * (tx - ox) + (c2y - oy) * (ty - oy)).toBeCloseTo(DROP_LENGTH * r * r, 3);
+        // Symmetric about θ: the controls mirror each other across the axis.
+        const along = (x: number, y: number): number => x * Math.cos(theta) + y * Math.sin(theta);
+        const across = (x: number, y: number): number => -x * Math.sin(theta) + y * Math.cos(theta);
+        expect(along(c1x - ox, c1y - oy)).toBeCloseTo(along(c2x - ox, c2y - oy), 4);
+        expect(across(c1x - ox, c1y - oy)).toBeCloseTo(-across(c2x - ox, c2y - oy), 4);
+        expect(Math.abs(across(c1x - ox, c1y - oy))).toBeCloseTo(DROP_LENGTH * r * Math.sin(DROP_HALF_SPREAD), 4);
+        // The far end, B(½) = c + ⅜(P1 + P2 − 2c), lies on θ about 2.3 radii out.
+        const ax = (3 * (c1x + c2x - 2 * ox)) / 8;
+        const ay = (3 * (c1y + c2y - 2 * oy)) / 8;
+        expect(Math.hypot(ax, ay)).toBeCloseTo(0.75 * DROP_LENGTH * Math.cos(DROP_HALF_SPREAD) * r, 4);
+        expect(Math.hypot(ax, ay) / r).toBeCloseTo(2.3, 1);
         expect(Math.atan2(ay, ax)).toBeCloseTo(Math.atan2(Math.sin(theta), Math.cos(theta)), 4);
+        // The arrowhead: tip one radius back from the centre along the end tangent, pointing into the node.
+        const [ex, ey] = dropEndTangent(sx, sy, tx, ty);
+        expect(cross(ex, ey, ox - c2x, oy - c2y)).toBeCloseTo(0, 3);
+        expect(tx).toBeCloseTo(ox - ex * r, 4);
+        expect(ty).toBeCloseTo(oy - ey * r, 4);
         // The arrowhead's foot is the drop's last control point.
         const foot = new Float32Array(2);
         loopArrowFrom(Float32Array.of(sx, sy), Float32Array.of(tx, ty), foot, 1);
@@ -138,15 +155,16 @@ describe("self-loop geometry", () => {
         closePath: () => undefined,
       };
       traceDropHalfArrow(rec, so[0] ?? 0, so[1] ?? 0, to[0] ?? 0, to[1] ?? 0, 2, DROP_REACH);
-      // moveTo P0, inner → head base, tip, barb, outer start, outer → foot.
+      // moveTo the centre, inner → head base, tip, barb, outer start, outer → foot.
       expect(pts).toHaveLength(6);
+      expect(Math.hypot(...(pts[0] ?? [1, 1]))).toBeCloseTo(0, 5);
       const [tipX, tipY] = pts[2] ?? [0, 0];
       expect(tipX).toBeCloseTo(to[0] ?? 0, 5);
       expect(tipY).toBeCloseTo(to[1] ?? 0, 5);
-      // The outer foot sits on the far side of the source leg from θ: outside the drop.
+      // The outer foot sits on the far side of the source leg (the line through the centre and P0) from θ: outside.
       const [fx, fy] = pts[5] ?? [0, 0];
-      const across = (x: number, y: number): number => -x * Math.sin(theta) + y * Math.cos(theta);
-      expect(Math.abs(across(fx, fy))).toBeGreaterThan(Math.abs(across(so[0] ?? 0, so[1] ?? 0)));
+      const side = (x: number, y: number): number => (so[0] ?? 0) * y - (so[1] ?? 0) * x;
+      expect(side(fx, fy) * side(Math.cos(theta), Math.sin(theta))).toBeLessThan(0);
     }
   });
 
