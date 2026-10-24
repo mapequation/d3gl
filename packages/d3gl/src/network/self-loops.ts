@@ -27,7 +27,7 @@ import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer, InstancedLoopHead, InstancedLoopsData, GroupBuilder } from "../core/index.js";
 import type { RGBAValue } from "./glyphs.js";
 import type { StableColumns } from "../core/stable-columns.js";
-import { DROP_HALF_SPREAD, loopArrowOutline, loopHalfArrowOutline, spreadCot, traceLoop, traceOutline } from "../core/loop-drop.js";
+import { DROP_HALF_SPREAD, spreadCot, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../core/loop-drop.js";
 import { headLength } from "../core/arrowhead.js";
 
 /** The direction of a loop whose node has no neighbours to point away from (radians, y down: up-right). */
@@ -325,10 +325,6 @@ export function selfLoopSelected(loops: SelfLoopIndex, linkSelected: Uint8Array)
   return out;
 }
 
-/** Module scratch for one loop's outline ({@link loopArrowOutline}: `2·LOOP_SAMPLES + 5` points, the most), refilled
- *  per loop: the Scene records each path synchronously, so no loop allocates. */
-const LOOP_PTS = new Float64Array(2 * (2 * LOOP_SAMPLES + 5));
-
 /**
  * The Scene twin (Canvas / SVG) of the undirected `line`-style loops: one stroked drawable each in the `links` group,
  * keyed by its edge ({@link traceLoop}, head length `headLength(arrowSize)` so the arrow loop runs the same path, leg
@@ -351,22 +347,25 @@ export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache, idBase = 0): vo
   }
 }
 
-/** The Scene twin of the `half-arrow` loops: one filled half-arrow outline each ({@link loopHalfArrowOutline}), keyed
- *  by its edge. `bake` as `emitHalfLinks`: screen mode solves in px around the node centre × bake and emits ÷ bake. */
+/** The Scene twin of the `half-arrow` loops: one filled half-arrow outline each ({@link traceLoopHalfArrowOutline}, its
+ *  cubic edges as cubics the recorder flattens), keyed by its edge. `bake` as `emitHalfLinks`: screen mode solves in px
+ *  around the node centre × bake and emits ÷ bake. Coincident ends (no loop) emit nothing. */
 export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const inv = 1 / bake;
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
-    const n = loopHalfArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, LOOP_SAMPLES, c.legLength, c.spreadCot);
-    if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
+    const sx = px + (so[2 * i] ?? 0), sy = py + (so[2 * i + 1] ?? 0), tx = px + (to[2 * i] ?? 0), ty = py + (to[2 * i + 1] ?? 0);
+    if (sx === tx && sy === ty) continue;
+    const width = c.widths[i] ?? 0;
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoopHalfArrowOutline(ctx, sx, sy, tx, ty, width, c.legLength, c.spreadCot, inv));
   }
 }
 
 /** The Scene twin of the directed `line`-style loops: one filled arrow outline each, shaft and head as ONE shape
- *  ({@link loopArrowOutline}), keyed by its edge, in a filled group. `bake` as `emitArrowLinks`: screen mode solves in
- *  px around the node centre × bake and emits ÷ bake (re-baked with the links). */
+ *  ({@link traceLoopArrowOutline}), keyed by its edge, in a filled group. `bake` as `emitArrowLinks`: screen mode solves
+ *  in px around the node centre × bake and emits ÷ bake (re-baked with the links). Coincident ends emit nothing. */
 export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const inv = 1 / bake;
@@ -374,8 +373,10 @@ export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, 
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
-    const n = loopArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, h, LOOP_SAMPLES, c.legLength, c.spreadCot);
-    if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
+    const sx = px + (so[2 * i] ?? 0), sy = py + (so[2 * i + 1] ?? 0), tx = px + (to[2 * i] ?? 0), ty = py + (to[2 * i + 1] ?? 0);
+    if (sx === tx && sy === ty) continue;
+    const width = c.widths[i] ?? 0;
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoopArrowOutline(ctx, sx, sy, tx, ty, width, h, c.legLength, c.spreadCot, inv));
   }
 }
 

@@ -190,8 +190,9 @@ function writeHead(out: PointBuffer, o: number, p: ArrowParams, bend: number): n
 }
 
 /**
- * Write the whole arrow as ONE closed, non-self-overlapping outline (Canvas/SVG/`toSVG()` fill): the
- * shaft's left edge from the source, the left barb, the tip, the right barb, the right edge back.
+ * Write the whole arrow as ONE closed, non-self-overlapping outline of sampled points — the exact offset at each
+ * sample, the reference {@link traceArrowOutline} (what Canvas/SVG/`toSVG()` fill, each edge ONE cubic) approximates:
+ * the shaft's left edge from the source, the left barb, the tip, the right barb, the right edge back.
  * Here the shaft is trimmed at the head's BASE (its end corners land on the base edge, inside the
  * barbs), so the outline is the exact union of shaft and head with no folded edge. Writes
  * `2·(2·samples + 3)` numbers at `o`; returns the number of points (`2·samples + 3`, or 0 for a
@@ -205,21 +206,185 @@ export function arrowOutline(out: PointBuffer, o: number, p: ArrowParams, sample
   return 2 * samples + 3;
 }
 
+/** The path context an outline traces into (Canvas, SVG, the Scene's and the export's `PathRecorder`). */
+export interface OutlineContext {
+  moveTo(x: number, y: number): void;
+  lineTo(x: number, y: number): void;
+  bezierCurveTo(c1x: number, c1y: number, c2x: number, c2y: number, x: number, y: number): void;
+  closePath(): void;
+}
+
+/** Module scratch for {@link offsetCubic}'s three leg normals (6 numbers), refilled per call. */
+const LEG_N = new Float64Array(6);
+
+/** Below this `|sin|` of the angle between a cubic's end tangents, {@link offsetCubic} keeps the miter controls: the
+ *  midpoint fit's 2×2 solve is ill-conditioned there, and the miter is already within 0.003·|d| (bend ≲ 0.05). */
+const FIT_MIN_SIN = 0.1;
+
 /**
- * Shared shaft sampler, on the faded bend `bend` ({@link fadedBend}). `outline = false`: strip order (left, right
- * per sample). `outline = true`: left edge at points `0 … M−1`, right edge reversed at points `M+3 … 2M+2` (the
- * head goes between).
+ * Offset the cubic `c` (8 numbers at `ci`: `P0 … P3`) by `d` along `+perp(travel)` as ONE cubic `Q0 … Q3`, written as
+ * 8 numbers at `o` (#542). A cubic's offset is not a cubic, so this approximates it:
+ *
+ * - the ends: each control leg (`P0P1`, `P1P2`, `P2P3`) shifts along its own unit normal by `d`, and `Q0`, `Q3` are
+ *   the shifted `P0`, `P3` — exactly `d` off the curve along its end normals, with its end tangents;
+ * - the inner controls lie on the shifted end legs, `Q1 = Q0 + a·T0`, `Q2 = Q3 − b·T3` (`T0`, `T3` the unit end
+ *   tangents). `a`, `b` put `Q(½)` on the exact offset point `B(½) + d·N(½)`: `a·T0 − b·T3 = 8/3·(M − (Q0 + Q3)/2)`,
+ *   a 2×2 solve. Where that is ill-conditioned (end tangents within {@link FIT_MIN_SIN}) or not positive, they are
+ *   where the adjacent shifted legs meet instead, `P_k + d·(n_a + n_b)/(1 + n_a·n_b)` (the miter of the two normals).
+ *
+ * A zero-length leg borrows its neighbour's normal; a leg reversing onto its neighbour (`n_a·n_b → −1`) falls back to
+ * the shifted `P_k`. Against the exact offset (`arrowhead.test.ts`), a link's edges keep within 0.03·w (0.1 px) for
+ * bends up to 0.5, widths 1–10 and links of 40–400 px, several times closer than the miter alone (0.036·w). Scalar
+ * math, no allocation.
  */
-function writeShaft(out: PointBuffer, o: number, p: ArrowParams, bend: number, trim: number, samples: number, outline: boolean): number {
+export function offsetCubic(c: ArrayLike<number>, ci: number, d: number, out: PointBuffer, o: number): void {
+  for (let k = 0; k < 3; k++) {
+    const gx = (c[ci + 2 * k + 2] ?? 0) - (c[ci + 2 * k] ?? 0);
+    const gy = (c[ci + 2 * k + 3] ?? 0) - (c[ci + 2 * k + 1] ?? 0);
+    const gl = Math.hypot(gx, gy);
+    LEG_N[2 * k] = gl > 0 ? -gy / gl : Number.NaN;
+    LEG_N[2 * k + 1] = gl > 0 ? gx / gl : Number.NaN;
+  }
+  // Borrow across zero-length legs: the middle from either end, then the ends from the middle.
+  if (Number.isNaN(LEG_N[2] ?? 0)) {
+    const from = Number.isNaN(LEG_N[0] ?? 0) ? 4 : 0;
+    LEG_N[2] = LEG_N[from] ?? 0;
+    LEG_N[3] = LEG_N[from + 1] ?? 0;
+  }
+  for (let k = 0; k <= 4; k += 4) {
+    if (Number.isNaN(LEG_N[k] ?? 0)) {
+      LEG_N[k] = LEG_N[2] ?? 0;
+      LEG_N[k + 1] = LEG_N[3] ?? 0;
+    }
+  }
+  for (let k = 0; k < 4; k++) {
+    // Point k's normal: the end legs' own at P0/P3, the two adjacent legs' miter at P1/P2.
+    const a = k === 0 ? 0 : 2 * (k - 1);
+    const b = k === 3 ? 4 : 2 * k;
+    const ax = LEG_N[a] ?? 0, ay = LEG_N[a + 1] ?? 0, bx = LEG_N[b] ?? 0, by = LEG_N[b + 1] ?? 0;
+    const den = 1 + ax * bx + ay * by;
+    let mx = ax;
+    let my = ay;
+    if (a !== b && den > 1e-6) {
+      mx = (ax + bx) / den;
+      my = (ay + by) / den;
+    }
+    out[o + 2 * k] = (c[ci + 2 * k] ?? 0) + d * mx;
+    out[o + 2 * k + 1] = (c[ci + 2 * k + 1] ?? 0) + d * my;
+  }
+  // The midpoint fit. T0 = −perp(n0) and T3 = −perp(n2) are the end legs' unit tangents (perp(v) = (−v.y, v.x)).
+  const t0x = LEG_N[1] ?? 0, t0y = -(LEG_N[0] ?? 0), t3x = LEG_N[5] ?? 0, t3y = -(LEG_N[4] ?? 0);
+  const det = t3x * t0y - t0x * t3y; // cross(T0, −T3)
+  if (!(Math.abs(det) >= FIT_MIN_SIN)) return;
+  const p0x = c[ci] ?? 0, p0y = c[ci + 1] ?? 0, p1x = c[ci + 2] ?? 0, p1y = c[ci + 3] ?? 0;
+  const p2x = c[ci + 4] ?? 0, p2y = c[ci + 5] ?? 0, p3x = c[ci + 6] ?? 0, p3y = c[ci + 7] ?? 0;
+  // B'(½) ∝ P2 + P3 − P0 − P1; M = B(½) + d·perp(B'(½))/|B'(½)|.
+  const gx = p2x + p3x - p0x - p1x, gy = p2y + p3y - p0y - p1y;
+  const gl = Math.hypot(gx, gy);
+  if (!(gl > 0)) return;
+  const q0x = out[o] ?? 0, q0y = out[o + 1] ?? 0, q3x = out[o + 6] ?? 0, q3y = out[o + 7] ?? 0;
+  const vx = (8 / 3) * ((p0x + 3 * p1x + 3 * p2x + p3x) / 8 - (d * gy) / gl - (q0x + q3x) / 2);
+  const vy = (8 / 3) * ((p0y + 3 * p1y + 3 * p2y + p3y) / 8 + (d * gx) / gl - (q0y + q3y) / 2);
+  const fa = (t3x * vy - vx * t3y) / det; // cross(V, −T3) / det
+  const fb = (t0x * vy - t0y * vx) / det; // cross(T0, V) / det
+  if (!(fa > 0) || !(fb > 0)) return;
+  out[o + 2] = q0x + fa * t0x;
+  out[o + 3] = q0y + fa * t0y;
+  out[o + 4] = q3x - fb * t3x;
+  out[o + 5] = q3y - fb * t3y;
+}
+
+/** Module scratch for {@link traceArrowOutline}: the left edge's cubic, the right edge's, then the head (22 numbers). */
+const EDGES = new Float64Array(22);
+
+/**
+ * Trace the whole arrow as ONE closed outline (Canvas/SVG/`toSVG()` fill) — the shape {@link arrowOutline} samples,
+ * with each long edge as ONE cubic ({@link offsetCubic} of the centre cubic by `±width/2`) instead of points, so the
+ * recorder flattens it by its own tolerance: the left edge from the source, the left barb, the tip, the right barb,
+ * the right edge back. Its end corners are the centre end `± width/2` along the head's normal, on the head's base, as
+ * {@link arrowOutline}'s. A straight shaft traces its edges as lines; a short bent link's collapsed shaft (whose
+ * direction is not the head's axis) runs its edges on the shaft's own normal to `E1`, then steps onto the base corner,
+ * as {@link arrowOutline}'s samples do. Every point × `scale` (the screen-sizeMode bake's `1/k`). Returns false
+ * (traces nothing) for a zero-length link.
+ */
+export function traceArrowOutline(ctx: OutlineContext, p: ArrowParams, scale = 1): boolean {
+  const bend = arrowBend(p);
+  const kind = shaftCubic(p, bend, headLength(p.size));
+  if (kind === SHAFT_NONE) return false;
+  writeHead(EDGES, 16, p, bend);
+  const hw = p.width / 2;
+  const s = scale;
+  const e = EDGES;
+  if (kind === SHAFT_CURVED) {
+    offsetCubic(CUBIC, 0, hw, e, 0);
+    offsetCubic(CUBIC, 0, -hw, e, 8);
+  } else {
+    // Straight: the edges on the shaft's normal (start, and E1 for the collapsed step), the end corners on the head's.
+    const p0x = CUBIC[0] ?? 0, p0y = CUBIC[1] ?? 0, p3x = CUBIC[6] ?? 0, p3y = CUBIC[7] ?? 0;
+    const gx = (CUBIC[2] ?? 0) - p0x, gy = (CUBIC[3] ?? 0) - p0y;
+    const gl = Math.hypot(gx, gy);
+    const hnx = U1[1] ?? 0, hny = -(U1[0] ?? 0);
+    const nx = gl > 0 ? -gy / gl : hnx, ny = gl > 0 ? gx / gl : hny;
+    e[0] = p0x + nx * hw;
+    e[1] = p0y + ny * hw;
+    e[2] = p3x + nx * hw;
+    e[3] = p3y + ny * hw;
+    e[6] = p3x + hnx * hw;
+    e[7] = p3y + hny * hw;
+    e[8] = p0x - nx * hw;
+    e[9] = p0y - ny * hw;
+    e[10] = p3x - nx * hw;
+    e[11] = p3y - ny * hw;
+    e[14] = p3x - hnx * hw;
+    e[15] = p3y - hny * hw;
+  }
+  ctx.moveTo((e[0] ?? 0) * s, (e[1] ?? 0) * s);
+  if (kind === SHAFT_CURVED) ctx.bezierCurveTo((e[2] ?? 0) * s, (e[3] ?? 0) * s, (e[4] ?? 0) * s, (e[5] ?? 0) * s, (e[6] ?? 0) * s, (e[7] ?? 0) * s);
+  else {
+    if (kind === SHAFT_COLLAPSED) ctx.lineTo((e[2] ?? 0) * s, (e[3] ?? 0) * s);
+    ctx.lineTo((e[6] ?? 0) * s, (e[7] ?? 0) * s);
+  }
+  ctx.lineTo((e[16] ?? 0) * s, (e[17] ?? 0) * s);
+  ctx.lineTo((e[18] ?? 0) * s, (e[19] ?? 0) * s);
+  ctx.lineTo((e[20] ?? 0) * s, (e[21] ?? 0) * s);
+  ctx.lineTo((e[14] ?? 0) * s, (e[15] ?? 0) * s);
+  if (kind === SHAFT_CURVED) ctx.bezierCurveTo((e[12] ?? 0) * s, (e[13] ?? 0) * s, (e[10] ?? 0) * s, (e[11] ?? 0) * s, (e[8] ?? 0) * s, (e[9] ?? 0) * s);
+  else {
+    if (kind === SHAFT_COLLAPSED) ctx.lineTo((e[10] ?? 0) * s, (e[11] ?? 0) * s);
+    ctx.lineTo((e[8] ?? 0) * s, (e[9] ?? 0) * s);
+  }
+  ctx.closePath();
+  return true;
+}
+
+/** {@link shaftCubic}'s result: a zero-length link, a straight shaft (no bend), a short bent link's collapsed straight
+ *  shaft `E0 → E1` (not on the head's axis), or the settled cubic. */
+const SHAFT_NONE = 0;
+const SHAFT_STRAIGHT = 1;
+const SHAFT_COLLAPSED = 2;
+const SHAFT_CURVED = 3;
+
+/** Module scratch for the shaft's end leg `u1` (2 numbers), refilled by {@link shaftCubic}. */
+const U1 = new Float64Array(2);
+
+/**
+ * Solve the shaft's centre cubic on the faded bend `bend` ({@link fadedBend}) for a shaft ending `trim` back from the
+ * tip, into {@link CUBIC}, and its end leg `u1` into {@link U1} (the head's axis is `−u1`). Returns {@link SHAFT_NONE}
+ * for a zero-length link, {@link SHAFT_STRAIGHT} with no bend, {@link SHAFT_COLLAPSED} when the head reaches back past
+ * the quadratic control and the shaft collapses to the straight `E0 → E1`, else {@link SHAFT_CURVED}.
+ */
+function shaftCubic(p: ArrowParams, bend: number, trim: number): number {
   const { sx, sy, tx, ty } = p;
   const dx = tx - sx;
   const dy = ty - sy;
   // The legs: from each centre towards the quadratic control C = mid + ⟂d·bend. |d + 2b·⟂d| = |−d + 2b·⟂d|.
   const b2 = 2 * bend;
   const ll = Math.hypot(dx - b2 * dy, dy + b2 * dx);
-  if (ll <= 0) return 0;
+  if (ll <= 0) return SHAFT_NONE;
   const u1x = (-dx - b2 * dy) / ll;
   const u1y = (-dy + b2 * dx) / ll;
+  U1[0] = u1x;
+  U1[1] = u1y;
   // The headed end E1 on the head's axis, `back` out of the target centre.
   const back = p.radius + trim;
   const e1x = tx + back * u1x;
@@ -230,12 +395,24 @@ function writeShaft(out: PointBuffer, o: number, p: ArrowParams, bend: number, t
   if (back < ll / 2) {
     // E1 before C (|C − c1| = ll/2): the settled cubic.
     legCubic(CUBIC, 0, sx, sy, (dx - b2 * dy) / ll, (dy + b2 * dx) / ll, 0, tx, ty, u1x, u1y, back, (chord * Math.sqrt(1 + b2 * b2)) / 3);
-  } else {
-    // The head reaches back past C (a very short link): the shaft collapses to the straight E0 → E1.
-    const vx = chord > 0 ? cx / chord : -u1x;
-    const vy = chord > 0 ? cy / chord : -u1y;
-    legCubic(CUBIC, 0, sx, sy, vx, vy, 0, e1x, e1y, -vx, -vy, 0, chord / 3);
+    return bend === 0 ? SHAFT_STRAIGHT : SHAFT_CURVED;
   }
+  // The head reaches back past C (a very short link): the shaft collapses to the straight E0 → E1.
+  const vx = chord > 0 ? cx / chord : -u1x;
+  const vy = chord > 0 ? cy / chord : -u1y;
+  legCubic(CUBIC, 0, sx, sy, vx, vy, 0, e1x, e1y, -vx, -vy, 0, chord / 3);
+  return bend === 0 ? SHAFT_STRAIGHT : SHAFT_COLLAPSED;
+}
+
+/**
+ * Shared shaft sampler, on the faded bend `bend` ({@link fadedBend}). `outline = false`: strip order (left, right
+ * per sample). `outline = true`: left edge at points `0 … M−1`, right edge reversed at points `M+3 … 2M+2` (the
+ * head goes between).
+ */
+function writeShaft(out: PointBuffer, o: number, p: ArrowParams, bend: number, trim: number, samples: number, outline: boolean): number {
+  if (shaftCubic(p, bend, trim) === SHAFT_NONE) return 0;
+  const u1x = U1[0] ?? 0;
+  const u1y = U1[1] ?? 0;
   const [p0x = 0, p0y = 0, p1x = 0, p1y = 0, p2x = 0, p2y = 0, p3x = 0, p3y = 0] = CUBIC;
   // The head's normal ⟂(−u1): the shaft's end pair lies on the base, and the cubic's end tangent is −u1.
   const hnx = u1y;

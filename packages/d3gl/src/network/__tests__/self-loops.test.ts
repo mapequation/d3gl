@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, LOOP_SPREAD, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, loopHalfHeadLength, traceLoop } from "../../core/loop-drop.js";
+import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, LOOP_SPREAD, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, loopHalfHeadLength, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../../core/loop-drop.js";
+import { PathRecorder } from "../../core/path-recorder.js";
+import { outlineGap } from "../../core/__tests__/outline-gap.js";
 import { headHalfWidth, headLength } from "../../core/arrowhead.js";
 import { StableColumns } from "../../core/stable-columns.js";
 import {
@@ -241,6 +243,34 @@ describe("self-loop geometry", () => {
         }
       }
     }
+  });
+
+  it("traces the arrow and half-arrow loops with cubic edges (two per edge) within 0.05·w of the exact offset", () => {
+    const M = 600; // the dense sampled outline stands in for the exact offset
+    const dense = new Float64Array(2 * (2 * M + 5));
+    const traced = (draw: (rec: PathRecorder) => boolean): number[] => {
+      const rec = new PathRecorder(0.002);
+      expect(draw(rec)).toBe(true);
+      expect(rec.subpaths).toHaveLength(1);
+      return rec.subpaths[0]?.points ?? [];
+    };
+    for (const r of [5, 10, 20]) {
+      for (const width of [1, 4, 10]) {
+        const [sx, sy, tx, ty] = endsAt(0.9, r, 3, -4);
+        const h = headLength(5 * Math.cbrt(width));
+        let n = loopArrowOutline(dense, 0, sx, sy, tx, ty, width, h, M);
+        let pts = traced((rec) => traceLoopArrowOutline(rec, sx, sy, tx, ty, width, h));
+        expect(outlineGap(pts, pts.length / 2, dense, n), `arrow r ${r} width ${width}`).toBeLessThan(0.05 * width);
+        n = loopHalfArrowOutline(dense, 0, sx, sy, tx, ty, width, M);
+        pts = traced((rec) => traceLoopHalfArrowOutline(rec, sx, sy, tx, ty, width));
+        expect(outlineGap(pts, pts.length / 2, dense, n), `half r ${r} width ${width}`).toBeLessThan(0.05 * width);
+      }
+    }
+    // Coincident ends: no loop, nothing traced.
+    const rec = new PathRecorder();
+    expect(traceLoopArrowOutline(rec, 1, 1, 1, 1, 2, 4)).toBe(false);
+    expect(traceLoopHalfArrowOutline(rec, 1, 1, 1, 1, 2)).toBe(false);
+    expect(rec.subpaths).toHaveLength(0);
   });
 });
 

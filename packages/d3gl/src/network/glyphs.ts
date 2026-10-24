@@ -5,7 +5,7 @@ import { reciprocalEdges, type NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
 import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
-import { arrowOutline } from "../core/arrowhead.js";
+import { traceArrowOutline } from "../core/arrowhead.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, chordBend } from "../core/half-link.js";
 import { PairIndex } from "./pair-index.js";
 import { selfLoopCache, selfLoopLayers, updateSelfLoops, type SelfLoopCache } from "./self-loops.js";
@@ -2933,7 +2933,7 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
 /**
  * Emit each directed `line` link as ONE filled arrow (#542): the shaft up to the head's base, then the head, its
  * tip on the target's rim (`nodeRadii[target]`), a full head on a bent link's own end tangent — the Canvas/SVG twin
- * of the WebGL `arrows` lane ({@link arrowOutline}; `toSVG()` traces the same outline). Keyed by edge index; the
+ * of the WebGL `arrows` lane ({@link traceArrowOutline}: each edge ONE cubic; `toSVG()` traces the same outline). Keyed by edge index; the
  * layer sets the fill. `bake` is the screen-sizeMode bake of {@link emitHalfLinks}: solve in px (positions × `bake`,
  * widths/size/radii already px) and emit ÷`bake`, so the ×k view transform reproduces the constant-px render.
  */
@@ -2947,12 +2947,10 @@ export function emitArrowLinks(
   bake = 1,
 ): void {
   const inv = 1 / bake;
-  const samples = bend ? BENT_SAMPLES : 2;
-  const pts = new Float64Array(2 * (2 * samples + 3)); // one scratch for every link
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e] ?? 0;
     const t = graph.target[e] ?? 0;
-    const n = arrowOutline(pts, 0, {
+    const p = {
       sx: (graph.positions[s * 2] ?? 0) * bake,
       sy: (graph.positions[s * 2 + 1] ?? 0) * bake,
       tx: (graph.positions[t * 2] ?? 0) * bake,
@@ -2961,14 +2959,10 @@ export function emitArrowLinks(
       width: widthOf(graph.weight[e] ?? 0),
       size,
       bend,
-    }, samples);
-    if (n === 0) continue;
-    // The Scene records the path synchronously, so the shared scratch is safe to reuse for the next link.
-    g.drawable(e, (ctx) => {
-      ctx.moveTo((pts[0] ?? 0) * inv, (pts[1] ?? 0) * inv);
-      for (let i = 1; i < n; i++) ctx.lineTo((pts[2 * i] ?? 0) * inv, (pts[2 * i + 1] ?? 0) * inv);
-      ctx.closePath();
-    });
+    };
+    if (p.sx === p.tx && p.sy === p.ty) continue; // zero length: no arrow
+    // Each edge is ONE cubic: the Scene's recorder flattens it by its tolerance.
+    g.drawable(e, (ctx) => traceArrowOutline(ctx, p, inv));
   }
 }
 
@@ -3149,7 +3143,7 @@ export function traceSuperLines(g: GroupBuilder, lines: InstancedLinesData, ids:
 
 /**
  * Trace LOD directed `line` links (super-edges and leaf links) as ONE filled arrow each (#542), keyed by `ids` —
- * the Scene twin of the WebGL `arrows` lane and of {@link emitArrowLinks}: {@link arrowOutline} from the
+ * the Scene twin of the WebGL `arrows` lane and of {@link emitArrowLinks}: {@link traceArrowOutline} from the
  * line's ends, width, bend, `arrowSize` and target draw radius (`radii`). Same `bake` trick for `screen`
  * sizeMode: solve in pixel space (×bake, widths/size/radii already px) and emit ÷bake.
  */
@@ -3157,10 +3151,8 @@ export function traceSuperArrowLines(g: GroupBuilder, lines: InstancedArrowsData
   const { sources, targets, widths, bends, radii } = lines;
   const size = lines.arrowSize;
   const inv = 1 / bake;
-  const pts = new Float64Array(2 * (2 * BENT_SAMPLES + 3)); // one scratch for every link
   for (let e = 0; e < lines.count; e++) {
-    const bend = bends ? (bends[e] ?? 0) : 0;
-    const n = arrowOutline(pts, 0, {
+    const p = {
       sx: (sources[e * 2] ?? 0) * bake,
       sy: (sources[e * 2 + 1] ?? 0) * bake,
       tx: (targets[e * 2] ?? 0) * bake,
@@ -3168,15 +3160,10 @@ export function traceSuperArrowLines(g: GroupBuilder, lines: InstancedArrowsData
       radius: radii[e] ?? 0,
       width: widths[e] ?? 0,
       size,
-      bend,
-    }, bend ? BENT_SAMPLES : 2);
-    if (n === 0) continue;
-    // The Scene records the path synchronously, so the shared scratch is safe to reuse for the next link.
-    g.drawable(ids[e] ?? 0, (ctx) => {
-      ctx.moveTo((pts[0] ?? 0) * inv, (pts[1] ?? 0) * inv);
-      for (let i = 1; i < n; i++) ctx.lineTo((pts[2 * i] ?? 0) * inv, (pts[2 * i + 1] ?? 0) * inv);
-      ctx.closePath();
-    });
+      bend: bends ? (bends[e] ?? 0) : 0,
+    };
+    if (p.sx === p.tx && p.sy === p.ty) continue; // zero length: no arrow
+    g.drawable(ids[e] ?? 0, (ctx) => traceArrowOutline(ctx, p, inv));
   }
 }
 

@@ -859,6 +859,9 @@ tolerance depends on how a drawable is *drawn*. World-scaled geometry bakes at t
   `expandStroke`'s round joins/caps, and the **mirror-image** case on the Scene path — screen-mode
   half-arrows are solved in px, scaled ÷k to world (`emitHalfLinks`, `bake = k`) and then recorded at
   the *world* tolerance, so their bend facets at `curveTolerance·k` px after each zoom-end re-bake.
+  Since #542 the same holds for whole arrows and headed loops (`traceArrowOutline`,
+  `traceLoop(Half)ArrowOutline`): their edges are cubics the recorder flattens, no longer 24 fixed
+  samples, so a screen-mode arrow's point count and facet size follow `curveTolerance·k`.
 - Guards: `core/__tests__/curve-tolerance.test.ts`, `network/__tests__/pie-instances.test.ts`,
   `map/curve-tolerance.browser.test.ts` (per-layer counts on all three backends + pixel identity).
 

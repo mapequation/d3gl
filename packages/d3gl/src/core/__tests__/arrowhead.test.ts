@@ -8,9 +8,13 @@ import {
   headHalfWidth,
   headLength,
   legCubic,
+  offsetCubic,
   shaftSetback,
+  traceArrowOutline,
   type ArrowParams,
 } from "../arrowhead.js";
+import { PathRecorder } from "../path-recorder.js";
+import { outlineGap } from "./outline-gap.js";
 import { bentEndTangent, halfLinkGeometry } from "../half-link.js";
 
 const EPS = 1e-9;
@@ -419,5 +423,69 @@ describe("fadedBend (short bent links)", () => {
     expect(b).toBeCloseTo((0.5 * 0.99) / Math.sqrt(1 - 0.99 * 0.99), 12);
     expect(fadedBend(-0.3, 0, 0, 0, 3)).toBe(-0.3);
     expect(fadedBend(0, 0, 4, 2, 3)).toBe(0);
+  });
+});
+
+describe("traceArrowOutline (#542: each edge ONE cubic)", () => {
+  const M = 800; // the dense sampled outline stands in for the exact offset
+  const dense = new Float64Array(2 * (2 * M + 3));
+  const traced = (p: ArrowParams, tolerance: number, scale = 1): number[] => {
+    const rec = new PathRecorder(tolerance);
+    traceArrowOutline(rec, p, scale);
+    expect(rec.subpaths).toHaveLength(1);
+    expect(rec.subpaths[0]?.closed).toBe(true);
+    return rec.subpaths[0]?.points ?? [];
+  };
+
+  it("keeps within 0.03·w (0.15 px) of the exact offset: bends 0.1–0.5, widths 1–10, links of 40–400 px", () => {
+    for (const bend of [0.1, 0.25, 0.5])
+      for (const width of [1, 4, 10])
+        for (const len of [40, 100, 400]) {
+          const p: ArrowParams = { sx: 3, sy: -2, tx: 3 + len * Math.cos(0.7), ty: -2 + len * Math.sin(0.7), radius: 5, width, size: 5 * Math.cbrt(width), bend };
+          const n = arrowOutline(dense, 0, p, M);
+          const pts = traced(p, 0.002);
+          const gap = outlineGap(pts, pts.length / 2, dense, n);
+          expect(gap, `bend ${bend} width ${width} len ${len}`).toBeLessThan(Math.min(0.03 * width, 0.15));
+        }
+  });
+
+  it("starts, meets the head and ends exactly where arrowOutline does; a straight link is the same 7 points", () => {
+    const p: ArrowParams = { sx: 0, sy: 0, tx: 120, ty: 30, radius: 6, width: 3, size: 4, bend: 0.3 };
+    const n = arrowOutline(dense, 0, p, M);
+    const pts = traced(p, 0.25);
+    const k = pts.length / 2;
+    // First point = the left edge's start; the head's 5 points (base corner, barb, tip, barb, base corner) are the
+    // sampled outline's M−1 … M+3; the last point = the right edge's start.
+    expect(pts[0]).toBeCloseTo(dense[0] ?? NaN, 9);
+    expect(pts[1]).toBeCloseTo(dense[1] ?? NaN, 9);
+    expect(pts[2 * (k - 1)]).toBeCloseTo(dense[2 * (n - 1)] ?? NaN, 9);
+    expect(pts[2 * (k - 1) + 1]).toBeCloseTo(dense[2 * (n - 1) + 1] ?? NaN, 9);
+    for (let j = 0; j < 5; j++) {
+      const w = M - 1 + j;
+      const found = Array.from({ length: k }, (_, i) => Math.hypot((pts[2 * i] ?? 0) - (dense[2 * w] ?? 0), (pts[2 * i + 1] ?? 0) - (dense[2 * w + 1] ?? 0)));
+      expect(Math.min(...found), `head point ${j}`).toBeLessThan(1e-9);
+    }
+
+    const straight: ArrowParams = { ...p, bend: 0 };
+    const sn = arrowOutline(dense, 0, straight, 2);
+    const sp = traced(straight, 0.25, 0.5);
+    expect(sp).toHaveLength(2 * sn);
+    for (let i = 0; i < 2 * sn; i++) expect(sp[i]).toBeCloseTo((dense[i] ?? 0) * 0.5, 9);
+  });
+
+  it("stores a 40 px link in fewer points than the 24-sample outline, and flattens by the recorder's tolerance", () => {
+    const p: ArrowParams = { sx: 0, sy: 0, tx: 40, ty: 0, radius: 5, width: 2, size: 5 * Math.cbrt(2), bend: 0.25 };
+    expect(traced(p, 0.25).length / 2).toBeLessThan(2 * 24 + 3);
+    const long = { ...p, tx: 300 };
+    expect(traced(long, 0.05).length).toBeGreaterThan(traced(long, 0.25).length);
+  });
+
+  it("offsetCubic: offset 0 is the cubic itself; a straight cubic shifts exactly", () => {
+    const c = [0, 0, 10, 5, 30, 5, 40, 0];
+    const out = new Float64Array(8);
+    offsetCubic(c, 0, 0, out, 0);
+    c.forEach((v, i) => expect(out[i]).toBeCloseTo(v, 12));
+    offsetCubic([0, 0, 10, 0, 20, 0, 30, 0], 0, 2, out, 0);
+    expect(Array.from(out)).toEqual([0, 2, 10, 2, 20, 2, 30, 2]);
   });
 });

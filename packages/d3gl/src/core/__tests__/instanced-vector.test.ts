@@ -116,12 +116,14 @@ describe("instancedVectorLayers (#200)", () => {
     expect(screen?.sizeMode).toBe("world");
     close(screen?.drawables[0]?.subpaths[0]?.points, [0, 1, 90, 1, 90, 3, 95, 0, 90, -3, 90, -1, 0, -1]);
 
-    // Bent: still one outline whose tip sits `radius` from the target along the curve's end tangent.
+    // Bent: still one outline whose tip sits `radius` from the target along the curve's end tangent. Each edge is ONE
+    // cubic the recorder flattens by its tolerance, so the point count follows the curve, not the lane's `samples`.
     const bent = instancedVectorLayers([{ name: "links", primitive: "arrows", arrows: { ...arrows, bends: Float32Array.from([0.2]), samples: 8 } }], 1)[0];
     const pts = bent?.drawables[0]?.subpaths[0]?.points ?? [];
-    expect(pts.length).toBeGreaterThanOrEqual(2 * (2 * 8 + 3));
-    const tip = 8 + 1; // points 0…7 left edge, 8 left barb, 9 tip
-    expect(Math.hypot((pts[2 * tip] ?? 0) - 100, pts[2 * tip + 1] ?? 0)).toBeCloseTo(10, 5);
+    expect(pts.length).toBeGreaterThan(2 * 7); // more than the straight outline's 7 points
+    let nearest = Infinity;
+    for (let i = 0; i < pts.length; i += 2) nearest = Math.min(nearest, Math.hypot((pts[i] ?? 0) - 100, pts[i + 1] ?? 0));
+    expect(nearest).toBeCloseTo(10, 5);
   });
 
   it("pie: a filled arc sector per wedge, anchored in screen sizeMode", () => {

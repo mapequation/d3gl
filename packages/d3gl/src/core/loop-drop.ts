@@ -23,7 +23,7 @@
  * The writers are scalar math into module scratch and the caller's output buffer: no allocation per loop. Perp
  * convention as `arrowhead.ts`: `perp(v) = (−v.y, v.x)`, and `+perp(travel)` is the loop's OUTSIDE.
  */
-import { barbOverhang, headHalfWidth, headLength, legCubic, type PointBuffer } from "./arrowhead.js";
+import { barbOverhang, headHalfWidth, headLength, legCubic, offsetCubic, type PointBuffer } from "./arrowhead.js";
 import type { InstancedLoopHead } from "./backend.js";
 
 /** The angle between the loop's two legs at the centre (degrees): the default of the network style's `selfLinkSpread`. */
@@ -167,7 +167,8 @@ function writeLoopEdges(out: PointBuffer, o: number, m: number, first: number, s
 }
 
 /**
- * Write the directed (`line` style) loop as ONE closed outline (Canvas/SVG/`toSVG()` fill), as `arrowOutline` does
+ * Write the directed (`line` style) loop as ONE closed outline of sampled points (the reference that
+ * {@link traceLoopArrowOutline}, what Canvas/SVG/`toSVG()` fill, approximates with cubic edges), as `arrowOutline` does
  * for a link: the shaft's left edge (`+width/2` along `perp(travel)`, the loop's outside) from `c` through the straight
  * leg and `samples` points on the cubic to `E1`; the left barb `E1 + hw·n`, the tip `T = c + r·u1` on the rim, the
  * right barb `E1 − hw·n` (`n = perp(−u1)`, `hw` = `headHalfWidth(width)`); the right edge (`−width/2`) back to `c`. The
@@ -194,7 +195,7 @@ export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: nu
 }
 
 /**
- * Write the `half-arrow` loop as ONE closed outline: the band between offsets 0 (the inner edge, the centre path
+ * Write the `half-arrow` loop as ONE closed outline of sampled points ({@link traceLoopHalfArrowOutline}'s reference): the band between offsets 0 (the inner edge, the centre path
  * itself) and `+width` (the outer edge, on the loop's outside). The inner edge runs `c → E0 → (cubic) → E1` (points
  * `0 … samples`), then the tip `T = c + r·u1` on the rim, the barb `E1 + (width + 2√width)·n` (`n = perp(−u1)`), and
  * the outer edge back from `E1 + width·n` to `c + width·perp(u0)`. Head length `h` = {@link loopHalfHeadLength}.
@@ -214,6 +215,97 @@ export function loopHalfArrowOutline(out: PointBuffer, o: number, sx: number, sy
   out[b + 2] = (CUBIC[6] ?? 0) + u1y * reach;
   out[b + 3] = (CUBIC[7] ?? 0) - u1x * reach;
   return 2 * m + 4;
+}
+
+/** Module scratch for the traced loop outlines: the centre cubic's two halves, then each edge's two offset halves
+ *  ({@link offsetCubic}): 48 numbers. */
+const HALVES = new Float64Array(16);
+const EDGE = new Float64Array(32);
+
+/**
+ * Trace one loop edge pair as ONE closed outline, `first` and `second` along `+perp(travel)` off the centre path
+ * `c → E0 → (cubic) → E1` (the {@link solveLoop} scratch), as {@link writeLoopEdges} samples it but with each cubic
+ * edge as TWO cubics: the centre cubic splits at `t = ½` (the loop turns ~155°, and one offset cubic per half keeps
+ * within 0.05·w of the exact offset where one for the whole stays within only ~0.1·w), each half offset by
+ * {@link offsetCubic}. The first edge runs forwards from `c`, then the `count` points of `head`, then the second edge
+ * back to `c`. Every point × `scale`.
+ */
+function traceLoopEdges(ctx: DropContext, first: number, second: number, head: ArrayLike<number>, count: number, scale: number): void {
+  const s = scale;
+  const cx = FRAME[0] ?? 0, cy = FRAME[1] ?? 0;
+  // The straight leg's normal perp(u0) is the cubic's start normal: the edge runs on with no corner.
+  const nx = -(FRAME[4] ?? 0), ny = FRAME[3] ?? 0;
+  // de Casteljau at ½: the halves P0, a, ab, m and m, bc, c, P3.
+  for (let k = 0; k < 2; k++) {
+    const p0 = CUBIC[k] ?? 0, p1 = CUBIC[2 + k] ?? 0, p2 = CUBIC[4 + k] ?? 0, p3 = CUBIC[6 + k] ?? 0;
+    const a = (p0 + p1) / 2, b = (p1 + p2) / 2, c = (p2 + p3) / 2;
+    const ab = (a + b) / 2, bc = (b + c) / 2;
+    HALVES[k] = p0;
+    HALVES[2 + k] = a;
+    HALVES[4 + k] = ab;
+    HALVES[6 + k] = HALVES[8 + k] = (ab + bc) / 2;
+    HALVES[10 + k] = bc;
+    HALVES[12 + k] = c;
+    HALVES[14 + k] = p3;
+  }
+  offsetCubic(HALVES, 0, first, EDGE, 0);
+  offsetCubic(HALVES, 8, first, EDGE, 8);
+  offsetCubic(HALVES, 0, second, EDGE, 16);
+  offsetCubic(HALVES, 8, second, EDGE, 24);
+  const e = EDGE;
+  ctx.moveTo((cx + nx * first) * s, (cy + ny * first) * s);
+  ctx.lineTo((e[0] ?? 0) * s, (e[1] ?? 0) * s);
+  ctx.bezierCurveTo((e[2] ?? 0) * s, (e[3] ?? 0) * s, (e[4] ?? 0) * s, (e[5] ?? 0) * s, (e[6] ?? 0) * s, (e[7] ?? 0) * s);
+  ctx.bezierCurveTo((e[10] ?? 0) * s, (e[11] ?? 0) * s, (e[12] ?? 0) * s, (e[13] ?? 0) * s, (e[14] ?? 0) * s, (e[15] ?? 0) * s);
+  for (let i = 0; i < count; i++) ctx.lineTo((head[2 * i] ?? 0) * s, (head[2 * i + 1] ?? 0) * s);
+  ctx.lineTo((e[30] ?? 0) * s, (e[31] ?? 0) * s);
+  ctx.bezierCurveTo((e[28] ?? 0) * s, (e[29] ?? 0) * s, (e[26] ?? 0) * s, (e[27] ?? 0) * s, (e[24] ?? 0) * s, (e[25] ?? 0) * s);
+  ctx.bezierCurveTo((e[20] ?? 0) * s, (e[21] ?? 0) * s, (e[18] ?? 0) * s, (e[19] ?? 0) * s, (e[16] ?? 0) * s, (e[17] ?? 0) * s);
+  ctx.lineTo((cx + nx * second) * s, (cy + ny * second) * s);
+  ctx.closePath();
+}
+
+/** Module scratch for a traced loop's head points (at most 3), refilled per call. */
+const HEAD = new Float64Array(6);
+
+/**
+ * Trace the directed (`line` style) loop as ONE closed outline — the shape {@link loopArrowOutline} samples, with each
+ * cubic edge (`±width/2` off the centre cubic) as ONE cubic ({@link offsetCubic}), so the recorder flattens it by its
+ * own tolerance; the straight legs and the head stay straight. Every point × `scale` (the screen bake's `1/k`).
+ * Returns false (traces nothing) for coincident ends. `leg` = L, `cot` = `cot α`.
+ */
+export function traceLoopArrowOutline(ctx: DropContext, sx: number, sy: number, tx: number, ty: number, width: number, h: number, leg = LOOP_LEG, cot = DROP_COT, scale = 1): boolean {
+  const r = solveLoop(sx, sy, tx, ty, h, leg, cot);
+  if (r === 0) return false;
+  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
+  const ex = CUBIC[6] ?? 0, ey = CUBIC[7] ?? 0;
+  const hw = headHalfWidth(width);
+  HEAD[0] = ex + u1y * hw;
+  HEAD[1] = ey - u1x * hw;
+  HEAD[2] = (FRAME[0] ?? 0) + r * u1x;
+  HEAD[3] = (FRAME[1] ?? 0) + r * u1y;
+  HEAD[4] = ex - u1y * hw;
+  HEAD[5] = ey + u1x * hw;
+  traceLoopEdges(ctx, width / 2, -width / 2, HEAD, 3, scale);
+  return true;
+}
+
+/**
+ * Trace the `half-arrow` loop as ONE closed outline — the shape {@link loopHalfArrowOutline} samples: the inner edge
+ * (offset 0, the centre cubic itself), the tip and the barb, then the outer edge (`+width`, ONE cubic by
+ * {@link offsetCubic}) back. Every point × `scale`. Returns false for coincident ends. `leg` = L, `cot` = `cot α`.
+ */
+export function traceLoopHalfArrowOutline(ctx: DropContext, sx: number, sy: number, tx: number, ty: number, width: number, leg = LOOP_LEG, cot = DROP_COT, scale = 1): boolean {
+  const r = solveLoop(sx, sy, tx, ty, loopHalfHeadLength(width), leg, cot);
+  if (r === 0) return false;
+  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
+  const reach = width + barbOverhang(width);
+  HEAD[0] = (FRAME[0] ?? 0) + r * u1x;
+  HEAD[1] = (FRAME[1] ?? 0) + r * u1y;
+  HEAD[2] = (CUBIC[6] ?? 0) + u1y * reach;
+  HEAD[3] = (CUBIC[7] ?? 0) - u1x * reach;
+  traceLoopEdges(ctx, 0, width, HEAD, 2, scale);
+  return true;
 }
 
 /** Trace `n` points of a written outline as one closed subpath, each × `scale` (the screen-sizeMode bake's `1/k`). */
