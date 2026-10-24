@@ -459,14 +459,16 @@ export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
 // A `loops` layer (`InstancedLoopsData`): `a_center` its node centre, and its two rim ends are that centre plus
 // `a_startOffset` / `a_endOffset` (size units, any #509 node offset in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
 // T − c = n + D/2 = r·u1. The centre curve is c → E0, the cubic E0, E0 + ℓ·u0, E1 + ℓ·u1, E1 (E_k = c + (r + h)·u_k,
-// ℓ = L·r: `u_loopLeg` is the layer's `legLength`, L in node radii), then the variant's end. The template (`loopTemplate`):
-// (−1, ±1) the pair at c with the straight leg's normal ⟂(u0); (t ∈ [0, 1], ±1) the cubic; then the end —
-// undirected (4, ±1) the pair back at c; arrow (2, 1) left barb, (2, −1) right barb, (3, 0) tip (as
-// `headLineTemplate`); half-arrow (3, 0) tip, (2, 1) barb (the last pair, tip and barb: two triangles that tile the
-// one-sided head). Each edge sits `off` along ⟂(travel), the loop's outside: ±w/2 (line), 0 / +w (half-arrow, whose
-// head length is 10·∛w; otherwise h = u_loopStub). The tip is on the rim, T = c + r·u1.
+// ℓ = L·r: `u_loopLeg` is the layer's `legLength`, L in node radii), then the variant's end. h = max(2·arrowSize, 10·∛w)
+// in every variant (`loopPieceLength`), so the path never changes with the head, which lies on the end piece: its
+// tip on the rim, T = c + r·u1, its base B = c + (r + hl)·u1, hl its length (2·arrowSize = u_loopHead, or the half
+// head's 10·∛w). The template (`loopTemplate`): (−1, ±1) the pair at c with the straight leg's normal ⟂(u0);
+// (t ∈ [0, 1], ±1) the cubic; then the end — undirected (4, ±1) the pair back at c; arrow (5, ±1) the shaft's pair
+// at B, (2, 1) left barb, (2, −1) right barb, (3, 0) tip (as `headLineTemplate`); half-arrow (3, 0) tip, (5, 1) the
+// outer edge at B, (2, 1) barb (off the last pair, the band down to B and the one-sided head). Each edge sits `off`
+// along ⟂(travel), the loop's outside: ±w/2 (line), 0 / +w (half-arrow).
 const LOOP_DECL = `
-uniform float u_loopStub;   // h: the straight pieces past the rim (the stub, or the arrowhead's length, #542)
+uniform float u_loopHead;   // 2·arrowSize: the arrowhead's length; the straight pieces are max(this, 10·∛w) (#542)
 uniform float u_loopCot;    // cot α: recovers the loop's centre from its two rim ends
 uniform float u_loopHalf;   // 1 = the half-arrow band (edges 0 / +w, one-sided head), 0 = the line (±w/2)
 uniform float u_loopLeg;    // L: the cubic's arms in node radii (the layer's legLength)`;
@@ -486,16 +488,20 @@ const LOOP_BODY = `  float t = a_corner.x;
   vec2 u1 = (nd + hd) * ir;
   vec2 c = 0.5 * (src - a0 + tgt - (nd + hd));              // = S − r·u0 = T − r·u1
   float off = halfArrow ? (side + 1.0) * 0.5 * a_width : side * 0.5 * a_width;
-  float h = halfArrow ? 10.0 * pow(a_width, 1.0 / 3.0) : u_loopStub;
-  vec2 e1 = c + (r + h) * u1;                               // E1, the head's base centre
+  float halfHead = 10.0 * pow(a_width, 1.0 / 3.0);         // the half-arrow's head length
+  float h = max(u_loopHead, halfHead);                      // the straight pieces, the same in every variant
+  vec2 e1 = c + (r + h) * u1;                               // E1, the end piece's far end
   vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the end's normal
   vec2 pos;
-  if (t > 3.5) {
+  if (t > 4.5) {
+    pos = c + (r + (halfArrow ? halfHead : u_loopHead)) * u1 + un * off; // an edge at the head's base B
+  } else if (t > 3.5) {
     pos = c + un * off;                                     // the undirected loop's end, back at c
   } else if (t > 2.5) {
     pos = c + r * u1;                                       // the tip, on the rim
   } else if (t > 1.5) {
-    pos = e1 + un * (off + side * 2.0 * sqrt(a_width));     // a barb: barbOverhang past its edge
+    vec2 b = c + (r + (halfArrow ? halfHead : u_loopHead)) * u1;
+    pos = b + un * (off + side * 2.0 * sqrt(a_width));      // a barb at B: barbOverhang past its edge
   } else if (t < -0.5) {
     pos = c + vec2(-u0.y, u0.x) * off;                      // the start, at c
   } else {

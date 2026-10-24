@@ -1,8 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { network, Network, type NetworkLinkHit } from "../network.js";
 import { buildGraph } from "../graph.js";
-import { DROP_HALF_SPREAD, LOOP_LEG } from "../../core/loop-drop.js";
-import { headLength } from "../../core/arrowhead.js";
+import { DROP_HALF_SPREAD, LOOP_LEG, loopPieceLength } from "../../core/loop-drop.js";
 
 /**
  * #505: a self-link draws as a loop at its node, on WebGL, Canvas and SVG, in both size modes; a directed one
@@ -10,7 +9,7 @@ import { headLength } from "../../core/arrowhead.js";
  *
  * Node 0 (at x = 60) has a self-link and one neighbour, node 1 (at x = 140), so its loop points away from it,
  * towards −x. The loop runs from the node's centre back to it (#542: straight out to `E0 = c + ρ·u0`, the settled
- * cubic to `E1`, straight back, `ρ = r + headLength(arrowSize)`); its round far end, the cubic's `B(½)`, sits
+ * cubic to `E1`, straight back, `ρ = r + max(2·arrowSize, 10·∛w)` in every style); its round far end, the cubic's `B(½)`, sits
  * `(4ρ + 3ℓ)·cos α/4` left of the centre (`ℓ = LOOP_LEG·r`), outside the node.
  */
 
@@ -20,9 +19,9 @@ const SIZE_MODES = ["screen", "world"] as const;
 const R = 10;
 const CX = 60;
 const CY = 100;
-/** The draws' arrow size, and the `line`-style loop's leg offset `ρ` (its head length is the same, directed or not). */
+/** The draws' arrow size, and the loop's leg offset `ρ` at the default link width 3 (the same in every style). */
 const ARROW_SIZE = 4;
-const RHO = R + headLength(ARROW_SIZE);
+const RHO = R + loopPieceLength(ARROW_SIZE, 3);
 const APEX_X = CX - ((4 * RHO + 3 * LOOP_LEG * R) * Math.cos(DROP_HALF_SPREAD)) / 4;
 
 /** Where the loop's first leg (the upper one, y < CY) crosses the circle of radius `d ≤ ρ` round node 0: on its

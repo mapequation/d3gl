@@ -874,9 +874,10 @@ around a far larger `c` (in world mode that once bowed a loop level with its nei
 node). So every shape decision reads the offsets alone:
 
 - the shader takes `D = endOffset − startOffset` (exact: both ends share one centre), recovers the loop's centre
-  frame from it (`n = cot α·⟂(D)/2`, `u_loopCot`) and the radius `r = |n − D/2|`; the head is `u_loopStub`, or the
-  half-arrow band's `10·∛w` with `u_loopHalf`, and the cubic's arms are `u_loopLeg·r`: per-layer uniforms, no
-  per-loop column;
+  frame from it (`n = cot α·⟂(D)/2`, `u_loopCot`) and the radius `r = |n − D/2|`; the straight pieces are
+  `max(u_loopHead, 10·∛w)` in every variant (`loopPieceLength`, `u_loopHead` = `2·arrowSize`), the head that long
+  (`u_loopHead`, or the half-arrow band's `10·∛w` with `u_loopHalf`) sits at the end piece's end, and the cubic's arms
+  are `u_loopLeg·r`: per-layer uniforms, no per-loop column;
 - the CPU twins (`core/loop-drop.ts`: `traceLoop`, `loopArrowOutline`, `loopHalfArrowOutline`; the Scene writers in
   `network/self-loops.ts`, `loopsToDrawables` for `toSVG()`) recover the same frame from the same two ends with
   `spreadCot`, and the side of a half-arrow loop's band is fixed by the loop's own travel (always its outside), so

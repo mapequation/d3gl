@@ -2,7 +2,8 @@ import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
 import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_HALF_ARROW_VS, INSTANCED_LOOP_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import { LOOP_LEG, loopStubLength, loopsSpreadCot } from "../core/loop-drop.js";
+import { LOOP_LEG, loopsSpreadCot } from "../core/loop-drop.js";
+import { headLength } from "../core/arrowhead.js";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedHalfArrowsData, InstancedLoopsData, InstancedLoopHead, InstancedHighlight } from "../core/index.js";
 
 /** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
@@ -690,12 +691,14 @@ export type LineLaneData = InstancedLinesData & { radii?: Float32Array; arrowSiz
 /**
  * The self-link loop's strip (#542, `INSTANCED_LOOP_VS`): (−1, ±1) the pair at the node centre, the
  * {@link lineTemplate} cubic samples, then the end — `"none"`: (4, ±1) the pair back at the centre (`2·M + 4`
- * vertices); `"arrow"`: (2, 1) left barb, (2, −1) right barb, (3, 0) tip, as {@link headLineTemplate} (`2·M + 5`);
- * `"half"`: (3, 0) tip, (2, 1) barb, whose two triangles off the last pair tile the one-sided head (`2·M + 4`).
+ * vertices); `"arrow"`: (5, ±1) the shaft's pair at the head's base, then (2, 1) left barb, (2, −1) right barb,
+ * (3, 0) tip, as {@link headLineTemplate} (`2·M + 7`); `"half"`: (3, 0) tip, (5, 1) the outer edge at the head's
+ * base, (2, 1) barb, whose three triangles off the last pair tile the band down to the base and the one-sided head
+ * (`2·M + 5`). Where the end piece is as long as the head, the base pair repeats the last cubic pair (zero area).
  */
 export function loopTemplate(samples: number, head: InstancedLoopHead["head"]): Float32Array {
   const cubic = lineTemplate(samples);
-  const end = head === "none" ? [4, -1, 4, 1] : head === "arrow" ? [2, 1, 2, -1, 3, 0] : [3, 0, 2, 1];
+  const end = head === "none" ? [4, -1, 4, 1] : head === "arrow" ? [5, -1, 5, 1, 2, 1, 2, -1, 3, 0] : [3, 0, 5, 1, 2, 1];
   const t = new Float32Array(4 + cubic.length + end.length);
   t.set([-1, -1, -1, 1]);
   t.set(cubic, 4);
@@ -985,7 +988,7 @@ const LOOP_OFFSETS = ["a_startOffset", "a_endOffset"] as const;
  * A `loops` layer's lane (#542, `INSTANCED_LOOP_VS`, {@link loopTemplate}): per loop its node `centers`, its two rim
  * ends as offsets from the centre (#509 columns: uploaded when the array is new, or by `offsetsChanged`), `widths`,
  * `colors` and the highlight columns; per layer the head (fixed: a change recreates, like `samples`) and the shape
- * uniforms — `u_loopStub` (`h`), `u_loopCot` (`cot α`), `u_loopLeg` (`L`) and `u_loopHalf` (the half-arrow band).
+ * uniforms — `u_loopHead` (the arrowhead's length `2·arrowSize`), `u_loopCot` (`cot α`), `u_loopLeg` (`L`) and `u_loopHalf` (the half-arrow band).
  */
 export class InstancedLoops {
   count: number;
@@ -1059,9 +1062,10 @@ export class InstancedLoops {
     return this.pickModel ? [this.model, this.pickModel] : [this.model];
   }
 
-  /** The layer's shape uniforms: the straight pieces past the rim (`h`), the centre solve (`cot α`), the legs (`L`). */
+  /** The layer's shape uniforms: the arrowhead's length (and so, with each loop's width, its straight pieces' `h`), the
+   *  centre solve (`cot α`), the legs (`L`). */
   private setShape(data: InstancedLoopsData): void {
-    this.uniforms["u_loopStub"] = loopStubLength(data);
+    this.uniforms["u_loopHead"] = headLength(data.arrowSize);
     this.uniforms["u_loopCot"] = loopsSpreadCot(data.spread);
     this.uniforms["u_loopLeg"] = data.legLength ?? LOOP_LEG;
   }

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, LOOP_SPREAD, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, loopHalfHeadLength, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../../core/loop-drop.js";
+import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, LOOP_SPREAD, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, loopHalfHeadLength, loopPieceLength, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../../core/loop-drop.js";
 import { PathRecorder } from "../../core/path-recorder.js";
 import { outlineGap } from "../../core/__tests__/outline-gap.js";
 import { headHalfWidth, headLength } from "../../core/arrowhead.js";
@@ -153,19 +153,21 @@ describe("self-loop geometry", () => {
     }
   });
 
-  it("draws the arrow loop as one outline: the undirected path plus a head, its tip on the rim, the shaft's corners on the head's base", () => {
+  it("draws the arrow loop as one outline: the undirected path plus a head on the end piece, its tip on the rim", () => {
     const r = 10;
     const size = 4;
-    const h = headLength(size);
+    const hl = headLength(size);
     const m = 12;
     for (const [ox, oy] of [[0, 0], [-5, 9]] as const) {
       for (const theta of [-2.5, 0, 1.2, Math.PI]) {
+        // 0.5: the head (8) is the piece (10·∛0.5 < 8); 3 and 8: the piece (10·∛w) is longer, straight shaft to the base.
         for (const width of [0.5, 3, 8]) {
+          const h = loopPieceLength(size, width);
           const [sx, sy, tx, ty] = endsAt(theta, r, ox, oy);
-          const buf = new Float64Array(2 * (2 * m + 5));
-          const n = loopArrowOutline(buf, 0, sx, sy, tx, ty, width, h, m);
-          expect(n).toBe(2 * m + 5);
-          const last = 2 * m + 4;
+          const buf = new Float64Array(2 * (2 * m + 7));
+          const n = loopArrowOutline(buf, 0, sx, sy, tx, ty, width, size, m);
+          expect(n).toBe(2 * m + 7);
+          const last = 2 * m + 6;
           // The shaft's mid-line is the undirected loop's path: c, E0, then the cubic at t = (k − 1)/(m − 1).
           const [c = [0, 0], e0 = [0, 0], p1 = [0, 0], p2 = [0, 0], e1 = [0, 0]] = centrePath(sx, sy, tx, ty, h);
           for (let k = 0; k <= m; k++) {
@@ -180,18 +182,22 @@ describe("self-loop geometry", () => {
               expectPt(mirror(rr, theta, ox, oy), pt(buf, last - (m + 1 - k)));
             }
           }
-          // The head: left barb, tip, right barb. The tip is the rim end; the base is centred on E1, headHalfWidth wide.
-          const lb = pt(buf, m + 1), tip = pt(buf, m + 2), rb = pt(buf, m + 3);
+          // The head: left barb, tip, right barb. The tip is the rim end; the base B is centred on the end piece `hl`
+          // from the tip, headHalfWidth wide.
+          const lb = pt(buf, m + 2), tip = pt(buf, m + 3), rb = pt(buf, m + 4);
           expectPt(tip, [tx, ty]);
           expect(Math.hypot(tip[0] - ox, tip[1] - oy)).toBeCloseTo(r, 4);
-          expectPt([(lb[0] + rb[0]) / 2, (lb[1] + rb[1]) / 2], e1);
+          const base: Pt = [(lb[0] + rb[0]) / 2, (lb[1] + rb[1]) / 2];
+          expectPt(base, [tip[0] + (hl / h) * (e1[0] - tip[0]), tip[1] + (hl / h) * (e1[1] - tip[1])]);
           expect(Math.hypot(lb[0] - rb[0], lb[1] - rb[1]) / 2).toBeCloseTo(headHalfWidth(width), 4);
           expect(Math.hypot(e1[0] - tip[0], e1[1] - tip[1])).toBeCloseTo(h, 4);
-          // The shaft's end corners lie on the base, inside the barbs.
+          // The shaft runs straight down the end piece: its corners at the base are its corners at E1 moved along it,
+          // and lie on the base, inside the barbs.
           const cross = (p: Pt): number => (rb[0] - lb[0]) * (p[1] - lb[1]) - (rb[1] - lb[1]) * (p[0] - lb[0]);
-          for (const corner of [pt(buf, m), pt(buf, last - m)]) {
+          for (const [corner, atE1] of [[pt(buf, m + 1), pt(buf, m)], [pt(buf, m + 5), pt(buf, last - m)]] as const) {
+            expectPt([corner[0] - atE1[0], corner[1] - atE1[1]], [base[0] - e1[0], base[1] - e1[1]]);
             expect(cross(corner) / headHalfWidth(width)).toBeCloseTo(0, 4);
-            expect(Math.hypot(corner[0] - e1[0], corner[1] - e1[1])).toBeLessThan(headHalfWidth(width));
+            expect(Math.hypot(corner[0] - base[0], corner[1] - base[1])).toBeLessThan(headHalfWidth(width));
           }
           // The left edge is the loop's outside: farther from the centre than the right at the far end.
           const mid = Math.round((m + 1) / 2);
@@ -207,23 +213,29 @@ describe("self-loop geometry", () => {
     for (const theta of [-2.5, 0, 1.2]) {
       for (const width of [0.5, 2, 10, 50]) {
         const [sx, sy, tx, ty] = endsAt(theta, r);
-        const buf = new Float64Array(2 * (2 * m + 4));
-        const n = loopHalfArrowOutline(buf, 0, sx, sy, tx, ty, width, m);
-        expect(n).toBe(2 * m + 4);
-        const last = 2 * m + 3;
-        // The inner edge is the centre path for the half-arrow's head length.
-        const h = loopHalfHeadLength(width);
+        const size = 4; // a head of 8: longer than 10·∛0.5, shorter than the others
+        const buf = new Float64Array(2 * (2 * m + 5));
+        const n = loopHalfArrowOutline(buf, 0, sx, sy, tx, ty, width, size, m);
+        expect(n).toBe(2 * m + 5);
+        const last = 2 * m + 4;
+        // The inner edge is the centre path for the loop's piece length, whatever the head.
+        const h = loopPieceLength(size, width);
+        const hl = loopHalfHeadLength(width);
         const [c = [0, 0], e0 = [0, 0], p1 = [0, 0], p2 = [0, 0], e1 = [0, 0]] = centrePath(sx, sy, tx, ty, h);
         expectPt(pt(buf, 0), c);
         expectPt(pt(buf, 1), e0);
         expectPt(pt(buf, m), e1);
-        // The head: the tip on the rim, then the barb `width + 2√width` out from E1, then the outer edge at `width`.
+        // The head: the tip on the rim, then the barb `width + 2√width` out from the base B (`hl` from the tip, on
+        // the end piece), then the outer edge at `width` off B, running on straight to E1.
         const tip = pt(buf, m + 1);
         expectPt(tip, [tx, ty]);
         expect(Math.hypot(tip[0], tip[1])).toBeCloseTo(r, 4);
+        const base: Pt = [tip[0] + (hl / h) * (e1[0] - tip[0]), tip[1] + (hl / h) * (e1[1] - tip[1])];
         const barb = pt(buf, m + 2);
-        expect(Math.hypot(barb[0] - e1[0], barb[1] - e1[1])).toBeCloseTo(width + 2 * Math.sqrt(width), 4);
-        expect(Math.hypot(pt(buf, m + 3)[0] - e1[0], pt(buf, m + 3)[1] - e1[1])).toBeCloseTo(width, 4);
+        expect(Math.hypot(barb[0] - base[0], barb[1] - base[1])).toBeCloseTo(width + 2 * Math.sqrt(width), 4);
+        const corner = pt(buf, m + 3);
+        expect(Math.hypot(corner[0] - base[0], corner[1] - base[1])).toBeCloseTo(width, 4);
+        expectPt([corner[0] - pt(buf, last - m)[0], corner[1] - pt(buf, last - m)[1]], [base[0] - e1[0], base[1] - e1[1]]);
         const dense: Pt[] = [];
         for (let k = 0; k <= 2000; k++) dense.push(cubicAt(e0, p1, p2, e1, k / 2000));
         for (let k = 1; k <= m; k++) {
@@ -245,9 +257,44 @@ describe("self-loop geometry", () => {
     }
   });
 
+  it("runs the same path in every style: the pieces are max(2·arrowSize, 10·∛w) long, only the head differs (#542)", () => {
+    const r = 6;
+    const m = 8;
+    const arrow = new Float64Array(2 * (2 * m + 7));
+    const half = new Float64Array(2 * (2 * m + 5));
+    for (const size of [1, 3, 8]) {
+      for (const width of [0.5, 2, 9]) {
+        const h = loopPieceLength(size, width);
+        expect(h).toBeCloseTo(Math.max(2 * size, 10 * Math.cbrt(width)), 12);
+        const [sx, sy, tx, ty] = endsAt(0.7, r, 2, -3);
+        // The undirected loop: the centre path itself, with those pieces.
+        const [c = [0, 0], e0 = [0, 0], p1 = [0, 0], p2 = [0, 0], e1 = [0, 0], back = [0, 0]] = centrePath(sx, sy, tx, ty, h);
+        expectPt(back, c);
+        const onPath = (k: number): Pt => (k === 0 ? c : cubicAt(e0, p1, p2, e1, (k - 1) / (m - 1)));
+        // The arrow: its shaft's mid-line, then on down the end piece to its base.
+        expect(loopArrowOutline(arrow, 0, sx, sy, tx, ty, width, size, m)).toBe(2 * m + 7);
+        for (let k = 0; k <= m; k++) {
+          const a = pt(arrow, k), b = pt(arrow, 2 * m + 6 - k);
+          expectPt([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], onPath(k));
+        }
+        // The half-arrow: its inner edge.
+        expect(loopHalfArrowOutline(half, 0, sx, sy, tx, ty, width, size, m)).toBe(2 * m + 5);
+        for (let k = 0; k <= m; k++) expectPt(pt(half, k), onPath(k));
+        // Both heads lie on the end piece E1 → T, their bases their own length from the tip.
+        const along = (p: Pt): number => ((p[0] - tx) * (e1[0] - tx) + (p[1] - ty) * (e1[1] - ty)) / h;
+        const a = pt(arrow, m + 1), b = pt(arrow, m + 5);
+        const arrowBase: Pt = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        expect(along(arrowBase)).toBeCloseTo(headLength(size), 4);
+        expect(Math.hypot(arrowBase[0] - tx, arrowBase[1] - ty)).toBeCloseTo(headLength(size), 4);
+        const corner = pt(half, m + 3); // the outer edge at the half head's base, `width` off the piece
+        expect(along(corner)).toBeCloseTo(loopHalfHeadLength(width), 4);
+      }
+    }
+  });
+
   it("traces the arrow and half-arrow loops with cubic edges (two per edge) within 0.05·w of the exact offset", () => {
     const M = 600; // the dense sampled outline stands in for the exact offset
-    const dense = new Float64Array(2 * (2 * M + 5));
+    const dense = new Float64Array(2 * (2 * M + 7));
     const traced = (draw: (rec: PathRecorder) => boolean): number[] => {
       const rec = new PathRecorder(0.002);
       expect(draw(rec)).toBe(true);
@@ -257,19 +304,21 @@ describe("self-loop geometry", () => {
     for (const r of [5, 10, 20]) {
       for (const width of [1, 4, 10]) {
         const [sx, sy, tx, ty] = endsAt(0.9, r, 3, -4);
-        const h = headLength(5 * Math.cbrt(width));
-        let n = loopArrowOutline(dense, 0, sx, sy, tx, ty, width, h, M);
-        let pts = traced((rec) => traceLoopArrowOutline(rec, sx, sy, tx, ty, width, h));
-        expect(outlineGap(pts, pts.length / 2, dense, n), `arrow r ${r} width ${width}`).toBeLessThan(0.05 * width);
-        n = loopHalfArrowOutline(dense, 0, sx, sy, tx, ty, width, M);
-        pts = traced((rec) => traceLoopHalfArrowOutline(rec, sx, sy, tx, ty, width));
-        expect(outlineGap(pts, pts.length / 2, dense, n), `half r ${r} width ${width}`).toBeLessThan(0.05 * width);
+        // 1: a short arrowhead, shaft down the end piece; 5·∛w: the arrowhead as long as the half's, both the piece.
+        for (const size of [1, 5 * Math.cbrt(width)]) {
+          let n = loopArrowOutline(dense, 0, sx, sy, tx, ty, width, size, M);
+          let pts = traced((rec) => traceLoopArrowOutline(rec, sx, sy, tx, ty, width, size));
+          expect(outlineGap(pts, pts.length / 2, dense, n), `arrow r ${r} width ${width} size ${size}`).toBeLessThan(0.05 * width);
+          n = loopHalfArrowOutline(dense, 0, sx, sy, tx, ty, width, size, M);
+          pts = traced((rec) => traceLoopHalfArrowOutline(rec, sx, sy, tx, ty, width, size));
+          expect(outlineGap(pts, pts.length / 2, dense, n), `half r ${r} width ${width} size ${size}`).toBeLessThan(0.05 * width);
+        }
       }
     }
     // Coincident ends: no loop, nothing traced.
     const rec = new PathRecorder();
     expect(traceLoopArrowOutline(rec, 1, 1, 1, 1, 2, 4)).toBe(false);
-    expect(traceLoopHalfArrowOutline(rec, 1, 1, 1, 1, 2)).toBe(false);
+    expect(traceLoopHalfArrowOutline(rec, 1, 1, 1, 1, 2, 4)).toBe(false);
     expect(rec.subpaths).toHaveLength(0);
   });
 });
@@ -332,18 +381,18 @@ describe("self-loop cache and layers (per-frame cost)", () => {
     expect(heads({ directed: false })).toEqual(["loops:none"]);
   });
 
-  it("the head carries only its own size: the undirected loop's stub is the line style's head length (#542)", () => {
+  it("every head carries the style's arrow size, which sets the straight pieces in every variant (#542)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 1], directed: true });
     g.positions.set([0, 0, 10, 0]);
     const head = (opts: Parameters<typeof style>[1]) => {
       const s = style(2, opts);
       const l = networkLayersFromCache(g, s, noLodStyleCache(g, s)).find((x) => x.name === SELF_LOOP_LAYER);
       if (!l || l.primitive !== "loops") throw new Error("expected the loops layer");
-      return l.loops.head === "none" ? { head: "none", stubLength: l.loops.stubLength } : l.loops.head === "arrow" ? { head: "arrow", arrowSize: l.loops.arrowSize } : { head: "half" };
+      return { head: l.loops.head, arrowSize: l.loops.arrowSize };
     };
-    expect(head({ directed: false })).toEqual({ head: "none", stubLength: 6 }); // 2 · arrowSize 3
+    expect(head({ directed: false })).toEqual({ head: "none", arrowSize: 3 });
     expect(head({ directed: true })).toEqual({ head: "arrow", arrowSize: 3 });
-    expect(head({ directed: true, linkStyle: "half-arrow" })).toEqual({ head: "half" });
+    expect(head({ directed: true, linkStyle: "half-arrow" })).toEqual({ head: "half", arrowSize: 3 });
   });
 });
 

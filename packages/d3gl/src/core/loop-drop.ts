@@ -9,11 +9,12 @@
  *
  *   straight `c → E0`, then `legCubic(c, u0, ρ, c, u1, ρ, ℓ)` = `E0, E0 + ℓ·u0, E1 + ℓ·u1, E1`, then
  *
- * with `ρ = r + h` at both ends (`E_k = c + ρ·u_k`), `h` the head length and the leg `ℓ = L·r` (`L` the style's `selfLinkLength`, default {@link LOOP_LEG}).
- * The undirected loop goes on straight `E1 → c`; the arrow ends in a head whose base is on `E1` and whose tip is `T`,
- * on the rim; the half-arrow ends in its one-sided barb. `h` is the same for the undirected loop and the arrow
- * (`headLength(arrowSize)`), so toggling `directed` only adds or removes the head; the half-arrow's is
- * {@link loopHalfHeadLength}. Apart from the head, every variant is mirror-symmetric about `φ`, and the far end,
+ * with `ρ = r + h` at both ends (`E_k = c + ρ·u_k`), `h` the straight pieces' length past the rim and the leg `ℓ = L·r`
+ * (`L` the style's `selfLinkLength`, default {@link LOOP_LEG}). `h` = {@link loopPieceLength} is the same in every
+ * variant, so the path never changes with the style: only the head comes and goes. The undirected loop goes on
+ * straight `E1 → c`; the arrow ends in a head `headLength(arrowSize)` long and the half-arrow in its one-sided barb
+ * {@link loopHalfHeadLength} long, each with its tip `T` on the rim and its base on the end piece, the piece straight
+ * shaft from `E1` down to the base. Apart from the head, every variant is mirror-symmetric about `φ`, and the far end,
  * `B(½) = c + (4ρ + 3ℓ)·cos α/4 · u(φ)`, lies on the axis.
  *
  * The centre need not be stored: with the chord `D = T − S` and `n = cot α·⟂(D)/2`, `S − c = n − D/2 = r·u0` and
@@ -24,7 +25,6 @@
  * convention as `arrowhead.ts`: `perp(v) = (−v.y, v.x)`, and `+perp(travel)` is the loop's OUTSIDE.
  */
 import { barbOverhang, headHalfWidth, headLength, legCubic, offsetCubic, type PointBuffer } from "./arrowhead.js";
-import type { InstancedLoopHead } from "./backend.js";
 
 /** The angle between the loop's two legs at the centre (degrees): the default of the network style's `selfLinkSpread`. */
 export const LOOP_SPREAD = 25;
@@ -48,10 +48,11 @@ export function loopsSpreadCot(spread: number | undefined): number {
   return spread === undefined ? DROP_COT : spreadCot(spread / 2);
 }
 
-/** The length `h` a `loops` layer's straight pieces run past the rim ({@link InstancedLoopHead}): its `stubLength`, its
- *  arrowhead's length, or 0 for the half-arrow head, whose `h` is per loop (`10·∛width`, the lane's and the writer's own). */
-export function loopStubLength(head: InstancedLoopHead): number {
-  return head.head === "none" ? head.stubLength : head.head === "arrow" ? headLength(head.arrowSize) : 0;
+/** The length `h` a loop's straight pieces run past the rim, in every variant: `max(2·arrowSize, 10·∛width)`, long
+ *  enough for either head ({@link headLength}, {@link loopHalfHeadLength}), so the path is the same with or without
+ *  one. Per loop (its `width`); the loop lane's twin is `INSTANCED_LOOP_VS`. */
+export function loopPieceLength(arrowSize: number, width: number): number {
+  return Math.max(headLength(arrowSize), loopHalfHeadLength(width));
 }
 
 /** The path context a loop traces into (Canvas, SVG, the export recorder). */
@@ -101,8 +102,8 @@ function solveLoop(sx: number, sy: number, tx: number, ty: number, h: number, le
 }
 
 /**
- * Trace the loop's centre line (the stroked, undirected loop), given its rim ends `(sx, sy)`, `(tx, ty)` and head
- * length `h` (`headLength(arrowSize)`, so the arrow loop runs along the same path): `moveTo(c)`, `lineTo(E0)`,
+ * Trace the loop's centre line (the stroked, undirected loop), given its rim ends `(sx, sy)`, `(tx, ty)` and
+ * piece length `h` ({@link loopPieceLength}, so every variant runs along the same path): `moveTo(c)`, `lineTo(E0)`,
  * `bezierCurveTo(E0 + ℓ·u0, E1 + ℓ·u1, E1)`, `lineTo(c)`, with `E_k = c + (r + h)·u_k` and `ℓ = leg·r`. `cot` = `cot α`
  * of the ends' half-spread ({@link spreadCot}).
  */
@@ -167,54 +168,90 @@ function writeLoopEdges(out: PointBuffer, o: number, m: number, first: number, s
 }
 
 /**
+ * Write the arrow loop's head into `out` at `o` (the {@link solveLoop} scratch, piece length `h`): the head of length
+ * `hl` ≤ `h` on the end piece, its base `B = c + (r + hl)·u1` and its tip `T = c + r·u1` on the rim. With `shaft`, the
+ * shaft's end corners `B ± (width/2)·n` frame it (the straight shaft from `E1` down to the base): `B + (width/2)·n`,
+ * the left barb `B + hw·n`, `T`, the right barb `B − hw·n`, `B − (width/2)·n` (`n = perp(−u1)`, `hw` =
+ * `headHalfWidth(width)`); without, the middle three. Returns the point count (5 or 3).
+ */
+function writeArrowHead(out: PointBuffer, o: number, r: number, width: number, hl: number, shaft: boolean): number {
+  const cx = FRAME[0] ?? 0, cy = FRAME[1] ?? 0, u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
+  const bx = cx + (r + hl) * u1x, by = cy + (r + hl) * u1y;
+  const hw = headHalfWidth(width);
+  const half = width / 2;
+  let i = o;
+  if (shaft) {
+    out[i++] = bx + u1y * half;
+    out[i++] = by - u1x * half;
+  }
+  out[i++] = bx + u1y * hw;
+  out[i++] = by - u1x * hw;
+  out[i++] = cx + r * u1x;
+  out[i++] = cy + r * u1y;
+  out[i++] = bx - u1y * hw;
+  out[i++] = by + u1x * hw;
+  if (shaft) {
+    out[i++] = bx - u1y * half;
+    out[i++] = by + u1x * half;
+  }
+  return (i - o) / 2;
+}
+
+/**
+ * Write the half-arrow loop's head into `out` at `o`, as {@link writeArrowHead}: the tip `T = c + r·u1` on the rim
+ * (on the inner edge, the centre path, which runs on straight from `E1`), the barb `B + (width + 2√width)·n` and, with
+ * `shaft`, the outer edge's corner `B + width·n` at the base `B = c + (r + hl)·u1`. Returns the point count (3 or 2).
+ */
+function writeHalfArrowHead(out: PointBuffer, o: number, r: number, width: number, hl: number, shaft: boolean): number {
+  const cx = FRAME[0] ?? 0, cy = FRAME[1] ?? 0, u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
+  const bx = cx + (r + hl) * u1x, by = cy + (r + hl) * u1y;
+  const reach = width + barbOverhang(width);
+  out[o] = cx + r * u1x;
+  out[o + 1] = cy + r * u1y;
+  out[o + 2] = bx + u1y * reach;
+  out[o + 3] = by - u1x * reach;
+  if (!shaft) return 2;
+  out[o + 4] = bx + u1y * width;
+  out[o + 5] = by - u1x * width;
+  return 3;
+}
+
+/**
  * Write the directed (`line` style) loop as ONE closed outline of sampled points (the reference that
  * {@link traceLoopArrowOutline}, what Canvas/SVG/`toSVG()` fill, approximates with cubic edges), as `arrowOutline` does
  * for a link: the shaft's left edge (`+width/2` along `perp(travel)`, the loop's outside) from `c` through the straight
- * leg and `samples` points on the cubic to `E1`; the left barb `E1 + hw·n`, the tip `T = c + r·u1` on the rim, the
- * right barb `E1 − hw·n` (`n = perp(−u1)`, `hw` = `headHalfWidth(width)`); the right edge (`−width/2`) back to `c`. The
- * head's base is on `E1 = c + (r + h)·u1`, so the shaft's end corners land on it. `h` = `headLength(arrowSize)`.
- * Writes `2·(2·samples + 5)` numbers at `o`; returns the point count `2·samples + 5` (0 for coincident ends). `leg` = L,
- * `cot` = `cot α`.
+ * leg and `samples` points on the cubic to `E1`, on down the end piece to the head's base `B`; the left barb, the tip
+ * `T = c + r·u1` on the rim, the right barb; the right edge (`−width/2`) back to `c` ({@link writeArrowHead}). The
+ * pieces are `h` = {@link loopPieceLength} long and the head `headLength(arrowSize)`; where the two are equal, the
+ * shaft's corners at `B` repeat those at `E1`. Writes `2·(2·samples + 7)` numbers at `o`; returns the point count
+ * `2·samples + 7` (0 for coincident ends). `leg` = L, `cot` = `cot α`.
  */
-export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, h: number, samples: number, leg = LOOP_LEG, cot = DROP_COT): number {
-  const r = solveLoop(sx, sy, tx, ty, h, leg, cot);
+export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, arrowSize: number, samples: number, leg = LOOP_LEG, cot = DROP_COT): number {
+  const r = solveLoop(sx, sy, tx, ty, loopPieceLength(arrowSize, width), leg, cot);
   if (r === 0) return 0;
   const m = Math.max(2, samples | 0);
-  writeLoopEdges(out, o, m, width / 2, -width / 2, 2 * m + 4);
-  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
-  const ex = CUBIC[6] ?? 0, ey = CUBIC[7] ?? 0;
-  const hw = headHalfWidth(width);
-  const b = o + 2 * (m + 1);
-  out[b] = ex + u1y * hw;
-  out[b + 1] = ey - u1x * hw;
-  out[b + 2] = (FRAME[0] ?? 0) + r * u1x;
-  out[b + 3] = (FRAME[1] ?? 0) + r * u1y;
-  out[b + 4] = ex - u1y * hw;
-  out[b + 5] = ey + u1x * hw;
-  return 2 * m + 5;
+  writeLoopEdges(out, o, m, width / 2, -width / 2, 2 * m + 6);
+  writeArrowHead(out, o + 2 * (m + 1), r, width, headLength(arrowSize), true);
+  return 2 * m + 7;
 }
 
 /**
  * Write the `half-arrow` loop as ONE closed outline of sampled points ({@link traceLoopHalfArrowOutline}'s reference): the band between offsets 0 (the inner edge, the centre path
  * itself) and `+width` (the outer edge, on the loop's outside). The inner edge runs `c → E0 → (cubic) → E1` (points
- * `0 … samples`), then the tip `T = c + r·u1` on the rim, the barb `E1 + (width + 2√width)·n` (`n = perp(−u1)`), and
- * the outer edge back from `E1 + width·n` to `c + width·perp(u0)`. Head length `h` = {@link loopHalfHeadLength}.
- * Writes `2·(2·samples + 4)` numbers at `o`; returns the point count `2·samples + 4` (0 for coincident ends). `leg` = L,
+ * `0 … samples`), then the tip `T = c + r·u1` on the rim, the barb `B + (width + 2√width)·n` (`n = perp(−u1)`) at the
+ * head's base `B`, and the outer edge back from `B + width·n` through `E1 + width·n` to `c + width·perp(u0)`
+ * ({@link writeHalfArrowHead}). The pieces are `h` = {@link loopPieceLength} long and the head
+ * {@link loopHalfHeadLength}; where the two are equal, `B + width·n` repeats `E1 + width·n`. Writes
+ * `2·(2·samples + 5)` numbers at `o`; returns the point count `2·samples + 5` (0 for coincident ends). `leg` = L,
  * `cot` = `cot α`.
  */
-export function loopHalfArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, samples: number, leg = LOOP_LEG, cot = DROP_COT): number {
-  const r = solveLoop(sx, sy, tx, ty, loopHalfHeadLength(width), leg, cot);
+export function loopHalfArrowOutline(out: PointBuffer, o: number, sx: number, sy: number, tx: number, ty: number, width: number, arrowSize: number, samples: number, leg = LOOP_LEG, cot = DROP_COT): number {
+  const r = solveLoop(sx, sy, tx, ty, loopPieceLength(arrowSize, width), leg, cot);
   if (r === 0) return 0;
   const m = Math.max(2, samples | 0);
-  writeLoopEdges(out, o, m, 0, width, 2 * m + 3);
-  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
-  const reach = width + barbOverhang(width);
-  const b = o + 2 * (m + 1);
-  out[b] = (FRAME[0] ?? 0) + r * u1x;
-  out[b + 1] = (FRAME[1] ?? 0) + r * u1y;
-  out[b + 2] = (CUBIC[6] ?? 0) + u1y * reach;
-  out[b + 3] = (CUBIC[7] ?? 0) - u1x * reach;
-  return 2 * m + 4;
+  writeLoopEdges(out, o, m, 0, width, 2 * m + 4);
+  writeHalfArrowHead(out, o + 2 * (m + 1), r, width, loopHalfHeadLength(width), true);
+  return 2 * m + 5;
 }
 
 /** Module scratch for the traced loop outlines: the centre cubic's two halves, then each edge's two offset halves
@@ -265,28 +302,23 @@ function traceLoopEdges(ctx: DropContext, first: number, second: number, head: A
   ctx.closePath();
 }
 
-/** Module scratch for a traced loop's head points (at most 3), refilled per call. */
-const HEAD = new Float64Array(6);
+/** Module scratch for a traced loop's head points (at most 5), refilled per call. */
+const HEAD = new Float64Array(10);
 
 /**
  * Trace the directed (`line` style) loop as ONE closed outline — the shape {@link loopArrowOutline} samples, with each
  * cubic edge (`±width/2` off the centre cubic) as ONE cubic ({@link offsetCubic}), so the recorder flattens it by its
- * own tolerance; the straight legs and the head stay straight. Every point × `scale` (the screen bake's `1/k`).
+ * own tolerance; the straight legs, the shaft down the end piece and the head stay straight (the shaft's corners at
+ * the head's base only where the piece is longer than the head). Every point × `scale` (the screen bake's `1/k`).
  * Returns false (traces nothing) for coincident ends. `leg` = L, `cot` = `cot α`.
  */
-export function traceLoopArrowOutline(ctx: DropContext, sx: number, sy: number, tx: number, ty: number, width: number, h: number, leg = LOOP_LEG, cot = DROP_COT, scale = 1): boolean {
+export function traceLoopArrowOutline(ctx: DropContext, sx: number, sy: number, tx: number, ty: number, width: number, arrowSize: number, leg = LOOP_LEG, cot = DROP_COT, scale = 1): boolean {
+  const h = loopPieceLength(arrowSize, width);
   const r = solveLoop(sx, sy, tx, ty, h, leg, cot);
   if (r === 0) return false;
-  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
-  const ex = CUBIC[6] ?? 0, ey = CUBIC[7] ?? 0;
-  const hw = headHalfWidth(width);
-  HEAD[0] = ex + u1y * hw;
-  HEAD[1] = ey - u1x * hw;
-  HEAD[2] = (FRAME[0] ?? 0) + r * u1x;
-  HEAD[3] = (FRAME[1] ?? 0) + r * u1y;
-  HEAD[4] = ex - u1y * hw;
-  HEAD[5] = ey + u1x * hw;
-  traceLoopEdges(ctx, width / 2, -width / 2, HEAD, 3, scale);
+  const hl = headLength(arrowSize);
+  const n = writeArrowHead(HEAD, 0, r, width, hl, h > hl);
+  traceLoopEdges(ctx, width / 2, -width / 2, HEAD, n, scale);
   return true;
 }
 
@@ -295,16 +327,13 @@ export function traceLoopArrowOutline(ctx: DropContext, sx: number, sy: number, 
  * (offset 0, the centre cubic itself), the tip and the barb, then the outer edge (`+width`, ONE cubic by
  * {@link offsetCubic}) back. Every point × `scale`. Returns false for coincident ends. `leg` = L, `cot` = `cot α`.
  */
-export function traceLoopHalfArrowOutline(ctx: DropContext, sx: number, sy: number, tx: number, ty: number, width: number, leg = LOOP_LEG, cot = DROP_COT, scale = 1): boolean {
-  const r = solveLoop(sx, sy, tx, ty, loopHalfHeadLength(width), leg, cot);
+export function traceLoopHalfArrowOutline(ctx: DropContext, sx: number, sy: number, tx: number, ty: number, width: number, arrowSize: number, leg = LOOP_LEG, cot = DROP_COT, scale = 1): boolean {
+  const h = loopPieceLength(arrowSize, width);
+  const r = solveLoop(sx, sy, tx, ty, h, leg, cot);
   if (r === 0) return false;
-  const u1x = FRAME[5] ?? 0, u1y = FRAME[6] ?? 0;
-  const reach = width + barbOverhang(width);
-  HEAD[0] = (FRAME[0] ?? 0) + r * u1x;
-  HEAD[1] = (FRAME[1] ?? 0) + r * u1y;
-  HEAD[2] = (CUBIC[6] ?? 0) + u1y * reach;
-  HEAD[3] = (CUBIC[7] ?? 0) - u1x * reach;
-  traceLoopEdges(ctx, 0, width, HEAD, 2, scale);
+  const hl = loopHalfHeadLength(width);
+  const n = writeHalfArrowHead(HEAD, 0, r, width, hl, h > hl);
+  traceLoopEdges(ctx, 0, width, HEAD, n, scale);
   return true;
 }
 

@@ -279,7 +279,8 @@ export interface InstancedHalfArrowsData {
  * on a cubic and comes back straight to the rim at its end, where it ends as {@link InstancedLoopHead.head} says.
  * With `r` the distance from the centre to the rim ends and `u0` / `u1` the unit directions to them, the straight
  * pieces run from the centre to `E_k = centre + (r + h)·u_k` (drawn from the rim out) and the cubic is `E0`,
- * `E0 + ℓ·u0`, `E1 + ℓ·u1`, `E1` with `ℓ = legLength·r`; `h` is the head's own (see {@link InstancedLoopHead}).
+ * `E0 + ℓ·u0`, `E1 + ℓ·u1`, `E1` with `ℓ = legLength·r`; `h = max(2·arrowSize, 10·∛width)` in every variant (see
+ * {@link InstancedLoopHead}), so the path is the same with or without a head.
  * Plain draws only: no `index`, so every column is per loop.
  */
 export interface InstancedLoopColumns {
@@ -317,16 +318,16 @@ export interface InstancedLoopColumns {
   count: number;
 }
 
-/** How every loop of an {@link InstancedLoopsData} layer ends (#542), and the length `h` its straight pieces run past
- *  the rim before the cubic. One per layer. */
-export type InstancedLoopHead =
-  /** Headless: a stroked loop, back at the centre. */
-  | { head: "none"; /** `h`, in the layer's size units. */ stubLength: number }
-  /** The line-style arrowhead, its tip on the rim: filled, shaft and head one outline. */
-  | { head: "arrow"; /** Arrow size, in the layer's size units: the head (and so `h`) is `2·arrowSize` long. */ arrowSize: number }
-  /** The half-arrow band (one width on the outside) and its one-sided head, filled; `h` is the head's length
-   *  `10·∛width`, per loop. */
-  | { head: "half" };
+/** How every loop of an {@link InstancedLoopsData} layer ends (#542), and its arrow size. One per layer. */
+export interface InstancedLoopHead {
+  /** The end: `"none"` a stroked loop, back at the centre; `"arrow"` the line-style arrowhead, `2·arrowSize` long, its
+   *  tip on the rim (filled, shaft and head one outline); `"half"` the half-arrow band (one width on the outside) and
+   *  its one-sided head, `10·∛width` long, filled. */
+  head: "none" | "arrow" | "half";
+  /** Arrow size, in the layer's size units, whatever the head: each loop's straight pieces run
+   *  `h = max(2·arrowSize, 10·∛width)` past the rim, long enough for either head, which sits at the piece's end. */
+  arrowSize: number;
+}
 
 /** SoA for instanced self-link loops: the columns ({@link InstancedLoopColumns}) and the head
  *  ({@link InstancedLoopHead}). */

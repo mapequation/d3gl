@@ -13,7 +13,7 @@ import { PathRecorder } from "./path-recorder.js";
 import { headLength, traceArrowOutline } from "./arrowhead.js";
 import { DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
-import { LOOP_LEG, loopStubLength, loopsSpreadCot, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "./loop-drop.js";
+import { LOOP_LEG, loopPieceLength, loopsSpreadCot, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "./loop-drop.js";
 import { bezierControl, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
 
@@ -247,7 +247,7 @@ export function arrowsToDrawables(l: InstancedArrowsData, bake = 1): DrawableVec
 
 /**
  * Self-link loops (#505, #542) → one drawable per loop, the loop lane's twin, with its centre solve
- * ({@link loopsSpreadCot}), leg length and `h` ({@link loopStubLength}) as the shader reads them. A headless loop is ONE
+ * ({@link loopsSpreadCot}), leg length and piece length `h` ({@link loopPieceLength}) as the shader solves them. A headless loop is ONE
  * stroked path ({@link traceLoop}) whose ends move by `offset / bake` world units, as {@link linesToDrawables}' do (the
  * loop is linear in its ends and `h`, so the loop on the moved ends is the one the shader draws in px). A headed loop
  * is ONE filled outline, {@link traceLoopArrowOutline} or {@link traceLoopHalfArrowOutline}, solved in px (×k) on a screen
@@ -255,7 +255,6 @@ export function arrowsToDrawables(l: InstancedArrowsData, bake = 1): DrawableVec
  */
 export function loopsToDrawables(l: InstancedLoopsData, bake = 1): DrawableVector[] {
   const inv = 1 / bake;
-  const h = loopStubLength(l);
   const cot = loopsSpreadCot(l.spread);
   const leg = l.legLength ?? LOOP_LEG;
   const { startOffsets: so, endOffsets: to } = l;
@@ -268,7 +267,7 @@ export function loopsToDrawables(l: InstancedLoopsData, bake = 1): DrawableVecto
       const cy = l.centers[e * 2 + 1] ?? 0;
       const sx = cx + offsetAt(so, e * 2, inv), sy = cy + offsetAt(so, e * 2 + 1, inv);
       const tx = cx + offsetAt(to, e * 2, inv), ty = cy + offsetAt(to, e * 2 + 1, inv);
-      out.push(drawable(e, { subpaths: record((ctx) => traceLoop(ctx, sx, sy, tx, ty, h * inv, leg, cot)), stroke: color, lineWidth: width }));
+      out.push(drawable(e, { subpaths: record((ctx) => traceLoop(ctx, sx, sy, tx, ty, loopPieceLength(l.arrowSize, width) * inv, leg, cot)), stroke: color, lineWidth: width }));
       continue;
     }
     const cx = (l.centers[e * 2] ?? 0) * bake;
@@ -276,7 +275,7 @@ export function loopsToDrawables(l: InstancedLoopsData, bake = 1): DrawableVecto
     const sx = cx + offsetAt(so, e * 2, 1), sy = cy + offsetAt(so, e * 2 + 1, 1);
     const tx = cx + offsetAt(to, e * 2, 1), ty = cy + offsetAt(to, e * 2 + 1, 1);
     const half = l.head === "half";
-    const subpaths = record((ctx) => (half ? traceLoopHalfArrowOutline(ctx, sx, sy, tx, ty, width, leg, cot, inv) : traceLoopArrowOutline(ctx, sx, sy, tx, ty, width, h, leg, cot, inv)));
+    const subpaths = record((ctx) => (half ? traceLoopHalfArrowOutline(ctx, sx, sy, tx, ty, width, l.arrowSize, leg, cot, inv) : traceLoopArrowOutline(ctx, sx, sy, tx, ty, width, l.arrowSize, leg, cot, inv)));
     if (subpaths.length > 0) out.push(drawable(e, { subpaths, fill: color }));
   }
   return out;

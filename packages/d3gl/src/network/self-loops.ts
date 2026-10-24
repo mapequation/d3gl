@@ -27,8 +27,7 @@ import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer, InstancedLoopHead, InstancedLoopsData, GroupBuilder } from "../core/index.js";
 import type { RGBAValue } from "./glyphs.js";
 import type { StableColumns } from "../core/stable-columns.js";
-import { DROP_HALF_SPREAD, spreadCot, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../core/loop-drop.js";
-import { headLength } from "../core/arrowhead.js";
+import { DROP_HALF_SPREAD, loopPieceLength, spreadCot, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "../core/loop-drop.js";
 
 /** The direction of a loop whose node has no neighbours to point away from (radians, y down: up-right). */
 export const FALLBACK_ANGLE = -Math.PI / 4;
@@ -192,10 +191,10 @@ export interface SelfLoopCache {
   halfSpread: number;
   /** `cot α`: the Scene writers recover each loop's centre from its ends with it (the `loops` layer takes `2α`). */
   spreadCot: number;
-  /** The line style's head length is `headLength(arrowSize)`, the undirected loop's too (#542). */
+  /** The style's arrow size: with each loop's width, its straight pieces' length `loopPieceLength(arrowSize, width)`
+   *  in every variant, and the arrow's head length `headLength(arrowSize)` (#542). */
   arrowSize: number;
-  /** The `loops` layer's head (per style version): the variant, with the undirected loop's straight pieces as long
-   *  as the arrow's head. */
+  /** The `loops` layer's head (per style version): the variant and the arrow size. */
   head: InstancedLoopHead;
   // Position columns (rewritten in place each position frame).
   centres: Float32Array;
@@ -248,7 +247,7 @@ export function selfLoopCache(graph: NetworkGraph, style: SelfLoopStyle): SelfLo
     halfSpread,
     spreadCot: spreadCot(halfSpread),
     arrowSize: style.arrowSize,
-    head: halfArrow ? { head: "half" } : style.directed ? { head: "arrow", arrowSize: style.arrowSize } : { head: "none", stubLength: headLength(style.arrowSize) },
+    head: { head: halfArrow ? "half" : style.directed ? "arrow" : "none", arrowSize: style.arrowSize },
     centres: new Float32Array(2 * S),
     angles: new Float32Array(S),
     sourceOffsets: new Float32Array(2 * S),
@@ -327,7 +326,7 @@ export function selfLoopSelected(loops: SelfLoopIndex, linkSelected: Uint8Array)
 
 /**
  * The Scene twin (Canvas / SVG) of the undirected `line`-style loops: one stroked drawable each in the `links` group,
- * keyed by its edge ({@link traceLoop}, head length `headLength(arrowSize)` so the arrow loop runs the same path, leg
+ * keyed by its edge ({@link traceLoop}, piece length `loopPieceLength(arrowSize, width)` so every variant runs the same path, leg
  * `legLength`).
  * World mode traces world geometry; screen mode traces px offsets around an `anchor` at the node centre, which the
  * Scene draws as `anchor′ + (p − anchor)`: constant px at every zoom, no re-bake. Reads the columns
@@ -336,14 +335,15 @@ export function selfLoopSelected(loops: SelfLoopIndex, linkSelected: Uint8Array)
 export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const screen = c.sizeMode === "screen";
-  const h = headLength(c.arrowSize);
   const cot = c.spreadCot;
   const leg = c.legLength;
   for (let i = 0; i < loops.count; i++) {
     const px = centres[2 * i] ?? 0;
     const py = centres[2 * i + 1] ?? 0;
     const sox = so[2 * i] ?? 0, soy = so[2 * i + 1] ?? 0, tox = to[2 * i] ?? 0, toy = to[2 * i + 1] ?? 0;
-    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoop(ctx, px + sox, py + soy, px + tox, py + toy, h, leg, cot), { lineWidth: c.widths[i] ?? 0, anchor: screen ? [px, py] : undefined });
+    const width = c.widths[i] ?? 0;
+    const h = loopPieceLength(c.arrowSize, width);
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoop(ctx, px + sox, py + soy, px + tox, py + toy, h, leg, cot), { lineWidth: width, anchor: screen ? [px, py] : undefined });
   }
 }
 
@@ -359,7 +359,7 @@ export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake =
     const sx = px + (so[2 * i] ?? 0), sy = py + (so[2 * i + 1] ?? 0), tx = px + (to[2 * i] ?? 0), ty = py + (to[2 * i + 1] ?? 0);
     if (sx === tx && sy === ty) continue;
     const width = c.widths[i] ?? 0;
-    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoopHalfArrowOutline(ctx, sx, sy, tx, ty, width, c.legLength, c.spreadCot, inv));
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoopHalfArrowOutline(ctx, sx, sy, tx, ty, width, c.arrowSize, c.legLength, c.spreadCot, inv));
   }
 }
 
@@ -369,14 +369,13 @@ export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake =
 export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, idBase = 0): void {
   const { loops, centres, sourceOffsets: so, targetOffsets: to } = c;
   const inv = 1 / bake;
-  const h = headLength(c.arrowSize);
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
     const sx = px + (so[2 * i] ?? 0), sy = py + (so[2 * i + 1] ?? 0), tx = px + (to[2 * i] ?? 0), ty = py + (to[2 * i + 1] ?? 0);
     if (sx === tx && sy === ty) continue;
     const width = c.widths[i] ?? 0;
-    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoopArrowOutline(ctx, sx, sy, tx, ty, width, h, c.legLength, c.spreadCot, inv));
+    g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoopArrowOutline(ctx, sx, sy, tx, ty, width, c.arrowSize, c.legLength, c.spreadCot, inv));
   }
 }
 
