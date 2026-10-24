@@ -10,9 +10,11 @@
  * between shaft and head, at any width.
  *
  * A bent (`linkBend`) link is the quadratic bezier `P0 → C → P1`, `C` = chord midpoint + ⟂(chord)·bend
- * (as `bezierControl` in `half-link.ts` and the strip shader). Its shaft is the curve over `[0, t1]`
- * (the de Casteljau sub-curve, sampled), with `t1` the trim parameter ({@link trimParam}); the last
- * sample is snapped onto the head's axis so the shaft's end corners land exactly on the head's edges.
+ * (as `bezierControl` in `half-link.ts` and the strip shader). The head's axis is the end tangent, the
+ * line through `C` and `P1`, so the shaft is the quadratic `P0 → C → B` with `B` the head's base centre
+ * on that axis: the same curve with its end pulled back along its own tangent. It leaves the source as
+ * the link does and runs into the head along the head's axis, with no sideways step and no corner. When
+ * the head reaches back past `C` (a very short link), the shaft is the straight `P0 → B`.
  *
  * Everything here is scalar math with no allocation beyond the caller's output buffer, so the
  * WebGL strip shader can mirror it line for line. Perp convention: `perp(v) = (−v.y, v.x)`; "left"
@@ -52,21 +54,6 @@ export function shaftSetback(width: number, size: number): number {
   return h > 0 ? (headLength(size) * (width / 2)) / h : 0;
 }
 
-/**
- * Trim parameter of the curve for a shaft that ends `trim` back from the tip, i.e. `radius + trim`
- * from the target centre: `t1 = clamp(1 − (radius + trim) / |B'(1)|, 0, 1)` (first-order arc length
- * at the end, exact for a straight link). `B'(1) = 2·(P1 − C)`.
- */
-export function trimParam(sx: number, sy: number, tx: number, ty: number, bend: number, radius: number, trim: number): number {
-  const dx = tx - sx;
-  const dy = ty - sy;
-  const ex = 0.5 * dx + dy * bend;
-  const ey = 0.5 * dy - dx * bend;
-  const t1len = 2 * Math.hypot(ex, ey);
-  if (t1len <= 0) return 0;
-  return Math.min(1, Math.max(0, 1 - (radius + trim) / t1len));
-}
-
 /** Shared inputs of the shaft/head/outline writers (world or px units, per the caller's sizeMode). */
 export interface ArrowParams {
   /** Source point (the shaft starts here). */
@@ -87,8 +74,8 @@ export interface ArrowParams {
 
 /**
  * Write the shaft's edge pairs (left, right per sample — triangle-strip order, the WebGL twin) for a
- * shaft trimmed `trim` back from the tip. `samples ≥ 2`: samples `0 … samples−2` lie on the curve at
- * `t = t1·i/(samples−1)`, the last is snapped to `tip − dir·trim` with the head's normal. Every backend
+ * shaft that ends `trim` back from the tip. `samples ≥ 2` points on the quadratic `P0 → C → B` at
+ * `t = i/(samples−1)`, `B = tip − dir·trim`; the last pair takes the head's normal. Every backend
  * passes `trim = headLength(size)` (#542 step 2: the shaft ends on the head's base, as in
  * {@link arrowOutline} and the WebGL strip). Writes
  * `4·samples` numbers at `o`; returns the number of points written (0 for a zero-length link).
@@ -155,7 +142,13 @@ function writeShaft(out: PointBuffer, o: number, p: ArrowParams, trim: number, s
   const ux = ex / el;
   const uy = ey / el;
   const m = Math.max(2, samples | 0);
-  const t1 = Math.min(1, Math.max(0, 1 - (p.radius + trim) / (2 * el)));
+  // The shaft's end B on the head's axis, and its control: C (on that axis too), or the midpoint of P0 → B
+  // when B lies back past C.
+  const back = p.radius + trim;
+  const bx = tx - ux * back;
+  const by = ty - uy * back;
+  const qx = back < el ? cx : (sx + bx) / 2;
+  const qy = back < el ? cy : (sy + by) / 2;
   const hw = p.width / 2;
   const last = 2 * m + 2; // index of the outline's final point
   for (let i = 0; i < m; i++) {
@@ -164,19 +157,19 @@ function writeShaft(out: PointBuffer, o: number, p: ArrowParams, trim: number, s
     let nx: number;
     let ny: number;
     if (i === m - 1) {
-      // Snap onto the head's axis, with the head's normal: the corners land on its edges.
-      px = tx - ux * (p.radius + trim);
-      py = ty - uy * (p.radius + trim);
+      // The end, with the head's normal: the corners land on its edges.
+      px = bx;
+      py = by;
       nx = -uy;
       ny = ux;
     } else {
-      const t = (t1 * i) / (m - 1);
+      const t = i / (m - 1);
       const a = 1 - t;
-      px = a * a * sx + 2 * a * t * cx + t * t * tx;
-      py = a * a * sy + 2 * a * t * cy + t * t * ty;
-      // B'(t)/2 = (1−t)(C − P0) + t(P1 − C)
-      const gx = a * (cx - sx) + t * ex;
-      const gy = a * (cy - sy) + t * ey;
+      px = a * a * sx + 2 * a * t * qx + t * t * bx;
+      py = a * a * sy + 2 * a * t * qy + t * t * by;
+      // Q'(t)/2 = (1−t)(Q − P0) + t(B − Q)
+      const gx = a * (qx - sx) + t * (bx - qx);
+      const gy = a * (qy - sy) + t * (by - qy);
       const gl = Math.hypot(gx, gy) || 1;
       nx = -gy / gl;
       ny = gx / gl;

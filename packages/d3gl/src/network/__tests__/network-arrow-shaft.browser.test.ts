@@ -15,7 +15,7 @@ import { decodeImage, type PixelBuffer } from "../../map/__tests__/backend-equiv
 const W = 300;
 const H = 200;
 const BACKENDS = ["webgl", "canvas", "svg"] as const;
-const ZOOMS = [1, 1.6] as const;
+const ZOOMS = [1, 1.6, 3] as const;
 const RADIUS = 12;
 // Target node at world (200, 100), drawn at screen (210, 100) at every zoom; the source sits to its left.
 const POS = new Float32Array([40, 100, 200, 100]);
@@ -103,13 +103,26 @@ describe("network: a directed line link is one shape, shaft + head (#542, LOD of
               for (const [a, b] of [[0.6, 0.2], [0.2, 0.6]] as const)
                 expect(ink(0.2 * tx + a * lx + b * rx, 0.2 * ty + a * ly + b * ry), `barb ${a > b ? "left" : "right"} missing`).toBe(true);
               // No gap at the join: the axis from behind the base to the tip, and the shaft's edges across the base.
-              // The head's axis is the END tangent: on a bent link the shaft leaves it a few px behind the base.
-              const back = bend ? (wpx >= 4 ? -2 : 0) : -8;
-              for (let d = back; d <= len - 3; d += 1) expect(ink(mx + d * ux, my + d * uy), `gap on the axis at ${d.toFixed(0)}px from the base`).toBe(true);
+              // A bent link's shaft runs into the head along the head's axis, so it stays on the axis behind the base.
+              const back = -8;
+              // Sampled at pixel centres: `at` rounds, so a coordinate c reads the pixel covering [c − 0.5, c + 0.5);
+              // shift by half (WebGL's toPNG has no AA, so a thin diagonal line can miss a half-pixel-off sample).
+              const inkAt = (x: number, y: number): boolean => ink(x - 0.5, y - 0.5);
+              for (let d = back; d <= len - 3; d += 1) expect(inkAt(mx + d * ux, my + d * uy), `gap on the axis at ${d.toFixed(0)}px from the base`).toBe(true);
               if (wpx >= 4)
                 for (const side of [-1, 1])
                   for (let d = -3; d <= 1; d++)
                     expect(ink(mx + d * ux + side * (wpx / 2 - 1.5) * nx, my + d * uy + side * (wpx / 2 - 1.5) * ny), `gap at the shaft edge by the base (${side}, ${d})`).toBe(true);
+              // No sideways step: just behind the base the shaft is centred on the head's axis.
+              const extent = (side: number): number => {
+                let e = 0;
+                for (let o = 0; o <= wpx / 2 + 4; o += 0.25) {
+                  if (!inkAt(mx - 3 * ux + side * o * nx, my - 3 * uy + side * o * ny)) break;
+                  e = o;
+                }
+                return e;
+              };
+              expect(Math.abs(extent(1) - extent(-1)), "shaft off the head's axis behind the base").toBeLessThanOrEqual(1);
               // A translucent link composites once: the axis colour is the same on the shaft, across the join and in the head.
               if (link.name === "translucent") {
                 const ref = at(px, mx + back * ux, my + back * uy);

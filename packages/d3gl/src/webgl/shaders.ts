@@ -362,8 +362,8 @@ void main() {
 // INSTANCED_HEAD_LINE_VS — a line WITH its arrowhead as one instance (#542): the whole arrow is one strip.
 // The twin of `core/arrowhead.ts` `arrowOutline`: the tip sits `a_radius` back from the target along the
 // curve's end tangent; the head is `2·u_arrowSize` long and `a_width/2 + 2·sqrt(a_width)` wide each side
-// (the half-arrow barb rule, `barbOverhang`); the shaft is trimmed at the head's BASE and its last sample
-// snaps onto the base with the head's normal. The template (`headLineTemplate`) is the line's `(t, side)`
+// (the half-arrow barb rule, `barbOverhang`); the shaft is the quadratic src → ctrl → base (ctrl lies on the
+// head's axis, so the shaft runs into the head along it), its last pair on the base with the head's normal. The template (`headLineTemplate`) is the line's `(t, side)`
 // samples, then (2, 1) left barb, (2, -1) right barb, (3, 0) tip: the two triangles that join the shaft's
 // last pair to the barbs are collinear (all on the base edge, zero area), so one strip draws shaft + head
 // with no overlap and a translucent arrow blends once. Units follow sizeMode like the line (px or world).
@@ -390,12 +390,13 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
   } else if (t > 1.5) {
     pos = base + un * side * (hw + 2.0 * sqrt(a_width));    // headHalfWidth: the barbs
   } else if (t >= 1.0) {
-    pos = base + un * side * hw;                            // the shaft's end, snapped onto the base
+    pos = base + un * side * hw;                            // the shaft's end, on the base
   } else {
-    float tt = t * clamp(1.0 - (a_radius + len) / (2.0 * length(e)), 0.0, 1.0); // trimParam
-    float u = 1.0 - tt;
-    vec2 p = u * u * src + 2.0 * u * tt * ctrl + tt * tt * tgt;
-    vec2 dir = normalize(2.0 * u * (ctrl - src) + 2.0 * tt * (tgt - ctrl));
+    // The shaft src → q → base: q = ctrl (on the head's axis), or the midpoint when the base lies back past ctrl.
+    vec2 q = a_radius + len < length(e) ? ctrl : 0.5 * (src + base);
+    float u = 1.0 - t;
+    vec2 p = u * u * src + 2.0 * u * t * q + t * t * base;
+    vec2 dir = normalize(2.0 * u * (q - src) + 2.0 * t * (base - q));
     pos = p + vec2(-dir.y, dir.x) * side * hw;
   }
   gl_Position = screen

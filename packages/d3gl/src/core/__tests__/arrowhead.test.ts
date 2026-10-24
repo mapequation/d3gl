@@ -7,7 +7,6 @@ import {
   headHalfWidth,
   headLength,
   shaftSetback,
-  trimParam,
   type ArrowParams,
 } from "../arrowhead.js";
 import { bentEndTangent, halfLinkGeometry } from "../half-link.js";
@@ -122,47 +121,53 @@ describe("arrowShaft (strip)", () => {
     }
   });
 
-  it("intermediate samples lie on the de Casteljau sub-curve [0, t1]", () => {
+  it("samples lie on the quadratic P0 → C → B, B on the head's axis, so the shaft meets the head along it", () => {
     const p = params(4, 3, 0.3);
     const s = shaftSetback(4, 3);
-    const t1 = trimParam(p.sx, p.sy, p.tx, p.ty, p.bend, p.radius, s);
     const m = 5;
     const out = new Float64Array(4 * m);
     arrowShaft(out, 0, p, s, m);
-    // Sub-curve controls by de Casteljau at t1, evaluated at its midpoint u = 0.5 (sample i = 2 of 5 → t = t1/2).
     const cx = (p.sx + p.tx) / 2 - (p.ty - p.sy) * p.bend;
     const cy = (p.sy + p.ty) / 2 + (p.tx - p.sx) * p.bend;
-    const q0x = p.sx + (cx - p.sx) * t1;
-    const q0y = p.sy + (cy - p.sy) * t1;
-    const a = 1 - t1;
-    const q1x = a * a * p.sx + 2 * a * t1 * cx + t1 * t1 * p.tx;
-    const q1y = a * a * p.sy + 2 * a * t1 * cy + t1 * t1 * p.ty;
-    const midX = 0.25 * p.sx + 0.5 * q0x + 0.25 * q1x;
-    const midY = 0.25 * p.sy + 0.5 * q0y + 0.25 * q1y;
-    expect(((out[8] ?? 0) + (out[10] ?? 0)) / 2).toBeCloseTo(midX, 9);
-    expect(((out[9] ?? 0) + (out[11] ?? 0)) / 2).toBeCloseTo(midY, 9);
-    // The snapped end is close to the curve's own point at t1 (the kink is small).
-    const ex = ((out[16] ?? 0) + (out[18] ?? 0)) / 2;
-    const ey = ((out[17] ?? 0) + (out[19] ?? 0)) / 2;
-    expect(Math.hypot(ex - q1x, ey - q1y)).toBeLessThan(0.5);
+    const el = Math.hypot(p.tx - cx, p.ty - cy);
+    const ux = (p.tx - cx) / el;
+    const uy = (p.ty - cy) / el;
+    const bx = p.tx - ux * (p.radius + s);
+    const by = p.ty - uy * (p.radius + s);
+    for (let i = 0; i < m; i++) {
+      const t = i / (m - 1);
+      const a = 1 - t;
+      expect(((out[4 * i] ?? 0) + (out[4 * i + 2] ?? 0)) / 2).toBeCloseTo(a * a * p.sx + 2 * a * t * cx + t * t * bx, 9);
+      expect(((out[4 * i + 1] ?? 0) + (out[4 * i + 3] ?? 0)) / 2).toBeCloseTo(a * a * p.sy + 2 * a * t * cy + t * t * by, 9);
+    }
+    // C, B and the tip are collinear: the shaft's end tangent B − C is the head's axis (no step, no corner).
+    const h = head(p);
+    const tipX = h[2] ?? NaN;
+    const tipY = h[3] ?? NaN;
+    expect((bx - cx) * (tipY - by) - (by - cy) * (tipX - bx)).toBeCloseTo(0, 9);
   });
 
-  it("t1 clamps to 0 when the node and setback swallow the link, and the output stays finite", () => {
+  it("is the straight P0 → B when the head reaches back past C, and the output stays finite", () => {
     const p: ArrowParams = { sx: 0, sy: 0, tx: 10, ty: 0, radius: 30, width: 3, size: 4, bend: 0.2 };
-    expect(trimParam(p.sx, p.sy, p.tx, p.ty, p.bend, p.radius, shaftSetback(3, 4))).toBe(0);
     const out = new Float64Array(16);
     expect(arrowShaft(out, 0, p, shaftSetback(3, 4), 4)).toBe(8);
     expect(out.every(Number.isFinite)).toBe(true);
-    // Every non-snapped sample collapses onto the source.
-    expect(((out[4] ?? NaN) + (out[6] ?? NaN)) / 2).toBeCloseTo(0, 12);
+    // Sample 1 of 4 sits a third of the way from the source to the end.
+    const ex = ((out[12] ?? NaN) + (out[14] ?? NaN)) / 2;
+    const ey = ((out[13] ?? NaN) + (out[15] ?? NaN)) / 2;
+    expect(((out[4] ?? NaN) + (out[6] ?? NaN)) / 2).toBeCloseTo(ex / 3, 9);
+    expect(((out[5] ?? NaN) + (out[7] ?? NaN)) / 2).toBeCloseTo(ey / 3, 9);
   });
 
   it("is exact for a straight link: the end is at radius + s from the target", () => {
     const p = params(6, 4, 0);
     const s = shaftSetback(6, 4);
-    const t1 = trimParam(p.sx, p.sy, p.tx, p.ty, 0, p.radius, s);
-    const len = Math.hypot(p.tx - p.sx, p.ty - p.sy);
-    expect(t1 * len).toBeCloseTo(len - p.radius - s, 9);
+    const m = 4;
+    const out = new Float64Array(4 * m);
+    arrowShaft(out, 0, p, s, m);
+    const ex = ((out[4 * m - 4] ?? 0) + (out[4 * m - 2] ?? 0)) / 2;
+    const ey = ((out[4 * m - 3] ?? 0) + (out[4 * m - 1] ?? 0)) / 2;
+    expect(Math.hypot(p.tx - ex, p.ty - ey)).toBeCloseTo(p.radius + s, 9);
   });
 });
 
