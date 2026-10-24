@@ -166,3 +166,15 @@ A zoom frame with LOD off uploads nothing before and after (assert in network-sw
 - Translucent links still double-blend over [s, 2·size] (smaller than today's overlap under the whole head).
 - Large nodes on short bent links: the snapped last segment can show a small kink.
 - 2–4 more programs compile at registration. `r32float` + `texelFetch` untested on SwiftShader (check in step 2).
+
+## Self-link loops (user, 2026-10-24) — done in #542 once #528 is on main, then #528's loops adopt it
+
+- Loops draw as ONE shape like other directed links (shaft ends where the head starts; the line never runs
+  through the head and masks its taper). #528's two-shape loop arrows (`self-loop-arrows` layer) are not patched.
+- The loop's INNER curve starts and ends at the node centre, for symmetry, in every variant (undirected, arrow,
+  half-arrow); its control points are the undirected loop's, never shifted for the head.
+- Arrow style: a full head whose direction is the curve's tangent where the curve meets the node's rim (no outward
+  tilt towards the centre; #528's de46c966 tilted it).
+- Half-arrow style: the same curve as the undirected loop; before reaching the node, the outer part of the line
+  ends and forms the half-arrowhead (barb rule), tapering to the tip on the rim.
+- Example (#528): the Arrow / Half-arrow choice is only for directed links (done in b54ffb7f).
