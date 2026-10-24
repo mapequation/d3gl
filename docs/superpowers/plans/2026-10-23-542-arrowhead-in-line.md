@@ -179,39 +179,39 @@ A zoom frame with LOD off uploads nothing before and after (assert in network-sw
   ends and forms the half-arrowhead (barb rule), tapering to the tip on the rim.
 - Example (#528): the Arrow / Half-arrow choice is only for directed links (done in b54ffb7f).
 
-## One link geometry for every link (user, 2026-10-24) — supersedes the loop drawing above where they differ
+## One link geometry for every link (user, 2026-10-24, settled) — supersedes every geometry section above
 
-Self-links and other links use the SAME maths and drawing functions; only three parameters differ.
+Links and self-links use ONE function; only its parameters differ. Closed form everywhere (no root-finding).
+Reference model: scratchpad `model2.mjs` (the sheets the user approved).
 
-**Centreline.** Every link is the cubic `K(t)` from the source centre `P0` to the target centre `P3`, with legs
-`C1 = P0 + ℓ·u(θ + β)` and `C2 = P3 + ℓ·u(θ + π − β)` (`u(a) = (cos a, sin a)`).
+**Ends.** End k (0 = source, 1 = target) has a centre `c_k`, radius `r_k`, a unit leg `u_k` (pointing out of
+`c_k` along the curve), and an offset `ρ_k`. The curve's end is `E_k = c_k + ρ_k·u_k`; one leg length `ℓ`.
 
-| | θ | β | ℓ |
-|---|---|---|---|
-| link (`linkBend` = b) | chord angle | `atan(2b)` | `⅔·|chord|·√(¼ + b²)` → 0 with the chord (straight in the limit) |
-| self-link | loop axis φ − 90° | 90° + α (α = 35°) | `3.75·r`, fixed |
+**Centre curve.** `[straight c_0 → E_0 if ρ_0 > 0]` + cubic `E_0, E_0 + ℓ·u_0, E_1 + ℓ·u_1, E_1` +
+`[straight E_1 → c_1 if the end is unheaded and ρ_1 > 0]`. Both legs are radial through their centres.
 
-The link row is today's quadratic, degree-elevated (the same curve); the self-link row is today's undirected loop.
+| | u_0 | u_1 | ρ_0 | ρ_1 | ℓ |
+|---|---|---|---|---|---|
+| link, bend b | `norm(d + 2b·p)` | `norm(−d + 2b·p)` | 0 | `r_1 + h` if headed, else 0 | `|E_1 − E_0|·√(1 + 4b²)/3` |
+| self-link | `u(φ + α)` | `u(φ − α)` | `r + h` | `r + h` | `L·r` |
 
-**Tip and head axis.** `t*` is where `K` last crosses the target rim: `|K(t*) − P3| = r`. Tip `T = K(t*)`, axis
-`τ = K'(t*)/|K'(t*)|`. Straight link: `t* = 1 − r/|chord|` (as today). Self-link: `t* = 0.893663`, a constant (every
-loop is a similarity of one drop); `τ` is 7.95° off the inward radial. Bent link: 3 Newton steps from
-`t0 = 1 − r/|K'(1)|` (exact to 1e-6 on the test cases). Bent links' heads change against the centre-tangent rule of
-08ba33d4: 2–20° (short, strongly bent links most), tip moves ≤ 2 px.
+`d = c_1 − c_0`, `p = perp(d) = (−d.y, d.x)` (the sign today's `bezierControl` uses), `u(a) = (cos a, sin a)`,
+`φ` the loop's axis (`selfLoopAngles`). Defaults: `α = 20°`, `L = 3` (the teardrop). An unheaded link is exactly
+today's quadratic (degree-elevated); a headed link is today's shape with its end pulled back along the radial leg.
+`h` = the head length of the style: `2·arrowSize` (line style), `10·∛w` (half-arrow loops). An undirected
+self-link also uses `ρ = r + h` with the line style's `h`, so toggling Directed only adds or removes the head.
 
-**Arrow (line style).** Head: length `2·size`, half-width `w/2 + 2√w`, base centre `B = T − 2·size·τ`. Shaft: split
-`K` at `t*` (de Casteljau: `S0 = P0`, `S1 = P0 + t*(C1 − P0)`, `S2 = T − (t*/3)·K'(t*)`), then pull its end back
-along `τ` to `B`: the shaft is the cubic `S0, S1, S2, B`. `S2` is on the axis, so the shaft enters the head along it:
-no step, no corner. Valid while `2·size < |T − S2| = (t*/3)|K'(t*)|` (self-link: 2.31·r); beyond, the head is
-capped there.
+**Width.** Each sample offset along its normal `perp(travel)`: line / arrow `±w/2`; half-arrow loop `0` (inner)
+and `+w` (outer; `+perp(travel)` is the loop's outside).
 
-**Width.** Each sample of the shaft is offset by `±w/2` along its normal (constant width; the strip on WebGL, the
-same samples in the Canvas/SVG outline).
+**Heads.** Tip `T = c_1 + r_1·u_1` (on the rim), base `E_1`, `n = perp(−u_1)`.
+- Arrow: barbs `E_1 ± (w/2 + 2√w)·n`; the strip/outline is shaft (±w/2), then left barb, tip, right barb.
+- Half-arrow loop: the inner edge runs to `E_1` then `T`; the outer edge ends at `E_1 + w·n`, then the barb point
+  `E_1 + (w + 2√w)·n`, then `T`.
 
-**Half-arrow.** Inner edge: the same split-and-pulled-back cubic, ending at `B' = T − h·τ`, `h` the half-arrow head
-length, then straight to `T`. Outer edge: the inner edge offset by `w` along its outward normal (sampled, exact
-constant width), up to the base, out by the barb `2√w`, then straight to `T`. A self-link's inner edge is the
-undirected loop up to the rim, so the band is symmetric except for its head.
+**Cost.** Links: no new attributes or buffers; the same vertex template (shaft samples + 3 head vertices); the
+shader evaluates a cubic instead of a quadratic. Undirected links: unchanged. Self-links: their own layer and
+template (one extra sample pair per straight piece); a loop needs one radius.
 
-**Cost.** Per vertex: the rim solve (3 Newton steps, ~30 flops; skipped for straight links, a constant for loops)
-and one split (~20 flops). No new attributes, buffers or passes; O(links × samples) as today.
+**Not in scope yet.** Regular half-arrow links keep the reference shape (`half-link.ts`). Public names for `α` / `L`
+(the example's sliders need them; names open for the user).
