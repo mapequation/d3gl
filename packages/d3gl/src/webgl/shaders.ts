@@ -370,8 +370,8 @@ export const DROP_LINE_VS = lineVS(DROP_LINE_GLSL);
 // INSTANCED_HEAD_LINE_VS — a line WITH its arrowhead as one instance (#542): the whole arrow is one strip.
 // The twin of `core/arrowhead.ts` `arrowOutline`: the tip sits `a_radius` back from the target along the
 // curve's end tangent; the head is `2·u_arrowSize` long and `a_width/2 + 2·sqrt(a_width)` wide each side
-// (the half-arrow barb rule, `barbOverhang`); the shaft is the quadratic src → ctrl → base (ctrl lies on the
-// head's axis, so the shaft runs into the head along it), its last pair on the base with the head's normal. The template (`headLineTemplate`) is the line's `(t, side)`
+// (the half-arrow barb rule, `barbOverhang`); the shaft is the settled cubic (`legCubic`) src → base, whose end
+// tangent is the head's axis, so it runs into the head along it, its last pair on the base with the head's normal. The template (`headLineTemplate`) is the line's `(t, side)`
 // samples, then (2, 1) left barb, (2, -1) right barb, (3, 0) tip: the two triangles that join the shaft's
 // last pair to the barbs are collinear (all on the base edge, zero area), so one strip draws shaft + head
 // with no overlap and a translucent arrow blends once. Units follow sizeMode like the line (px or world).
@@ -385,13 +385,15 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
   vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
   vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
   vec2 d = tgt - src;
-  vec2 ctrl = 0.5 * (src + tgt) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
-  vec2 e = tgt - ctrl;                                      // B'(1) / 2
-  vec2 ux = normalize(e);
-  vec2 un = vec2(-ux.y, ux.x);
-  vec2 tip = tgt - ux * a_radius;
+  // The legs (core/arrowhead.ts writeShaft): out of each centre towards the quadratic's control mid + ⟂d·bend.
+  vec2 bp = 2.0 * a_bend * vec2(-d.y, d.x);
+  float ll = length(d + bp);                                // = |−d + 2b·⟂d|
+  vec2 u1 = (bp - d) / ll;                                  // out of the target: the head's axis is −u1
+  vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the head's normal
+  vec2 tip = tgt + u1 * a_radius;
   float len = 2.0 * u_arrowSize;                            // headLength
-  vec2 base = tip - ux * len;
+  float back = a_radius + len;
+  vec2 base = tgt + u1 * back;                              // E1, the head's base centre
   vec2 pos;
   if (t > 2.5) {
     pos = tip;
@@ -400,12 +402,23 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
   } else if (t >= 1.0) {
     pos = base + un * side * hw;                            // the shaft's end, on the base
   } else {
-    // The shaft src → q → base: q = ctrl (on the head's axis), or the midpoint when the base lies back past ctrl.
-    vec2 q = a_radius + len < length(e) ? ctrl : 0.5 * (src + base);
+    // legCubic: E0 = src, E0 + ℓ·u0, E1 + ℓ·u1, E1 = base, ℓ = |E1 − E0|·√(1 + 4b²)/3; when the base lies
+    // back past the control (a very short link) the shaft collapses to the straight src → base.
+    vec2 c = base - src;
+    float chord = length(c);
+    vec2 v = chord > 0.0 ? c / chord : -u1;
+    bool settled = back < 0.5 * ll;
+    vec2 l0 = settled ? (d + bp) / ll : v;
+    vec2 l1 = settled ? u1 : -v;
+    float leg = settled ? chord * sqrt(1.0 + 4.0 * a_bend * a_bend) / 3.0 : chord / 3.0;
+    vec2 p1 = src + leg * l0;
+    vec2 p2 = base + leg * l1;
     float u = 1.0 - t;
-    vec2 p = u * u * src + 2.0 * u * t * q + t * t * base;
-    vec2 dir = normalize(2.0 * u * (q - src) + 2.0 * t * (base - q));
-    pos = p + vec2(-dir.y, dir.x) * side * hw;
+    vec2 p = u * u * u * src + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * base;
+    vec2 g = u * u * (p1 - src) + 2.0 * u * t * (p2 - p1) + t * t * (base - p2); // B'(t)/3
+    float gl = length(g);
+    vec2 n = gl > 0.0 ? vec2(-g.y, g.x) / gl : un;
+    pos = p + n * side * hw;
   }
   gl_Position = screen
     ? vec4(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0, 0.0, 1.0)

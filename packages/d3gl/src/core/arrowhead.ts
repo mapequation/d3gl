@@ -9,14 +9,15 @@
  * as wide as the line ({@link shaftSetback}) — no line edge shows beside the tip, and no gap opens
  * between shaft and head, at any width.
  *
- * A bent (`linkBend`) link is the quadratic bezier `P0 → C → P1`, `C` = chord midpoint + ⟂(chord)·bend
- * (as `bezierControl` in `half-link.ts` and the strip shader). The head's axis is the end tangent, the
- * line through `C` and `P1`, so the shaft is the quadratic `P0 → C → B` with `B` the head's base centre
- * on that axis: the same curve with its end pulled back along its own tangent. It leaves the source as
- * the link does and runs into the head along the head's axis, with no sideways step and no corner. When
- * the head reaches back past `C` (a very short link), the shaft is the straight `P0 → B`.
+ * A link's centre curve is the settled cubic of {@link legCubic}: it leaves the source centre along the leg
+ * `u0` and runs into the head's base centre along the head's axis `−u1`, where `u0`, `u1` are the directions
+ * from each centre to today's quadratic control `C` = chord midpoint + ⟂(chord)·bend (as `bezierControl` in
+ * `half-link.ts`). So the shaft meets the head with no sideways step and no corner, and the head's axis is
+ * the bent link's end tangent. With no head (`E1 = c1`) the cubic is exactly the quadratic `P0 → C → P1`,
+ * degree-elevated; a straight link is the same segment as before.
  *
- * Everything here is scalar math with no allocation beyond the caller's output buffer, so the
+ * Everything here is scalar math with no allocation beyond the caller's output buffer (and one module
+ * scratch for the cubic's controls), so the
  * WebGL strip shader can mirror it line for line. Perp convention: `perp(v) = (−v.y, v.x)`; "left"
  * is `+perp`.
  */
@@ -73,9 +74,53 @@ export interface ArrowParams {
 }
 
 /**
+ * The settled link curve (#542), shared by links and self-links: the cubic between two ends, each given by a
+ * centre `c`, a unit leg `u` (pointing out of the end, along the curve) and an offset `ρ` along that leg, with
+ * leg length `ℓ`. Writes its four control points as 8 numbers at `o`:
+ *
+ *   `E0 = c0 + ρ0·u0`,  `E0 + ℓ·u0`,  `E1 + ℓ·u1`,  `E1 = c1 + ρ1·u1`.
+ *
+ * The curve leaves `E0` along `u0` and arrives at `E1` along `−u1`. A link passes `ρ0 = 0`, `ρ1 = r1 + h`,
+ * `u0 = norm(d + 2b·p)`, `u1 = norm(−d + 2b·p)` (`d = c1 − c0`, `p = ⟂d`, `b` the bend) and
+ * `ℓ = |E1 − E0|·√(1 + 4b²)/3` ({@link arrowShaft}). Scalar math, no allocation: the GLSL twin
+ * (`HEAD_LINE_BODY` in `webgl/shaders.ts`) mirrors it line for line.
+ */
+export function legCubic(
+  out: PointBuffer,
+  o: number,
+  x0: number,
+  y0: number,
+  u0x: number,
+  u0y: number,
+  rho0: number,
+  x1: number,
+  y1: number,
+  u1x: number,
+  u1y: number,
+  rho1: number,
+  leg: number,
+): void {
+  const e0x = x0 + rho0 * u0x;
+  const e0y = y0 + rho0 * u0y;
+  const e1x = x1 + rho1 * u1x;
+  const e1y = y1 + rho1 * u1y;
+  out[o] = e0x;
+  out[o + 1] = e0y;
+  out[o + 2] = e0x + leg * u0x;
+  out[o + 3] = e0y + leg * u0y;
+  out[o + 4] = e1x + leg * u1x;
+  out[o + 5] = e1y + leg * u1y;
+  out[o + 6] = e1x;
+  out[o + 7] = e1y;
+}
+
+/** Module scratch for a link's cubic controls (8 numbers), refilled per call: no per-link allocation. */
+const CUBIC = new Float64Array(8);
+
+/**
  * Write the shaft's edge pairs (left, right per sample — triangle-strip order, the WebGL twin) for a
- * shaft that ends `trim` back from the tip. `samples ≥ 2` points on the quadratic `P0 → C → B` at
- * `t = i/(samples−1)`, `B = tip − dir·trim`; the last pair takes the head's normal. Every backend
+ * shaft that ends `trim` back from the tip. `samples ≥ 2` points on the link's cubic ({@link legCubic},
+ * `ρ1 = radius + trim`) at `t = i/(samples−1)`; the last pair takes the head's normal. Every backend
  * passes `trim = headLength(size)` (#542 step 2: the shaft ends on the head's base, as in
  * {@link arrowOutline} and the WebGL strip). Writes
  * `4·samples` numbers at `o`; returns the number of points written (0 for a zero-length link).
@@ -132,47 +177,57 @@ function writeShaft(out: PointBuffer, o: number, p: ArrowParams, trim: number, s
   const { sx, sy, tx, ty, bend } = p;
   const dx = tx - sx;
   const dy = ty - sy;
-  // Control point C and the end tangent P1 − C (half of B'(1)).
-  const cx = (sx + tx) / 2 - dy * bend;
-  const cy = (sy + ty) / 2 + dx * bend;
-  const ex = tx - cx;
-  const ey = ty - cy;
-  const el = Math.hypot(ex, ey);
-  if (el <= 0) return 0;
-  const ux = ex / el;
-  const uy = ey / el;
-  const m = Math.max(2, samples | 0);
-  // The shaft's end B on the head's axis, and its control: C (on that axis too), or the midpoint of P0 → B
-  // when B lies back past C.
+  // The legs: from each centre towards the quadratic control C = mid + ⟂d·bend. |d + 2b·⟂d| = |−d + 2b·⟂d|.
+  const b2 = 2 * bend;
+  const ll = Math.hypot(dx - b2 * dy, dy + b2 * dx);
+  if (ll <= 0) return 0;
+  const u1x = (-dx - b2 * dy) / ll;
+  const u1y = (-dy + b2 * dx) / ll;
+  // The headed end E1 on the head's axis, `back` out of the target centre.
   const back = p.radius + trim;
-  const bx = tx - ux * back;
-  const by = ty - uy * back;
-  const qx = back < el ? cx : (sx + bx) / 2;
-  const qy = back < el ? cy : (sy + by) / 2;
+  const e1x = tx + back * u1x;
+  const e1y = ty + back * u1y;
+  const cx = e1x - sx;
+  const cy = e1y - sy;
+  const chord = Math.hypot(cx, cy);
+  if (back < ll / 2) {
+    // E1 before C (|C − c1| = ll/2): the settled cubic.
+    legCubic(CUBIC, 0, sx, sy, (dx - b2 * dy) / ll, (dy + b2 * dx) / ll, 0, tx, ty, u1x, u1y, back, (chord * Math.sqrt(1 + b2 * b2)) / 3);
+  } else {
+    // The head reaches back past C (a very short link): the shaft collapses to the straight E0 → E1.
+    const vx = chord > 0 ? cx / chord : -u1x;
+    const vy = chord > 0 ? cy / chord : -u1y;
+    legCubic(CUBIC, 0, sx, sy, vx, vy, 0, e1x, e1y, -vx, -vy, 0, chord / 3);
+  }
+  const [p0x = 0, p0y = 0, p1x = 0, p1y = 0, p2x = 0, p2y = 0, p3x = 0, p3y = 0] = CUBIC;
+  // The head's normal ⟂(−u1): the shaft's end pair lies on the base, and the cubic's end tangent is −u1.
+  const hnx = u1y;
+  const hny = -u1x;
+  const m = Math.max(2, samples | 0);
   const hw = p.width / 2;
   const last = 2 * m + 2; // index of the outline's final point
   for (let i = 0; i < m; i++) {
     let px: number;
     let py: number;
-    let nx: number;
-    let ny: number;
+    let nx = hnx;
+    let ny = hny;
     if (i === m - 1) {
-      // The end, with the head's normal: the corners land on its edges.
-      px = bx;
-      py = by;
-      nx = -uy;
-      ny = ux;
+      // The end, with the head's normal: the corners land on its base.
+      px = p3x;
+      py = p3y;
     } else {
       const t = i / (m - 1);
       const a = 1 - t;
-      px = a * a * sx + 2 * a * t * qx + t * t * bx;
-      py = a * a * sy + 2 * a * t * qy + t * t * by;
-      // Q'(t)/2 = (1−t)(Q − P0) + t(B − Q)
-      const gx = a * (qx - sx) + t * (bx - qx);
-      const gy = a * (qy - sy) + t * (by - qy);
-      const gl = Math.hypot(gx, gy) || 1;
-      nx = -gy / gl;
-      ny = gx / gl;
+      px = a * a * a * p0x + 3 * a * a * t * p1x + 3 * a * t * t * p2x + t * t * t * p3x;
+      py = a * a * a * p0y + 3 * a * a * t * p1y + 3 * a * t * t * p2y + t * t * t * p3y;
+      // B'(t)/3 = (1−t)²(P1 − P0) + 2(1−t)t(P2 − P1) + t²(P3 − P2)
+      const gx = a * a * (p1x - p0x) + 2 * a * t * (p2x - p1x) + t * t * (p3x - p2x);
+      const gy = a * a * (p1y - p0y) + 2 * a * t * (p2y - p1y) + t * t * (p3y - p2y);
+      const gl = Math.hypot(gx, gy);
+      if (gl > 0) {
+        nx = -gy / gl;
+        ny = gx / gl;
+      }
     }
     const lx = px + nx * hw;
     const ly = py + ny * hw;
