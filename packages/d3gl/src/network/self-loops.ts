@@ -27,7 +27,7 @@ import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer, InstancedLoopHead, InstancedLoopsData, GroupBuilder } from "../core/index.js";
 import type { RGBAValue } from "./glyphs.js";
 import type { StableColumns } from "../core/stable-columns.js";
-import { DROP_HALF_SPREAD, LOOP_LEG, loopArrowOutline, loopHalfArrowOutline, spreadCot, traceLoop, traceOutline } from "../core/loop-drop.js";
+import { DROP_HALF_SPREAD, loopArrowOutline, loopHalfArrowOutline, spreadCot, traceLoop, traceOutline } from "../core/loop-drop.js";
 import { headLength } from "../core/arrowhead.js";
 
 /** The direction of a loop whose node has no neighbours to point away from (radians, y down: up-right). */
@@ -115,8 +115,10 @@ function selfLoopAngle(positions: ArrayLike<number>, csr: Adjacency, n: number, 
   const py = positions[2 * n + 1] ?? 0;
   let sx = 0;
   let sy = 0;
+  const start = csr.offsets[n] ?? 0;
   const end = csr.offsets[n + 1] ?? 0;
-  for (let k = csr.offsets[n] ?? 0; k < end; k++) {
+  selfLoopStats.neighbours += end - start;
+  for (let k = start; k < end; k++) {
     const m = csr.neighbors[k] ?? n;
     if (m === n) continue;
     let dx = (positions[2 * m] ?? 0) - px;
@@ -184,8 +186,8 @@ export interface SelfLoopCache {
   colors: Uint8Array;
   /** #162 highlight group per loop: its node (a loop is incident to its node at both ends). */
   groups: Float32Array;
-  /** The leg `L` in node radii per loop (`selfLinkLength`): the `loops` layer's `legs` column. */
-  legs: Float32Array;
+  /** The leg `L` in node radii (`selfLinkLength`), one per style: the `loops` layer's `legLength`. */
+  legLength: number;
   /** Half the angle between the legs, `α` (radians, half of `selfLinkSpread`): where {@link loopEnds} puts the ends. */
   halfSpread: number;
   /** `cot α`: the Scene writers recover each loop's centre from its ends with it (the `loops` layer takes `2α`). */
@@ -205,10 +207,18 @@ export interface SelfLoopCache {
   changed?: Uint32Array;
   /** Per-loop `selected` flags (#162), on an LOD frame's subset (the no-LOD lane attaches its own). */
   selected?: Uint8Array;
+  /** LOD frames: the position version ({@link LoopSubsetFrame.positionsVersion}) each `angles` entry was solved at,
+   *  0 for none, so a frame whose positions did not move (a zoom) copies its drawn loops' angles instead of
+   *  re-reading their neighbours. 4 B per loop, built by the first LOD frame; {@link updateSelfLoops}, which rewrites
+   *  `angles`, clears it. */
+  angleAt?: Uint32Array;
+  /** The node offsets (#509) the stamped angles were solved with: a frame with others solves them again. */
+  angleOffsets?: Float32Array;
 }
 
-/** Instrumentation for the per-frame guard: loop updates run, and loop instances they touched. */
-export const selfLoopStats = { updates: 0, instances: 0 };
+/** Instrumentation for the per-frame guards: loop updates run, loop instances they touched, and the neighbours the
+ *  loop angles read (the Σ degree term). */
+export const selfLoopStats = { updates: 0, instances: 0, neighbours: 0 };
 
 /** The {@link SelfLoopCache} for `graph` under `style`, `null` without self-links. O(S) (+ the O(E) index once
  *  per graph). Leaves the position columns for {@link updateSelfLoops}. */
@@ -234,7 +244,7 @@ export function selfLoopCache(graph: NetworkGraph, style: SelfLoopStyle): SelfLo
     widths,
     colors,
     groups: Float32Array.from(loops.nodes),
-    legs: new Float32Array(S).fill(style.selfLinkLength),
+    legLength: style.selfLinkLength,
     halfSpread,
     spreadCot: spreadCot(halfSpread),
     arrowSize: style.arrowSize,
@@ -260,6 +270,7 @@ export function updateSelfLoops(graph: NetworkGraph, c: SelfLoopCache, nodeOffse
     centres[2 * i + 1] = pos[2 * n + 1] ?? 0;
   }
   selfLoopAngles(pos, graph.csr, loops, angles, nodeOffsets);
+  c.angleAt?.fill(0); // the LOD frames' stamps no longer describe `angles`
   loopEnds(loops, angles, c.radii, c.sourceOffsets, c.targetOffsets, c.halfSpread);
   if (nodeOffsets) {
     const so = c.sourceOffsets;
@@ -284,7 +295,7 @@ export const SELF_LOOP_LAYER = "self-loops";
 /**
  * The instanced layer that draws the loops on WebGL, over the cache's current columns (call {@link updateSelfLoops}
  * first): ONE `loops` layer that draws each loop as the Scene's one shape (#542), its `head` the variant (`none`
- * undirected, `arrow` the line style's arrow, `half` the half-arrow), its `legs` the leg `L`, its `spread` the legs'
+ * undirected, `arrow` the line style's arrow, `half` the half-arrow), its `legLength` the leg `L`, its `spread` the legs'
  * angle `2α`. Instance `i` is loop `i`; its pick resolves to `loops.edges[i]`. O(1): no array is built.
  */
 export function selfLoopLayers(c: SelfLoopCache, pickable?: true, pickBase?: number): InstancedLayer[] {
@@ -297,7 +308,7 @@ export function selfLoopLayers(c: SelfLoopCache, pickable?: true, pickBase?: num
     offsetsChanged: c.changed,
     widths: c.widths,
     colors: c.colors,
-    legs: c.legs,
+    legLength: c.legLength,
     spread: 2 * c.halfSpread,
     samples: LOOP_SAMPLES,
     groups: c.groups,
@@ -321,7 +332,7 @@ const LOOP_PTS = new Float64Array(2 * (2 * LOOP_SAMPLES + 5));
 /**
  * The Scene twin (Canvas / SVG) of the undirected `line`-style loops: one stroked drawable each in the `links` group,
  * keyed by its edge ({@link traceLoop}, head length `headLength(arrowSize)` so the arrow loop runs the same path, leg
- * `legs[i]`).
+ * `legLength`).
  * World mode traces world geometry; screen mode traces px offsets around an `anchor` at the node centre, which the
  * Scene draws as `anchor′ + (p − anchor)`: constant px at every zoom, no re-bake. Reads the columns
  * {@link updateSelfLoops} wrote; each drawable captures its numbers, not the columns.
@@ -331,11 +342,11 @@ export function emitSelfLoops(g: GroupBuilder, c: SelfLoopCache, idBase = 0): vo
   const screen = c.sizeMode === "screen";
   const h = headLength(c.arrowSize);
   const cot = c.spreadCot;
+  const leg = c.legLength;
   for (let i = 0; i < loops.count; i++) {
     const px = centres[2 * i] ?? 0;
     const py = centres[2 * i + 1] ?? 0;
     const sox = so[2 * i] ?? 0, soy = so[2 * i + 1] ?? 0, tox = to[2 * i] ?? 0, toy = to[2 * i + 1] ?? 0;
-    const leg = c.legs[i] ?? LOOP_LEG;
     g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceLoop(ctx, px + sox, py + soy, px + tox, py + toy, h, leg, cot), { lineWidth: c.widths[i] ?? 0, anchor: screen ? [px, py] : undefined });
   }
 }
@@ -348,7 +359,7 @@ export function emitSelfLoopHalfArrows(g: GroupBuilder, c: SelfLoopCache, bake =
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
-    const n = loopHalfArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, LOOP_SAMPLES, c.legs[i] ?? LOOP_LEG, c.spreadCot);
+    const n = loopHalfArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, LOOP_SAMPLES, c.legLength, c.spreadCot);
     if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
   }
 }
@@ -363,7 +374,7 @@ export function emitSelfLoopArrows(g: GroupBuilder, c: SelfLoopCache, bake = 1, 
   for (let i = 0; i < loops.count; i++) {
     const px = (centres[2 * i] ?? 0) * bake;
     const py = (centres[2 * i + 1] ?? 0) * bake;
-    const n = loopArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, h, LOOP_SAMPLES, c.legs[i] ?? LOOP_LEG, c.spreadCot);
+    const n = loopArrowOutline(LOOP_PTS, 0, px + (so[2 * i] ?? 0), py + (so[2 * i + 1] ?? 0), px + (to[2 * i] ?? 0), py + (to[2 * i + 1] ?? 0), c.widths[i] ?? 0, h, LOOP_SAMPLES, c.legLength, c.spreadCot);
     if (n > 0) g.drawable(idBase + (loops.edges[i] ?? 0), (ctx) => traceOutline(ctx, LOOP_PTS, n, inv));
   }
 }
@@ -430,14 +441,18 @@ export interface LoopSubsetFrame {
   /** Per-edge `selected` flags (a loop takes its first self-link's). */
   linkSelected?: Uint8Array;
   nodeOffsets?: Float32Array;
+  /** The engine's position version (≥ 1): it changes whenever positions may have moved, and a zoom keeps it. */
+  positionsVersion: number;
 }
 
 /**
  * The loops `sc.list[0..m)` of `c` as a {@link SelfLoopCache} of their own (#505: an LOD frame's loops on kept
- * leaves), so {@link selfLoopLayers} and the Scene emitters draw it as they draw the whole set. Each loop's angle
- * and ends are solved here (O(m + Σ degree of their nodes)); its style is copied from `c`. Every column goes
- * through `memo` ({@link StableColumns}), so a frame whose loops and positions did not change hands back the
- * arrays the GPU holds and uploads nothing; memory: two arrays per column, ≈ 2 × 41 B per drawn loop, reused.
+ * leaves), so {@link selfLoopLayers} and the Scene emitters draw it as they draw the whole set. Each loop's ends are
+ * solved here, O(m); its angle is solved (O(degree of its node)) only when `frame.positionsVersion` moved since it was
+ * last solved, else copied from `c.angles` (stamped per loop in `c.angleAt`): a zoom frame does no degree work. Its
+ * style is copied from `c`. Every column goes through `memo` ({@link StableColumns}), so a frame whose loops and
+ * positions did not change hands back the arrays the GPU holds and uploads nothing; memory: two arrays per column,
+ * ≈ 2 × 37 B per drawn loop, reused.
  */
 export function selfLoopSubset(c: SelfLoopCache, graph: NetworkGraph, m: number, frame: LoopSubsetFrame, memo: StableColumns, sc: KeptLoopsScratch): SelfLoopCache {
   const list = sc.list;
@@ -451,13 +466,25 @@ export function selfLoopSubset(c: SelfLoopCache, graph: NetworkGraph, m: number,
   const { loops } = c;
   const { nodes, edges, weights, angles } = sc;
   const off = frame.nodeOffsets;
+  // The angle stamps: built once per cache (a style or graph change), cleared when the node offsets change.
+  if (!c.angleAt) c.angleAt = new Uint32Array(loops.count);
+  if (c.angleOffsets !== off) {
+    c.angleAt.fill(0);
+    c.angleOffsets = off;
+  }
+  const at = c.angleAt;
+  const ver = frame.positionsVersion;
   for (let i = 0; i < m; i++) {
     const j = list[i] ?? 0;
     const n = loops.nodes[j] ?? 0;
     nodes[i] = n;
     edges[i] = loops.edges[j] ?? 0;
     weights[i] = loops.weights[j] ?? 0;
-    angles[i] = selfLoopAngle(graph.positions, graph.csr, n, off);
+    if (at[j] !== ver) {
+      c.angles[j] = selfLoopAngle(graph.positions, graph.csr, n, off);
+      at[j] = ver;
+    }
+    angles[i] = c.angles[j] ?? 0;
   }
   const { cx, cy, fade, linkSelected } = frame;
   const a = c.halfSpread;
@@ -496,9 +523,6 @@ export function selfLoopSubset(c: SelfLoopCache, graph: NetworkGraph, m: number,
   const groups = memo.float32Into("loops.groups", m, (out) => {
     for (let i = 0; i < m; i++) out[i] = nodes[i] ?? 0;
   });
-  const legs = memo.float32Into("loops.legs", m, (out) => {
-    for (let i = 0; i < m; i++) out[i] = c.legs[list[i] ?? 0] ?? LOOP_LEG;
-  });
   const selected = linkSelected
     ? memo.uint8Into("loops.selected", m, (out) => {
         for (let i = 0; i < m; i++) out[i] = linkSelected[edges[i] ?? 0] ?? 0;
@@ -514,7 +538,7 @@ export function selfLoopSubset(c: SelfLoopCache, graph: NetworkGraph, m: number,
     widths,
     colors,
     groups,
-    legs,
+    legLength: c.legLength,
     halfSpread: c.halfSpread,
     spreadCot: c.spreadCot,
     arrowSize: c.arrowSize,

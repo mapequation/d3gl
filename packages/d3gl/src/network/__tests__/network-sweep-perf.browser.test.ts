@@ -431,8 +431,9 @@ beforeAll(async () => {
       return { frames: HOLD, uploadedBytes: holdBytes, alwaysWrittenBytes: floor, freshColumns: fresh, checkedColumns: checked, linkStrokeCalls: linkStrokeCalls - holdStroke, primitives: [...primitives].sort() };
     };
     lodHold = runHold(); // undirected lines
-    // The same engine restyled (a second engine would stall whenReady, #287): directed lines add the
-    // arrowhead layer, and half-arrows replace the lines — the Network Navigator's default link style.
+    // The same engine restyled (a second engine would stall whenReady, #287): directed lines draw each link as ONE
+    // arrow, its head part of the line lane's strip (#542), and half-arrows replace the lines — the Network
+    // Navigator's default link style.
     net.style({ directed: true });
     lodHoldArrows = runHold();
     net.style({ linkStyle: "half-arrow" });
@@ -463,8 +464,8 @@ beforeAll(async () => {
     lodSpatialHold = runHold();
     // A view that gathers no link, same engine: pan off the graph and back. The gathered link layers hold only the
     // links that touch an aggregate (#447), so they empty there, and must keep their GPU buffers through it rather
-    // than be dropped and rebuilt on the next frame that gathers one. Directed lines draw lines + arrowheads,
-    // half-arrows the third primitive; each restyle is a registration event, settled before the leg.
+    // than be dropped and rebuilt on the next frame that gathers one. Directed lines draw whole arrows (one
+    // layer, #542), half-arrows the third primitive; each restyle is a registration event, settled before the leg.
     const away = { ...held, x: held.x - 100 * W };
     const pan = [held, away, held, away, held];
     for (const [name, restyle] of [

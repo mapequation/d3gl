@@ -2,7 +2,7 @@ import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
 import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_HALF_ARROW_VS, INSTANCED_LOOP_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import { loopStubLength, loopsSpreadCot } from "../core/loop-drop.js";
+import { LOOP_LEG, loopStubLength, loopsSpreadCot } from "../core/loop-drop.js";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedHalfArrowsData, InstancedLoopsData, InstancedHighlight } from "../core/index.js";
 
 /** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
@@ -689,15 +689,14 @@ export type LinkHead = "none" | "arrow" | "half";
 export type LineLaneData = InstancedLinesData & { radii?: Float32Array; arrowSize?: number };
 
 /** A `loops` layer's columns as the line program reads them (#542): the node centre at both ends, the rim ends as the
- *  end offsets, the legs as the bends. Refilled IN PLACE on each update of the layer (`out`), so a loop frame
- *  allocates nothing; the arrays are the layer's own. */
+ *  end offsets, no bends (the leg length is the `u_loopLeg` uniform). Refilled IN PLACE on each update of the layer
+ *  (`out`), so a loop frame allocates nothing; the arrays are the layer's own. */
 function loopLaneColumns(d: InstancedLoopsData, out?: LineLaneData): LineLaneData {
-  if (!out) return { sources: d.centers, targets: d.centers, widths: d.widths, colors: d.colors, bends: d.legs, samples: d.samples, groups: d.groups, selected: d.selected, sourceOffsets: d.startOffsets, targetOffsets: d.endOffsets, endOffsetsChanged: d.offsetsChanged, count: d.count };
+  if (!out) return { sources: d.centers, targets: d.centers, widths: d.widths, colors: d.colors, samples: d.samples, groups: d.groups, selected: d.selected, sourceOffsets: d.startOffsets, targetOffsets: d.endOffsets, endOffsetsChanged: d.offsetsChanged, count: d.count };
   out.sources = d.centers;
   out.targets = d.centers;
   out.widths = d.widths;
   out.colors = d.colors;
-  out.bends = d.legs;
   out.samples = d.samples;
   out.groups = d.groups;
   out.selected = d.selected;
@@ -794,7 +793,8 @@ export class InstancedLines {
   private target: Buffer;
   private widthBuf: Buffer;
   private color: Buffer;
-  private bend: Buffer;
+  /** The per-link bends; null on a `loops` layer, whose program reads no `a_bend` (#542). */
+  private bend: Buffer | null;
   /** The ends' offsets (#509); the constant zero without them. */
   private readonly ends = new EndOffsets();
   /** The layer's head (#542), fixed per layer by its primitive: a change recreates (like `samples`). */
@@ -833,7 +833,7 @@ export class InstancedLines {
     this.widthBuf = device.createBuffer({ data: data.widths });
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ straight (control on the chord).
-    this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+    this.bend = loops ? null : device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
     this._lastWidths = data.widths;
     this._lastColors = data.colors;
     this._lastBends = data.bends;
@@ -846,7 +846,7 @@ export class InstancedLines {
       ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
       ...(this.headed ? { u_arrowSize: data.arrowSize ?? 0 } : {}),
       // A loop's straight pieces past the rim (`h`), its centre solve (cot α) and its band (#542).
-      ...(loops ? { u_loopStub: loopStubLength(loops), u_loopCot: loopsSpreadCot(loops.spread), u_loopHalf: loops.head === "half" ? 1 : 0 } : {}),
+      ...(loops ? { u_loopStub: loopStubLength(loops), u_loopCot: loopsSpreadCot(loops.spread), u_loopHalf: loops.head === "half" ? 1 : 0, u_loopLeg: loops.legLength ?? LOOP_LEG } : {}),
     };
     const bufferLayout = [
       { name: "a_corner", format: "float32x2" as const },
@@ -854,7 +854,7 @@ export class InstancedLines {
       { name: "a_target", format: "float32x2" as const, stepMode: "instance" as const },
       { name: "a_width", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
-      { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
+      ...(this.bend ? [{ name: "a_bend", format: "float32" as const, stepMode: "instance" as const }] : []),
       ...this.ends.layout,
       ...(this.headed ? RadiusColumn.layout : []),
       ...this.hl.layout,
@@ -865,7 +865,7 @@ export class InstancedLines {
       a_target: this.target,
       a_width: this.widthBuf,
       a_color: this.color,
-      a_bend: this.bend,
+      ...(this.bend ? { a_bend: this.bend } : {}),
       ...this.hl.attributes(),
     };
     this.model = new Model(device, {
@@ -939,6 +939,7 @@ export class InstancedLines {
       data = loopLaneColumns(input, this.loopColumns);
       this.uniforms["u_loopStub"] = loopStubLength(input);
       this.uniforms["u_loopCot"] = loopsSpreadCot(input.spread);
+      this.uniforms["u_loopLeg"] = input.legLength ?? LOOP_LEG;
     } else {
       if (this.loopColumns || head !== this.head) return false;
       data = input;
@@ -953,13 +954,13 @@ export class InstancedLines {
       if (this.target !== this.source) this.target.destroy();
       this.widthBuf.destroy();
       this.color.destroy();
-      this.bend.destroy();
+      this.bend?.destroy();
       this._capacity = grownCapacity(data.count, this._capacity);
       this.source = grownBuffer(device, data.sources, data.count, this._capacity);
       this.target = this.loopColumns ? this.source : grownBuffer(device, data.targets, data.count, this._capacity);
       this.widthBuf = grownBuffer(device, data.widths, data.count, this._capacity);
       this.color = grownBuffer(device, data.colors, data.count, this._capacity);
-      this.bend = grownBuffer(device, data.bends ?? new Float32Array(data.count), data.count, this._capacity);
+      this.bend = this.bend && grownBuffer(device, data.bends ?? new Float32Array(data.count), data.count, this._capacity);
       // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
       this._lastWidths = data.widths;
       this._lastColors = data.colors;
@@ -969,7 +970,7 @@ export class InstancedLines {
         a_target: this.target,
         a_width: this.widthBuf,
         a_color: this.color,
-        a_bend: this.bend,
+        ...(this.bend ? { a_bend: this.bend } : {}),
         ...this.hl.recreate(data, this._capacity),
       });
       if (this.pickModel) {
@@ -978,7 +979,7 @@ export class InstancedLines {
           a_target: this.target,
           a_width: this.widthBuf,
           a_color: this.color,
-          a_bend: this.bend,
+          ...(this.bend ? { a_bend: this.bend } : {}),
           ...this.hl.attributes(),
         });
       }
@@ -989,7 +990,7 @@ export class InstancedLines {
       if (this.target !== this.source) this.target.write(data.targets);
       this._lastWidths = writeIfChanged(this.widthBuf, data.widths, this._lastWidths);
       this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
-      if (data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
+      if (this.bend && data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
       this.hl.write(data);
     }
     this.ends.sync(device, this.models(), data, this._capacity);
@@ -1015,7 +1016,7 @@ export class InstancedLines {
     if (this.target !== this.source) this.target.destroy();
     this.widthBuf.destroy();
     this.color.destroy();
-    this.bend.destroy();
+    this.bend?.destroy();
     this.ends.destroy();
     this.radius?.destroy();
     this.hl.destroy();

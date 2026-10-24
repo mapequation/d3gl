@@ -16,6 +16,8 @@ import { GlBufferSpy, perfHost, zoomSteps } from "../../__tests__/engine-sweep.j
  *   loops' columns stay resident), a position frame rewrites exactly the S loops, in place;
  * - LOD on, with S self-links: each frame lists its kept leaves' loops in at most min(S, frontier) reads and
  *   writes at most that many loop instances: O(visible), never O(S) when the frontier is smaller.
+ * - LOD on, a looped hub of degree HUB_DEGREE (never scaled): a zoom frame reads none of its neighbours — its loop's
+ *   angle is solved at most once per position change, then copied (the Σ degree term is off the zoom path).
  * - LOD off, at a fixed small N (never scaled): what the loops add to a position frame — draw calls, vertices
  *   drawn, loop instances written — is the same per loop at N and 2N, so a superlinear step (a per-loop draw or
  *   upload, an O(S²) vertex count) shows at 5k–10k without a 100k run. Counts, so the machine's load cannot move it.
@@ -147,6 +149,54 @@ async function runLeg(loops: boolean, lod: boolean): Promise<Leg> {
 }
 
 const TIMEOUT = perfBudget(180_000 + N / 2);
+
+/** The looped hub's degree: a star whose centre has a self-link (fixed, ≥ 10⁵: the degree is what is guarded). */
+const HUB_DEGREE = 100_000;
+
+/** Per zoom frame of an LOD-on sweep over the looped hub: the loop instances written, the neighbours read. */
+async function hubLeg(): Promise<{ perFrame: { instances: number; neighbours: number }[]; row: number }> {
+  const host = perfHost(W, H);
+  const net: Network = network(host, { width: W, height: H, backend: "webgl" });
+  try {
+    await net.whenReady();
+    // The hub at the zoom centre (the sweep zooms about the viewport's middle), between the grid points its leaves
+    // sit on (8 apart, as the main fixture's), so the deepest zooms keep it as a leaf.
+    const n = HUB_DEGREE + 1;
+    const cols = Math.ceil(Math.sqrt(HUB_DEGREE));
+    const positions = new Float32Array(2 * n);
+    positions[0] = W / 2 + 4;
+    positions[1] = H / 2 + 4;
+    for (let i = 1; i < n; i++) {
+      positions[2 * i] = ((i - 1) % cols) * 8;
+      positions[2 * i + 1] = Math.floor((i - 1) / cols) * 8;
+    }
+    const source = new Int32Array(n);
+    const target = new Int32Array(n);
+    for (let i = 1; i < n; i++) target[i - 1] = i; // source 0: the hub
+    // The last edge, source = target = 0: the hub's self-link.
+    const graph = buildGraph({ nodeCount: n, source, target, directed: false });
+    net
+      .data(graph)
+      .style({ nodeRadius: 3, sizeMode: "screen", linkStroke: "rgb(100,116,139)" })
+      .lod({})
+      .layout({ backend: "positions", positions });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    const perFrame: { instances: number; neighbours: number }[] = [];
+    const steps = zoomSteps(W, H);
+    for (const t of [...steps, ...steps.slice().reverse()]) {
+      const inst = selfLoopStats.instances;
+      const nb = selfLoopStats.neighbours;
+      net.setTransform(t);
+      perFrame.push({ instances: selfLoopStats.instances - inst, neighbours: selfLoopStats.neighbours - nb });
+    }
+    // One solve of the hub's angle reads its CSR row: its HUB_DEGREE neighbours and its self-link (skipped).
+    return { perFrame, row: (graph.csr.offsets[1] ?? 0) - (graph.csr.offsets[0] ?? 0) };
+  } finally {
+    drainGpu(host);
+    net.destroy();
+    host.remove();
+  }
+}
 
 /** Draw calls and vertices (instances × vertices per instance) the WebGL2 context issues while installed. */
 class GlDrawSpy {
@@ -314,5 +364,21 @@ describe(`self-link loops per frame (#505) at N=${N.toLocaleString()}, S=${S.toL
       console.log(`  LOD on, S=${S}: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms, at most ${worst} loop entries read per frame, frontiers ${leg.perFrame.map((f) => f.glyphs).join("/")}`);
     },
     TIMEOUT,
+  );
+
+  it(
+    `LOD on, a looped hub of degree ${HUB_DEGREE.toLocaleString()}: a zoom frame reads none of its neighbours`,
+    async () => {
+      const { perFrame, row } = await hubLeg();
+      expect(row).toBeGreaterThanOrEqual(HUB_DEGREE);
+      const drawn = perFrame.filter((f) => f.instances > 0).length;
+      expect(drawn, "fewer than two zoom frames drew the hub's loop: the guard cannot tell a cached angle from a solved one").toBeGreaterThanOrEqual(2);
+      // Positions never move during the sweep, so the hub's angle is solved at most once (by the first frame that
+      // draws it, unless the registration's frame already did), and every other frame copies it.
+      const total = perFrame.reduce((a, f) => a + f.neighbours, 0);
+      expect(total, `neighbours read over the sweep, per frame ${perFrame.map((f) => f.neighbours).join("/")}`).toBeLessThanOrEqual(row);
+      console.log(`  LOD on, hub of degree ${HUB_DEGREE}: loop drawn on ${drawn}/${perFrame.length} zoom frames, ${total} neighbours read`);
+    },
+    perfBudget(180_000),
   );
 });

@@ -273,12 +273,12 @@ describe("self-loop cache and layers (per-frame cost)", () => {
       const layers = networkLayersFromCache(g, s, cache).filter((l) => l.name === SELF_LOOP_LAYER);
       const out = { lines: [] as Float32Array[], layers: layers.length };
       for (const l of layers)
-        if (l.primitive === "loops") out.lines = [l.loops.centers, l.loops.widths, l.loops.legs, l.loops.startOffsets, l.loops.endOffsets];
+        if (l.primitive === "loops") out.lines = [l.loops.centers, l.loops.widths, l.loops.startOffsets, l.loops.endOffsets];
       return out;
     };
     const a = frame();
     expect(a.layers).toBe(1); // the directed loop is ONE loops layer, its head part of each instance (#542)
-    expect(a.lines.length).toBe(5);
+    expect(a.lines.length).toBe(4);
     const u0 = selfLoopStats.updates;
     const i0 = selfLoopStats.instances;
     g.positions.set([0, 5, 10, 5, 20, 5, 30, 5]); // the layout moved every node
@@ -336,7 +336,7 @@ describe("selfLinkSpread and selfLinkLength (#542)", () => {
     if (!c) throw new Error("expected loops");
     expect(c.halfSpread).toBe(DROP_HALF_SPREAD);
     expect(c.spreadCot).toBe(DROP_COT);
-    expect([...c.legs]).toEqual([LOOP_LEG]);
+    expect(c.legLength).toBe(LOOP_LEG);
     const l = loopLayer(style(2));
     expect(loopsSpreadCot(l.spread)).toBe(DROP_COT);
     const [a0, a1] = ends(l);
@@ -363,9 +363,9 @@ describe("selfLinkSpread and selfLinkLength (#542)", () => {
     expect(seg[1]?.[0]).toBeCloseTo(10 + (so[0] ?? 0), 5);
   });
 
-  it("the length fills the legs column and leaves the ends alone", () => {
+  it("the length sets the layer's leg length and leaves the ends alone", () => {
     const l = loopLayer(style(2, { selfLinkLength: 4.5 }));
-    expect([...l.legs]).toEqual([4.5]);
+    expect(l.legLength).toBe(4.5);
     const [a0, a1] = ends(l);
     expect(a0).toBeCloseTo(DROP_HALF_SPREAD, 6);
     expect(a1).toBeCloseTo(-DROP_HALF_SPREAD, 6);
@@ -377,10 +377,10 @@ describe("selfLinkSpread and selfLinkLength (#542)", () => {
     if (!c) throw new Error("expected loops");
     const sc = makeKeptLoopsScratch();
     const m = keptLeafLoops(c.loops, 2, Uint32Array.of(1), null, sc);
-    const sub = selfLoopSubset(c, g, m, { cx: Float32Array.of(0, 10), cy: new Float32Array(2) }, new StableColumns(), sc);
+    const sub = selfLoopSubset(c, g, m, { cx: Float32Array.of(0, 10), cy: new Float32Array(2), positionsVersion: 1 }, new StableColumns(), sc);
     expect(sub.spreadCot).toBe(c.spreadCot);
     expect(sub.head).toBe(c.head);
-    expect([...sub.legs]).toEqual([2]);
+    expect(sub.legLength).toBe(2);
     expect(Math.atan2(sub.sourceOffsets[1] ?? 0, sub.sourceOffsets[0] ?? 0)).toBeCloseTo(Math.PI / 6, 6);
   });
 });
@@ -420,7 +420,7 @@ describe("an LOD frame's loops on kept leaves", () => {
     if (!c) throw new Error("expected loops");
     const sc = makeKeptLoopsScratch();
     const memo = new StableColumns();
-    const frame = { cx: Float32Array.from({ length: 10 }, (_, i) => 10 * i), cy: new Float32Array(10) };
+    const frame = { cx: Float32Array.from({ length: 10 }, (_, i) => 10 * i), cy: new Float32Array(10), positionsVersion: 1 };
     const m = keptLeafLoops(c.loops, 10, Uint32Array.of(9, 5), null, sc);
     const a = selfLoopSubset(c, g, m, frame, memo, sc);
     expect(Array.from(a.loops.nodes)).toEqual([5]);
@@ -429,8 +429,36 @@ describe("an LOD frame's loops on kept leaves", () => {
     // Node 5's neighbours sit at ±x: the mean cancels and the loop takes the fallback angle; both ends on its rim.
     expect(Math.hypot(a.sourceOffsets[0] ?? 0, a.sourceOffsets[1] ?? 0)).toBeCloseTo(2, 5);
     const m2 = keptLeafLoops(c.loops, 10, Uint32Array.of(9, 5), null, sc);
+    const n0 = selfLoopStats.neighbours;
     const b = selfLoopSubset(c, g, m2, frame, memo, sc);
-    for (const k of ["centres", "sourceOffsets", "targetOffsets", "widths", "colors", "groups", "legs"] as const) expect(b[k], k).toBe(a[k]);
+    for (const k of ["centres", "sourceOffsets", "targetOffsets", "widths", "colors", "groups"] as const) expect(b[k], k).toBe(a[k]);
+    // The same position version (a zoom): the angle is copied, no neighbour is read.
+    expect(selfLoopStats.neighbours - n0).toBe(0);
+  });
+
+  it("solves a drawn loop's angle once per position version (a zoom reads no neighbour), again when positions move", () => {
+    const c = selfLoopCache(g, style);
+    if (!c) throw new Error("expected loops");
+    const sc = makeKeptLoopsScratch();
+    const memo = new StableColumns();
+    const pos = Float32Array.from(g.positions);
+    const frame = { cx: Float32Array.from({ length: 10 }, (_, i) => 10 * i), cy: new Float32Array(10), positionsVersion: 7 };
+    const n0 = selfLoopStats.neighbours;
+    const m = keptLeafLoops(c.loops, 10, Uint32Array.of(2, 7), null, sc);
+    selfLoopSubset(c, g, m, frame, memo, sc);
+    const solved = selfLoopStats.neighbours - n0;
+    expect(solved).toBeGreaterThan(0);
+    for (let f = 0; f < 3; f++) selfLoopSubset(c, g, keptLeafLoops(c.loops, 10, Uint32Array.of(2, 7), null, sc), frame, memo, sc);
+    expect(selfLoopStats.neighbours - n0, "a frame at the same version re-read neighbours").toBe(solved);
+    // Node 3 moves above node 2: a new version solves node 2's loop again, away from it.
+    g.positions[7] = 10;
+    const moved = selfLoopSubset(c, g, keptLeafLoops(c.loops, 10, Uint32Array.of(2), null, sc), { ...frame, positionsVersion: 8 }, memo, sc);
+    expect(selfLoopStats.neighbours - n0).toBeGreaterThan(solved);
+    expect(moved.angles[0]).toBeCloseTo(selfLoopAngles(g.positions, g.csr, { ...c.loops, nodes: Uint32Array.of(2), count: 1 }, new Float32Array(1))[0] ?? NaN, 6);
+    // A full-detail position frame rewrites `angles`, so the LOD stamps no longer hold.
+    updateSelfLoops(g, c);
+    expect([...(c.angleAt ?? [])].every((v) => v === 0)).toBe(true);
+    g.positions.set(pos);
   });
 });
 

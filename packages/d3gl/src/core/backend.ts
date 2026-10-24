@@ -279,7 +279,7 @@ export interface InstancedHalfArrowsData {
  * on a cubic and comes back straight to the rim at its end, where it ends as {@link InstancedLoopHead.head} says.
  * With `r` the distance from the centre to the rim ends and `u0` / `u1` the unit directions to them, the straight
  * pieces run from the centre to `E_k = centre + (r + h)·u_k` (drawn from the rim out) and the cubic is `E0`,
- * `E0 + ℓ·u0`, `E1 + ℓ·u1`, `E1` with `ℓ = legs[i]·r`; `h` is the head's own (see {@link InstancedLoopHead}).
+ * `E0 + ℓ·u0`, `E1 + ℓ·u1`, `E1` with `ℓ = legLength·r`; `h` is the head's own (see {@link InstancedLoopHead}).
  * Plain draws only: no `index`, so every column is per loop.
  */
 export interface InstancedLoopColumns {
@@ -302,9 +302,9 @@ export interface InstancedLoopColumns {
   widths: Float32Array;
   /** RGBA bytes per loop, length `4 * count`. */
   colors: Uint8Array;
-  /** The length of each loop's cubic arms `ℓ`, in multiples of its radius `r` (the centre-to-rim distance); length
-   *  `count`. */
-  legs: Float32Array;
+  /** The length of the loops' cubic arms `ℓ`, in multiples of each loop's radius `r` (the centre-to-rim distance).
+   *  One value per layer (a uniform). Absent ⇒ 3 (`LOOP_LEG`). */
+  legLength?: number;
   /** The angle between each loop's two straight pieces at the centre, in radians: the angle between its rim ends.
    *  One value per layer (a uniform). Absent ⇒ 40° (`LOOP_SPREAD`). */
   spread?: number;

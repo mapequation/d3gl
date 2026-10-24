@@ -1171,6 +1171,10 @@ export class Network extends BaseEngine {
   private readonly fitRadii = new WeakMap<ResolvedNetworkStyle, number>();
   /** A streamed layout frame is waiting for the engine's coalesced frame ({@link scheduleLayoutRepaint}). */
   private streamPending = false;
+  /** Bumped by every redraw request and {@link rebuild}: every path that can move positions (a stream, a drag, a
+   *  transition, a settle, a data or view change). A zoom frame keeps it, so the LOD frames' loops reuse their
+   *  angles over a zoom ({@link selfLoopSubset}). */
+  private positionsVersion = 1;
   /** Leaves moved since the last drawn frame by a drag, a transition or a force-drag tick
    *  ({@link repaintDuringDrag}): null = none, `"all"` = every node may have moved, else the held set. */
   private moved: Uint32Array | "all" | null = null;
@@ -3867,6 +3871,12 @@ export class Network extends BaseEngine {
     return { rgba: null, css: typeof spec === "string" ? spec : DEFAULT_NODE_FILL };
   }
 
+  /** Every redraw request may follow a position change: it moves the position version ({@link positionsVersion}). */
+  protected override requestRedraw(): void {
+    this.positionsVersion++;
+    super.requestRedraw();
+  }
+
   /**
    * Coalesce progressive worker frames into at most one repaint per animation frame — the engine's one
    * coalesced frame, shared with pan/zoom and node-drag input, so a frame that streams while the user
@@ -4203,6 +4213,7 @@ export class Network extends BaseEngine {
     // for style-only rebuilds (those are click-frequency, not per-frame): the next settled label
     // refresh rebuilds the grid once, O(nodeCount), never per frame.
     this.labelSource.stale = true;
+    this.positionsVersion++;
     const backend = this.backend();
     if (!backend) return this;
     // "auto" mode's placeholder canvas (#201). The Scene branch below exists only because a vector
@@ -5600,7 +5611,8 @@ export class Network extends BaseEngine {
    * The self-link loops of this cut's kept leaves (#505), as their own {@link SelfLoopCache} (the full-detail
    * cache's style, this frame's centres and ends); null for a graph without self-links. Call after
    * {@link frontierSuperEdges}, whose gather stamped the kept leaves. O(min(S, frontier)) to list them, then
-   * O(m + Σ degree of their nodes) for the m drawn; a frame that changes none of their values uploads nothing.
+   * O(m) for the m drawn, plus the degree of each whose angle is stale (positions moved since it was solved: never on
+   * a zoom frame); a frame that changes none of their values uploads nothing.
    */
   private lodLoopSubsetFor(tree: LODTree, graph: NetworkGraph, style: ResolvedNetworkStyle, frontier: Uint32Array, linkSelected: Uint8Array | undefined): SelfLoopCache | null {
     const c = this.noLodCache(graph, style).loops;
@@ -5611,7 +5623,7 @@ export class Network extends BaseEngine {
     const gen = csr.gen;
     const isKept = this.leafKeptBy === "lazy" ? (v: number) => keptByLastGather(lazy, v) : this.leafKeptBy === "csr" ? (v: number) => csr.kept[v] === gen : null;
     const m = keptLeafLoops(c.loops, n, frontier, isKept, this.keptLoops);
-    const frame = { cx: tree.cx, cy: tree.cy, fade: this.fadeAlpha, linkSelected, nodeOffsets: style.nodeOffsets };
+    const frame = { cx: tree.cx, cy: tree.cy, fade: this.fadeAlpha, linkSelected, nodeOffsets: style.nodeOffsets, positionsVersion: this.positionsVersion };
     return (this.lodLoopsDrawn = selfLoopSubset(c, graph, m, frame, this.lodColumns, this.keptLoops));
   }
 
@@ -6200,7 +6212,7 @@ export class Network extends BaseEngine {
         const j = selfLoopOfEdge(loops.loops, e);
         if (j >= 0) return style.linkStrokeOf(loops.loops.weights[j] ?? 0);
       }
-      return style.linkStrokeOf(graph.weight[e]!);
+      return style.linkStrokeOf(graph.weight[e] ?? 0);
     };
     // The map glyph (`half-arrow`, directed) is one *filled* shape per link — the head is part of it,
     // so the "links" layer fills and the "arrows" layer stays empty. A directed `line` link fills too (#542,
@@ -6226,6 +6238,8 @@ export class Network extends BaseEngine {
       data: edgeIds,
       ids: edgeIds,
       sizeMode: filled ? "world" : linkMode,
+      // A filled link keeps the stroke's pick pad, so a thin one is as easy to hover as a stroked one.
+      padFillPick: filled,
       ...(filled ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit || !drawLinks) return;
@@ -6406,6 +6420,7 @@ export class Network extends BaseEngine {
       ids: seIds,
       // A half-arrow or a directed line is one filled shape (baked to world in screen mode); a plain line keeps the sizeMode.
       sizeMode: filled ? "world" : style.sizeMode,
+      padFillPick: filled,
       ...(isHalf
         ? { fill: (_d, i) => (i >= seCount ? loopCss(i) : se.halfArrows ? rgbaCss(se.halfArrows.colors, i) : "") }
         : arrowLine

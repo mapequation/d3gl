@@ -258,7 +258,7 @@ export function arrowsToDrawables(l: InstancedArrowsData, bake = 1): DrawableVec
 
 /**
  * Self-link loops (#505, #542) → one drawable per loop, the loop lane's twin, with its centre solve
- * ({@link loopsSpreadCot}), legs and `h` ({@link loopStubLength}) as the shader reads them. A headless loop is ONE
+ * ({@link loopsSpreadCot}), leg length and `h` ({@link loopStubLength}) as the shader reads them. A headless loop is ONE
  * stroked path ({@link traceLoop}) whose ends move by `offset / bake` world units, as {@link linesToDrawables}' do (the
  * loop is linear in its ends and `h`, so the loop on the moved ends is the one the shader draws in px). A headed loop
  * is ONE filled outline, {@link loopArrowOutline} or {@link loopHalfArrowOutline}, solved in px (×k) on a screen
@@ -270,11 +270,11 @@ export function loopsToDrawables(l: InstancedLoopsData, bake = 1): DrawableVecto
   const pts = new Float64Array(2 * (2 * samples + 5));
   const h = loopStubLength(l);
   const cot = loopsSpreadCot(l.spread);
+  const leg = l.legLength ?? LOOP_LEG;
   const { startOffsets: so, endOffsets: to } = l;
   const out: DrawableVector[] = [];
   for (let e = 0; e < l.count; e++) {
     const width = l.widths[e] ?? 0;
-    const leg = l.legs[e] ?? LOOP_LEG;
     const color = rgbaAt(l.colors, e);
     if (l.head === "none") {
       const cx = l.centers[e * 2] ?? 0;

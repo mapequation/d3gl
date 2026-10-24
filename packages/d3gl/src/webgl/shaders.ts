@@ -397,6 +397,14 @@ const HEAD_LINE_BODY = `  float t = a_corner.x;
   // The legs (core/arrowhead.ts writeShaft): out of each centre towards the quadratic's control mid + ⟂d·bend.
   vec2 bp = 2.0 * bend * vec2(-d.y, d.x);
   float ll = length(d + bp);                                // = |−d + 2b·⟂d|
+  // Coincident ends (a self-link's edge, or two nodes at one point): no direction, so no arrow, as the TS twin
+  // (writeShaft returns 0). Every vertex collapses onto src: a zero-area strip, never a NaN vertex.
+  if (!(ll > 0.0)) {
+    gl_Position = screen
+      ? vec4(src.x / u_viewport.x * 2.0 - 1.0, 1.0 - src.y / u_viewport.y * 2.0, 0.0, 1.0)
+      : vec4((u_transform * vec3(src, 1.0)).xy, 0.0, 1.0);
+    return;
+  }
   vec2 u1 = (bp - d) / ll;                                  // out of the target: the head's axis is −u1
   vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the head's normal
   vec2 tip = tgt + u1 * a_radius;
@@ -446,7 +454,7 @@ export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
 // two rim ends are that centre plus the end offsets (`startOffsets` / `endOffsets`, size units, any #509 node offset
 // in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
 // T − c = n + D/2 = r·u1. The centre curve is c → E0, the cubic E0, E0 + ℓ·u0, E1 + ℓ·u1, E1 (E_k = c + (r + h)·u_k,
-// ℓ = a_bend·r: `a_bend` is the layer's `legs`, L in node radii), then the variant's end. The template (`loopTemplate`):
+// ℓ = L·r: `u_loopLeg` is the layer's `legLength`, L in node radii), then the variant's end. The template (`loopTemplate`):
 // (−1, ±1) the pair at c with the straight leg's normal ⟂(u0); (t ∈ [0, 1], ±1) the cubic; then the end —
 // undirected (4, ±1) the pair back at c; arrow (2, 1) left barb, (2, −1) right barb, (3, 0) tip (as
 // `headLineTemplate`); half-arrow (3, 0) tip, (2, 1) barb (the last pair, tip and barb: two triangles that tile the
@@ -455,7 +463,8 @@ export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
 const LOOP_DECL = `
 uniform float u_loopStub;   // h: the straight pieces past the rim (the stub, or the arrowhead's length, #542)
 uniform float u_loopCot;    // cot α: recovers the loop's centre from its two rim ends
-uniform float u_loopHalf;   // 1 = the half-arrow band (edges 0 / +w, one-sided head), 0 = the line (±w/2)`;
+uniform float u_loopHalf;   // 1 = the half-arrow band (edges 0 / +w, one-sided head), 0 = the line (±w/2)
+uniform float u_loopLeg;    // L: the cubic's arms in node radii (the layer's legLength)`;
 const LOOP_BODY = `  float t = a_corner.x;
   float side = a_corner.y;
   bool screen = u_screen > 0.5;
@@ -485,7 +494,7 @@ const LOOP_BODY = `  float t = a_corner.x;
     pos = c + vec2(-u0.y, u0.x) * off;                      // the start, at c
   } else {
     vec2 e0 = c + (r + h) * u0;
-    float leg = a_bend * r;
+    float leg = u_loopLeg * r;
     vec2 p1 = e0 + leg * u0;
     vec2 p2 = e1 + leg * u1;
     float u = 1.0 - t;
@@ -503,7 +512,8 @@ const LOOP_BODY = `  float t = a_corner.x;
 function loopVS(vs: string): string {
   const at = vs.indexOf("  float t = a_corner.x;");
   if (at < 0 || !vs.includes("\nin float a_bend;")) throw new Error("loopVS: unexpected line shader");
-  return vs.slice(0, at).replace("\nin float a_bend;", `${LOOP_DECL}\nin float a_bend;`) + LOOP_BODY;
+  // A loop has no bend: its arms are the layer's u_loopLeg, so the line's `a_bend` attribute is dropped.
+  return vs.slice(0, at).replace("\nin float a_bend;", LOOP_DECL) + LOOP_BODY;
 }
 
 export const INSTANCED_LOOP_VS = loopVS(INSTANCED_LINE_VS);

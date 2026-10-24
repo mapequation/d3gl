@@ -2133,7 +2133,7 @@ export function superEdgeBatches(
   // `targets`) plus its draw radius; the tip sits on the node boundary, a full head on the link's own end
   // tangent — the shape the non-LOD path draws ({@link arrowOutline}).
   const radii = new Float32Array(count);
-  for (let e = 0; e < count; e++) putEndRadius(radii, e, e, bS[e]!);
+  for (let e = 0; e < count; e++) putEndRadius(radii, e, e, bS[e] ?? 0);
   lines.radii = radii;
   lines.arrowSize = style.arrowSize;
   return { lines, ids, flows };
@@ -2458,7 +2458,7 @@ export interface LinkLinesStyleAttrs {
 export function linkHeads(graph: NetworkGraph, size: number, nodeRadii: Float32Array): { arrowSize: number; radii: Float32Array } {
   const count = graph.edgeCount;
   const radii = new Float32Array(count);
-  for (let e = 0; e < count; e++) radii[e] = nodeRadii[graph.target[e]!]!;
+  for (let e = 0; e < count; e++) radii[e] = nodeRadii[graph.target[e] ?? 0] ?? 0;
   return { arrowSize: size, radii };
 }
 

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Scene } from "../scene.js";
 import { HitIndex } from "../hit-test.js";
+import type { PathRecorder } from "../path-recorder.js";
 
 const ID = { k: 1, x: 0, y: 0 }; // identity transform: screen == world
 
@@ -27,6 +28,29 @@ describe("HitIndex", () => {
     const idx = new HitIndex(scene.drawables("g"));
     expect(idx.pick(50, 50, ID)).toBe("line");   // on the line, hidden fill skipped
     expect(idx.pick(50, 70, ID)).toBe(null);     // far from line, fill hidden
+  });
+
+  it("padFills: a 1 px filled directed link hits ~1.5 px off its centre line, as its stroke did (#542)", () => {
+    // The outline of a 1 px directed link along +x: a shaft from x=0 to the head's base at x=90, then the head.
+    const arrow = (ctx: PathRecorder) => {
+      ctx.moveTo(0, 49.5); ctx.lineTo(90, 49.5); ctx.lineTo(90, 47); ctx.lineTo(100, 50);
+      ctx.lineTo(90, 53); ctx.lineTo(90, 50.5); ctx.lineTo(0, 50.5); ctx.closePath();
+    };
+    const scene = new Scene();
+    scene.group("links", (b) => b.drawable("e", arrow));
+    scene.group("stroke", (b) => b.drawable("e", (ctx) => { ctx.moveTo(0, 50); ctx.lineTo(90, 50); }, { lineWidth: 1 }));
+    const padded = new HitIndex(scene.drawables("links"), 1, false, true);
+    const stroked = new HitIndex(scene.drawables("stroke"));
+    const plain = new HitIndex(scene.drawables("links"));
+    // 1.4 px off the centre line (0.9 px off the edge): the stroke's band (½·1 + 1 px), and the padded fill's.
+    expect(stroked.pick(40, 51.4, ID)).toBe("e");
+    expect(padded.pick(40, 51.4, ID)).toBe("e");
+    expect(padded.pick(40, 48.6, ID)).toBe("e");
+    expect(padded.pick(40, 52, ID)).toBe(null); // 1.5 px off the edge: outside the pad
+    expect(padded.pick(40, 50, ID)).toBe("e"); // inside
+    // Without the opt-in a fill hits inside only (every other layer's fills keep that).
+    expect(plain.pick(40, 51.4, ID)).toBe(null);
+    expect(plain.pick(40, 50, ID)).toBe("e");
   });
 
   it("hits circle drawables within the radius", () => {
