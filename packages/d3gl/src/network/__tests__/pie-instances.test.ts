@@ -135,3 +135,35 @@ describe("physicalPieSelected (#175)", () => {
     expect(asked).toEqual([0, 2]); // single-module discs (1, 3) carry no wedge instance
   });
 });
+
+// #507: a default-shade flow border shows through the pie (full radius, a darker outer band per wedge); any
+// other border keeps the pie inside it (the node's inner radius, no band).
+describe("pie and the node's border (#507)", () => {
+  const positions = new Float32Array([0, 0, 50, 50]);
+  const fractions = new Float32Array([0.25, 0.5]);
+  it("with `darken`, the wedges span the full radius and carry the node's band fraction", () => {
+    const pie = physicalPieInstances(wedges, positions, 8, undefined, { fractions, darken: 0.5 });
+    expect(Array.from(pie.radii)).toEqual([8, 8]);
+    expect(Array.from(pie.borders ?? [])).toEqual([0.25, 0.25]);
+    expect(pie.borderDarken).toBe(0.5);
+  });
+  it("without `darken`, the wedges sit at the inner radius with no band", () => {
+    const pie = physicalPieInstances(wedges, positions, 8, undefined, { fractions });
+    expect(Array.from(pie.radii)).toEqual([6, 6]);
+    expect(pie.borders).toBeUndefined();
+  });
+  it("pieToDrawables draws a banded wedge as its inner sector plus the band in its darker colour", () => {
+    const pie = physicalPieInstances(wedges, positions, 8, new Uint8Array([200, 100, 50, 255, 10, 20, 30, 255]), { fractions, darken: 0.5 });
+    const ds = pieToDrawables(pie, false);
+    expect(ds.map((d) => d.id)).toEqual([0, 2, 1, 3]);
+    expect(ds.map((d) => d.fill)).toEqual([
+      [200, 100, 50, 255],
+      [100, 50, 25, 255],
+      [10, 20, 30, 255],
+      [5, 10, 15, 255],
+    ]);
+    // The band is an annulus: every point lies between the band radius (6) and the radius (8).
+    const pts = ds[1]?.subpaths[0]?.points ?? [];
+    for (let i = 0; i < pts.length; i += 2) expect(Math.hypot(pts[i] ?? 0, pts[i + 1] ?? 0)).toBeGreaterThan(5.99);
+  });
+});

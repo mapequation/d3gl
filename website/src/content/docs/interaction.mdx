@@ -110,6 +110,12 @@ Selection highlight is **ancestor-aware** under LOD: selecting a module and zoom
 expanding children (and their outgoing links) highlighted, even though only the module id is in the
 selection set — so `selection()` stays compact while the on-screen focus follows the subtree.
 
+It works the other way too: a selected node the cut has collapsed into a module shows on that module,
+which takes a **faint ring** (the selection colour at reduced opacity) and is not dimmed. Zoom in and the
+ring moves down the levels until it sits on the node itself, in full. The module's links stay as they
+are: they carry the whole module's flow, so only the selected nodes' own links light up. Select the
+nodes that match a search, and every match stays findable at any zoom.
+
 ## Cost model
 
 | Operation | Cost | When |
