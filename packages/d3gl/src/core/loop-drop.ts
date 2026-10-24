@@ -236,6 +236,9 @@ function writeHalfArrowHead(out: PointBuffer, o: number, r: number, width: numbe
 }
 
 /**
+ * Test-only reference outline: no renderer calls it (Canvas/SVG/`toSVG()` draw {@link traceLoopArrowOutline}, WebGL its
+ * shader twin); the tests pin both against it.
+ *
  * Write the directed (`line` style) loop as ONE closed outline of sampled points (the reference that
  * {@link traceLoopArrowOutline}, what Canvas/SVG/`toSVG()` fill, approximates with cubic edges), as `arrowOutline` does
  * for a link: the shaft's left edge (`+width/2` along `perp(travel)`, the loop's outside) from `c` through the straight
@@ -255,6 +258,9 @@ export function loopArrowOutline(out: PointBuffer, o: number, sx: number, sy: nu
 }
 
 /**
+ * Test-only reference outline: no renderer calls it (Canvas/SVG/`toSVG()` draw {@link traceLoopHalfArrowOutline}, WebGL
+ * its shader twin); the tests pin both against it.
+ *
  * Write the `half-arrow` loop as ONE closed outline of sampled points ({@link traceLoopHalfArrowOutline}'s reference): the band between offsets 0 (the inner edge, the centre path
  * itself) and `+width` (the outer edge, on the loop's outside). The inner edge runs `c → E0 → (cubic) → E1` (points
  * `0 … samples`), then the tip `T = c + r·u1` on the rim, the barb `B + (width + 2√width)·n` (`n = perp(−u1)`) at the

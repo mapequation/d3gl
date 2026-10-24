@@ -455,7 +455,7 @@ function headLineVS(vs: string): string {
 export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
 
 // INSTANCED_LOOP_VS — the self-link loop (#505, #542), one instance of the loop lane (`InstancedLoops`): the GLSL
-// twin of `core/loop-drop.ts` (`traceLoop`, `loopArrowOutline`, `loopHalfArrowOutline`), every variant one strip.
+// twin of `core/loop-drop.ts` (`traceLoop`, `traceLoopArrowOutline`, `traceLoopHalfArrowOutline`), every variant one strip.
 // A `loops` layer (`InstancedLoopsData`): `a_center` its node centre, and its two rim ends are that centre plus
 // `a_startOffset` / `a_endOffset` (size units, any #509 node offset in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
 // T − c = n + D/2 = r·u1. The centre curve is c → E0, the cubic E0, E0 + ℓ·u0, E1 + ℓ·u1, E1 (E_k = c + (r + h)·u_k,
