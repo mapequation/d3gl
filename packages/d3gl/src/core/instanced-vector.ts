@@ -121,10 +121,40 @@ function offsetAt(offsets: Float32Array | undefined, j: number, scale: number): 
 /** Full turn — the wedge fraction → angle convention the pie fragment shader uses (CCW from +x). */
 const TAU = Math.PI * 2;
 
+/**
+ * One pie wedge's sector between radii `r0 ≤ r1`, angles in radians: `r0 = 0` is the plain sector from the
+ * centre, `r0 > 0` the annular sector of its outer band (#507). The one geometry the Canvas/SVG Scene pie
+ * (`tracePieWedges`, network/glyphs.ts) and the `toSVG()` export of the instanced pie trace,
+ * so the vector band meets the WebGL shader's `r > 1 − border` test on the same circle.
+ */
+export function tracePieSector(ctx: PathRecorder, cx: number, cy: number, r0: number, r1: number, a0: number, a1: number): void {
+  if (r0 > 0) {
+    ctx.arc(cx, cy, r1, a0, a1, false);
+    ctx.arc(cx, cy, r0, a1, a0, true);
+  } else {
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, r1, a0, a1, false);
+  }
+  ctx.closePath();
+}
+
+/** A pie wedge's band radius (#507): where its outer band of `fraction` of `radius` starts. The WebGL
+ *  shader's `r > 1 − border` boundary, and the vector band's inner edge. */
+export function pieBandRadius(radius: number, fraction: number): number {
+  return radius * (1 - fraction);
+}
+
+/** RGBA `c` with RGB × `factor`, rounded as the GPU quantises a darkened fragment (alpha kept). */
+export function darkenRGBA(c: readonly [number, number, number, number], factor: number): [number, number, number, number] {
+  return [Math.round(c[0] * factor), Math.round(c[1] * factor), Math.round(c[2] * factor), c[3]];
+}
+
 /** Instanced pie wedges → one filled arc sector per wedge. Screen sizeMode pins the sector at a
  *  constant pixel size around its (projected) centre via the drawable anchor, as `tracePieWedges` does
  *  — so a screen wedge is an anchored glyph and bakes at {@link anchoredCurveTolerance}, exactly like
- *  its Canvas/SVG Scene twin (#283); a world wedge is world-scaled and bakes at `tolerance`. */
+ *  its Canvas/SVG Scene twin (#283); a world wedge is world-scaled and bakes at `tolerance`. A wedge with
+ *  an outer band (`borders`, #507) is two drawables: its inner sector, then the band as an annular sector
+ *  in its darker colour (id `count + i`), as the shader draws it in one instance. */
 export function pieToDrawables(
   p: InstancedPieData,
   screen: boolean,
@@ -132,23 +162,19 @@ export function pieToDrawables(
 ): DrawableVector[] {
   const out: DrawableVector[] = [];
   const bake = anchoredCurveTolerance(tolerance, screen);
+  const darken = p.borderDarken ?? 1;
   for (let i = 0; i < p.count; i++) {
     const cx = p.centers[i * 2] ?? 0;
     const cy = p.centers[i * 2 + 1] ?? 0;
     const r = p.radii[i] ?? 0;
     const a0 = (p.angles[i * 2] ?? 0) * TAU;
     const a1 = (p.angles[i * 2 + 1] ?? 0) * TAU;
-    out.push(
-      drawable(i, {
-        subpaths: record((ctx) => {
-          ctx.moveTo(cx, cy);
-          ctx.arc(cx, cy, r, a0, a1, false);
-          ctx.closePath();
-        }, bake),
-        fill: rgbaAt(p.colors, i),
-        anchor: screen ? [cx, cy] : null,
-      }),
-    );
+    const b = p.borders ? (p.borders[i] ?? 0) : 0;
+    const inner = b > 0 ? pieBandRadius(r, Math.min(b, 1)) : r;
+    const fill = rgbaAt(p.colors, i);
+    const anchor: [number, number] | null = screen ? [cx, cy] : null;
+    if (inner > 0) out.push(drawable(i, { subpaths: record((ctx) => tracePieSector(ctx, cx, cy, 0, inner, a0, a1), bake), fill, anchor }));
+    if (inner < r) out.push(drawable(p.count + i, { subpaths: record((ctx) => tracePieSector(ctx, cx, cy, inner, r, a0, a1), bake), fill: darkenRGBA(fill, darken), anchor }));
   }
   return out;
 }

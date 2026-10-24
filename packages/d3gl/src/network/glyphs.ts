@@ -1,5 +1,6 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
+import { tracePieSector, pieBandRadius } from "../core/index.js";
 import { reciprocalEdges, type NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
 import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, type LODTransform } from "./lod.js";
@@ -3234,6 +3235,16 @@ export function traceSuperArrows(g: GroupBuilder, arrows: InstancedArrowsData, i
 // nodeCircles lane, so only ≥2-module ("overlapping") physical nodes get a pie.
 // ---------------------------------------------------------------------------
 
+/** How the pie meets its node's border (#507): `fractions` are the per-physical border widths as fractions of
+ *  the radius — the node lane's own `borders` column (the flow border, else the node border). With `darken`
+ *  (a flow border or node border with no colour given) the pie spans the full radius and each wedge's outer
+ *  band of that fraction is its own colour with RGB × `darken`; without it (an explicit border colour) the pie
+ *  sits inside the border, at the node's inner radius. */
+export interface PieBorder {
+  fractions: ArrayLike<number>;
+  darken?: number;
+}
+
 /** Radius input for pie glyphs (active `sizeMode` units): a constant, or one radius per physical node. */
 export type PieRadius = number | ArrayLike<number>;
 
@@ -3256,6 +3267,8 @@ export function physicalPieInstances(
   /** Per-wedge RGBA (length `4·wedges`, wedge index order), resolved once per style (#494); default: each
    *  wedge's `color`, parsed per call. */
   rgba?: Uint8Array,
+  /** The node's border (#507, {@link PieBorder}); default: no border, the full radius. */
+  border?: PieBorder,
 ): InstancedPieData {
   const { offset, end, color, wedgeCount } = wedges;
   const physicalCount = wedgeCount.length;
@@ -3268,12 +3281,16 @@ export function physicalPieInstances(
   const angles = new Float32Array(total * 2);
   const colors = new Uint8Array(total * 4);
   const groups = new Float32Array(total);
+  const fractions = border?.fractions;
+  const band = fractions && border?.darken !== undefined ? new Float32Array(total) : undefined;
   let w = 0;
   for (let p = 0; p < physicalCount; p++) {
     if (wedgeCount[p]! < 2) continue;
     const cx = positions[2 * p]!;
     const cy = positions[2 * p + 1]!;
-    const r = radiusAt(p);
+    const f = fractions ? fractions[p]! : 0;
+    const r = fractions && !band ? pieBandRadius(radiusAt(p), f) : radiusAt(p);
+    if (band) band.fill(f, w, w + offset[p + 1]! - offset[p]!);
     let a0 = 0;
     for (let k = offset[p]!; k < offset[p + 1]!; k++) {
       const a1 = end[k]!;
@@ -3295,7 +3312,7 @@ export function physicalPieInstances(
       w++;
     }
   }
-  return { centers, radii, angles, colors, groups, count: total };
+  return band ? { centers, radii, angles, colors, groups, borders: band, borderDarken: border?.darken, count: total } : { centers, radii, angles, colors, groups, count: total };
 }
 
 /**
@@ -3332,7 +3349,16 @@ export function physicalPieSelected(wedges: PhysicalPieWedges, isSelected: ((p: 
  * layer `fillOf` reads `wedges.color[index]`). In screen sizeMode the wedge is pinned at a constant
  * pixel size around the physical centre via the drawable `anchor` (all a pie's wedges share it).
  */
-export function tracePieWedges(g: GroupBuilder, wedges: PhysicalPieWedges, positions: ArrayLike<number>, radius: PieRadius, screen: boolean): void {
+export function tracePieWedges(
+  g: GroupBuilder,
+  wedges: PhysicalPieWedges,
+  positions: ArrayLike<number>,
+  radius: PieRadius,
+  screen: boolean,
+  /** The outer band (#507): per-physical band radius (where each wedge's darker band starts) and the id offset
+   *  of the band drawables — wedge `k`'s band is keyed `bandIds + k`. Default: no band. */
+  band?: { inner: ArrayLike<number>; bandIds: number },
+): void {
   const { offset, end, wedgeCount } = wedges;
   const physicalCount = wedgeCount.length;
   const radiusAt = typeof radius === "number" ? () => radius : (p: number) => radius[p]!;
@@ -3341,21 +3367,16 @@ export function tracePieWedges(g: GroupBuilder, wedges: PhysicalPieWedges, posit
     const cx = positions[2 * p]!;
     const cy = positions[2 * p + 1]!;
     const r = radiusAt(p);
-    const anchor: [number, number] | undefined = screen ? [cx, cy] : undefined;
+    const inner = band ? Math.min(r, band.inner[p]!) : r;
+    const anchor: [number, number] = [cx, cy];
+    const opts = screen ? { anchor } : undefined;
     let a0 = 0;
     for (let k = offset[p]!; k < offset[p + 1]!; k++) {
-      const s = a0;
-      const e = end[k]!;
-      g.drawable(
-        k,
-        (ctx) => {
-          ctx.moveTo(cx, cy);
-          ctx.arc(cx, cy, r, s * TAU, e * TAU, false);
-          ctx.closePath();
-        },
-        anchor ? { anchor } : undefined,
-      );
-      a0 = e;
+      const s = a0 * TAU;
+      const e = end[k]! * TAU;
+      if (inner > 0) g.drawable(k, (ctx) => tracePieSector(ctx, cx, cy, 0, inner, s, e), opts);
+      if (band && inner < r) g.drawable(band.bandIds + k, (ctx) => tracePieSector(ctx, cx, cy, inner, r, s, e), opts);
+      a0 = end[k]!;
     }
   }
 }

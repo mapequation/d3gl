@@ -5,7 +5,9 @@ import { buildGraph } from "../graph.js";
 import type { ModulePathNode } from "../module-colors.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedLayer, InstancedHighlight } from "../../core/backend.js";
-import { decodeImage } from "../../map/__tests__/backend-equivalence-harness.js";
+import { decodeImage, rasterizeSVG } from "../../map/__tests__/backend-equivalence-harness.js";
+import { BORDER_DARKEN } from "../glyphs.js";
+import { pieColumnStats } from "../../webgl/instanced.js";
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -454,6 +456,130 @@ describe("physical-view pie highlight (#175)", () => {
     net.data(buildGraph({ nodeCount: 2, source: [0], target: [1], directed: false }));
     expect(live.has("nodes"), "the plain graph's lane drew no nodes").toBe(true);
     expect(live.has("pie"), "a stale pie layer survived data(plainGraph)").toBe(false);
+    net.destroy();
+    h.remove();
+  });
+});
+
+// #507: a flow border or node border with no colour given shows THROUGH the pie — each wedge spans the full
+// radius and its outer band (the border's width) is its own colour with RGB × BORDER_DARKEN, as a single-module
+// disc's ring is its fill's. A border with an explicit colour shows AROUND the pie, which sits at the node's
+// inner radius. Same on WebGL, Canvas, SVG and both `toSVG()` exports.
+describe("physical-view pie and the node's border (#507)", () => {
+  const BORDER: [number, number, number] = [255, 0, 255];
+  const BORDER_PX = 6;
+  /** `r` px from physical `p`'s centre at angle `a` (radians, screen coords). */
+  const at = (p: number, r: number, a: number): [number, number] => [(PIE_POS[2 * p] ?? 0) + r * Math.cos(a), (PIE_POS[2 * p + 1] ?? 0) + r * Math.sin(a)];
+  /** `r` px from physical `p`'s centre, in the same direction as {@link pieSample} (the second wedge). */
+  const along = (p: number, r: number): [number, number] => at(p, r, (3 * Math.PI) / 4);
+  const near = (a: number[], b: number[], tol: number) => a.slice(0, 3).every((v, i) => Math.abs(v - (b[i] ?? 0)) <= tol);
+  const isBorder = (c: number[]) => near(c, BORDER, 23);
+  const darker = (c: number[]) => c.slice(0, 3).map((v) => Math.round(v * BORDER_DARKEN));
+  const sources = ["webgl", "canvas", "svg", "webgl-toSVG"] as const;
+  type Source = (typeof sources)[number];
+
+  async function render(source: Source, style: Parameters<ReturnType<typeof network>["style"]>[0]) {
+    const h = host();
+    const { graph, modules } = pieStateNetwork();
+    const backend = source === "webgl-toSVG" ? "webgl" : source;
+    const net = network(h, { width: 200, height: 200, backend });
+    await net.whenReady();
+    net.style(style).stateNetwork(graph, { modules, view: "physical" }).layout({ backend: "positions", positions: PIE_POS });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.render();
+    const px = source === "svg" || source === "webgl-toSVG" ? await rasterizeSVG(net.toSVG(), 200, 200) : await decodeImage(net.toPNG(), 200, 200);
+    net.destroy();
+    h.remove();
+    return px;
+  }
+
+  const defaultShade = {
+    flowBorder: { flowBorder: { scale: () => BORDER_PX, flow: new Float32Array([1, 1, 1]) } },
+    nodeBorder: { nodeBorder: { width: BORDER_PX } },
+  } as const;
+  for (const source of sources) {
+    for (const kind of ["flowBorder", "nodeBorder"] as const) {
+      const label = kind === "flowBorder" ? "flow-border" : "node-border";
+      it(`${source}: with the default ${label} shade, each wedge shows its colour inside and RGB × BORDER_DARKEN in the band`, async () => {
+        const px = await render(source, { nodeRadius: PIE_R, ...defaultShade[kind] });
+        const inner = PIE_R - BORDER_PX; // where the band starts
+        for (const p of [0, 1]) {
+          const wedgeColors = new Set<string>();
+          let checked = 0;
+          for (let i = 0; i < 24; i++) {
+            const a = ((i + 0.5) / 24) * 2 * Math.PI;
+            // Clear of a wedge's radial edge: two samples on each side agree (no edge anti-aliasing between them).
+            const [c1, c2] = [rgbaAt(px, at(p, 3, a)), rgbaAt(px, at(p, inner - 3, a))];
+            const [b1, b2] = [rgbaAt(px, at(p, inner + 2, a)), rgbaAt(px, at(p, PIE_R - 2, a))];
+            if (!near(c1, c2, 1) || !near(b1, b2, 1)) continue;
+            checked++;
+            wedgeColors.add(c1.slice(0, 3).join(","));
+            expect(near(b1, darker(c1), 2), `physical ${p} at ${i}/24: band ${b1} is not ${darker(c1)} (wedge ${c1})`).toBe(true);
+          }
+          expect(checked, `physical ${p}: too few clean samples`).toBeGreaterThanOrEqual(16);
+          expect(wedgeColors.size, `physical ${p}: the band hides a wedge`).toBe(2);
+        }
+        // The single-module disc (physical 2): its flow-border ring is still its fill × BORDER_DARKEN.
+        const fill = rgbaAt(px, at(2, 4, -Math.PI / 2));
+        expect(near(rgbaAt(px, at(2, PIE_R - BORDER_PX / 2, -Math.PI / 2)), darker(fill), 2), `the disc's ${label} changed`).toBe(true);
+      });
+    }
+  }
+
+  const explicit = {
+    flowBorder: { flowBorder: { scale: () => BORDER_PX, flow: new Float32Array([1, 1, 1]), color: "#ff00ff" } },
+    nodeBorder: { nodeBorder: { width: BORDER_PX, color: "#ff00ff" } },
+  } as const;
+  for (const source of sources) {
+    for (const kind of ["flowBorder", "nodeBorder"] as const) {
+      it(`${source}: an explicit ${kind === "flowBorder" ? "flow-border" : "node-border"} colour stays visible around the pie`, async () => {
+        const px = await render(source, { nodeRadius: PIE_R, ...explicit[kind] });
+        const mid = PIE_R - BORDER_PX / 2; // the border's centreline
+        expect(isBorder(rgbaAt(px, at(2, mid, -Math.PI / 2))), "no border on the plain disc").toBe(true);
+        for (const p of [0, 1]) {
+          expect(isBorder(rgbaAt(px, along(p, mid))), `the pie of physical ${p} covers its border`).toBe(true);
+          expect(isBorder(rgbaAt(px, along(p, PIE_R / 3))), `no pie inside the border of physical ${p}`).toBe(false);
+        }
+      });
+    }
+  }
+
+  // Per-frame guard (count-based): the band is one 4 B/wedge column, built with the others on an emit. A
+  // position frame uploads the moved centres alone (the band column is the array last emitted), and a zoom
+  // re-emits nothing.
+  it("webgl: a position frame uploads the centres alone, a zoom uploads nothing", async () => {
+    const h = host();
+    const { graph, modules } = pieStateNetwork();
+    const net = network(h, { width: 200, height: 200, backend: "webgl" });
+    await net.whenReady();
+    const spy = laneSpy();
+    net
+      .style({ nodeRadius: PIE_R, flowBorder: { scale: () => BORDER_PX, flow: new Float32Array([1, 1, 1]) } })
+      .stateNetwork(graph, { modules, view: "physical" })
+      .layout({ backend: "positions", positions: PIE_POS });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.render();
+    const pie = last(spy.layers().flatMap((l) => (l.primitive === "pie" ? [l.pie] : [])));
+    expect(pie?.borders?.byteLength, "the band column is not 4 B per wedge").toBe(4 * (pie?.count ?? -1));
+    const wedges = pie?.count ?? 0;
+    expect(wedges).toBe(4);
+
+    spy.reset();
+    pieColumnStats.bytes = 0;
+    net.layout({ backend: "positions", positions: PIE_POS.map((v) => v + 3) });
+    net.render();
+    expect(spy.emitted().filter((n) => n === "pie").length, "the position frame did not re-emit the pie").toBeGreaterThan(0);
+    expect(pieColumnStats.bytes, "a position frame re-uploaded more than the centres").toBe(8 * wedges);
+
+    spy.reset();
+    pieColumnStats.bytes = 0;
+    for (let f = 1; f <= 4; f++) {
+      net.setTransform({ k: 1 + f / 2, x: -f * 10, y: -f * 10 });
+      net.render();
+    }
+    expect(spy.emitted().filter((n) => n === "pie"), "a zoom re-emitted the pie").toEqual([]);
+    expect(pieColumnStats.bytes, "a zoom uploaded pie columns").toBe(0);
+    vi.restoreAllMocks();
     net.destroy();
     h.remove();
   });

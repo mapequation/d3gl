@@ -320,6 +320,12 @@ export interface InstancedPieData {
   angles: Float32Array;
   /** RGBA bytes per wedge, length `4 * count`. */
   colors: Uint8Array;
+  /** Per-wedge outer band as a fraction of its radius (#507): from `radius · (1 − border)` out to `radius`
+   *  the wedge is drawn in its own colour with RGB × {@link InstancedPieData.borderDarken}, so a node's
+   *  flow border shows each wedge's darker shade. Length `count`; absent: no band. */
+  borders?: Float32Array;
+  /** The RGB factor of the band ({@link InstancedPieData.borders}); default 1 (no darkening). */
+  borderDarken?: number;
   /** Per-instance highlight group (#162) = the wedge's **physical node id**, so a hover/select lights the
    *  whole pie (all its wedges share the id). Length `count`. */
   groups?: Float32Array;
