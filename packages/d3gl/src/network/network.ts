@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type LayerSpec, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue, resolveNodeBorder, darkenedCss } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrowLinks, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue, resolveNodeBorder, darkenedCss } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -4460,19 +4460,20 @@ export class Network extends BaseEngine {
     return cache;
   }
 
-  /** Flag every link layer (lines/arrows/half-arrows; not node circles) into the GPU pick pass (#141)
-   *  when link picking is on. Mutates the freshly-built layers in place (they're per-emit, never shared). */
+  /** Flag every link layer (lines/half-arrows; not node circles) into the GPU pick pass (#141) when link
+   *  picking is on. A directed line's head is part of its instance (#542), so a head pixel picks its link.
+   *  Mutates the freshly-built layers in place (they're per-emit, never shared). */
   private flagPickableLinks(layers: InstancedLayer[]): InstancedLayer[] {
     if (this.pickLinksEnabled)
       for (const l of layers)
-        if (l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") l.pickable = true;
+        if (l.primitive === "lines" || l.primitive === "half-arrows") l.pickable = true;
     return layers;
   }
 
   /** Attach the shader-highlight columns (#162) to the **no-LOD** full-graph layers, in place — so a
    *  hover/selection restyle is a uniform / flag-buffer update, never a geometry rebuild. Instance order
    *  is the parallel emit: the `nodes` circles layer's instance `i` is node `i`; every link layer
-   *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. The group columns (`groups` =
+   *  (`lines` — a directed one carries its head, #542 — or `half-arrows`) instance `e` is graph edge `e`. The group columns (`groups` =
    *  node id / link source id; `groups2` = the link target, undirected incident hover) are
    *  position-independent, so they come from the {@link noLodCache} (#214) — the SAME array instances
    *  across position-only frames, letting the renderer skip their per-frame upload. `selected` follows
@@ -4480,7 +4481,7 @@ export class Network extends BaseEngine {
    *  (#240), so position-only frames also skip its upload, while a selection change refreshes the GPU
    *  flags in place (via writeSelected) AND hands later emits the fresh arrays. */
   private attachNoLodHighlight(layers: InstancedLayer[], cache: NoLodStyleCache): InstancedLayer[] {
-    let linkSelected: Uint8Array | undefined; // one build shared by all link layers (lines + arrows)
+    let linkSelected: Uint8Array | undefined; // one build shared by all link layers
     for (const l of layers) {
       if (l.primitive === "circles") {
         // The only circles layer in the no-LOD path is `nodes` (no aggregate halos). Instance i = node i.
@@ -4489,11 +4490,12 @@ export class Network extends BaseEngine {
         // `both` view (#494): a hovered container (id `stateCount + p`) keeps its state dots lit.
         const groups2 = this.bothGroups2();
         if (groups2) l.circles.groups2 = groups2;
-      } else if (l.primitive === "lines" || l.primitive === "half-arrows" || l.primitive === "arrows") {
-        const link = l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows;
+      } else if (l.primitive === "lines" || l.primitive === "half-arrows") {
+        // One set of columns per link: a directed line's head dims and lights with its shaft (#542).
+        const link = l.primitive === "lines" ? l.lines : l.halfArrows;
         link.groups = cache.groupSource;
         if (cache.groupTarget) link.groups2 = cache.groupTarget;
-        link.selected = linkSelected ??= this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
+        link.selected = linkSelected ??= this.noLodSelectedFor("links");
       }
       // A "pie" layer (#171 physical view) is not part of the standard node/link set: its per-wedge groups
       // (physical node id) come from physicalPieInstances and its `selected` flags are attached where it
@@ -5260,7 +5262,6 @@ export class Network extends BaseEngine {
     for (const l of layers) {
       if (l.primitive === "circles" && l.name === this.NODE_LAYER && l.circles.offsets) l.circles.offsetsChanged = changes.nodes;
       else if (l.primitive === "lines" && l.lines.sourceOffsets) l.lines.endOffsetsChanged = changes.links;
-      else if (l.primitive === "arrows" && l.arrows.sourceOffsets) l.arrows.endOffsetsChanged = changes.links;
       else if (l.primitive === "half-arrows" && l.halfArrows.sourceOffsets) l.halfArrows.endOffsetsChanged = changes.links;
     }
   }
@@ -6133,32 +6134,26 @@ export class Network extends BaseEngine {
     // (setInteracting) and on demand (syncScreenGeometry).
     const linkMode = style.sizeMode;
     const bake = halfArrow && linkMode === "screen" ? this.transform.k || 1 : 1;
-    // The plain line-style arrowhead bakes the same way (its tip + node-boundary setback are px in
-    // screen mode); baked geometry is world-coord, so the layer renders "world" and re-bakes on zoom-end.
-    const arrowBake = !halfArrow && style.directed && linkMode === "screen" ? this.transform.k || 1 : 1;
+    // A directed `line` link is ONE filled arrow, shaft + head (#542), baked the same way: its tip setback,
+    // head and width are px in screen mode, so the outline is solved at k in world coords and re-baked on zoom-end.
+    const arrowLine = !halfArrow && style.directed;
+    const arrowBake = arrowLine && linkMode === "screen" ? this.transform.k || 1 : 1;
+    const filled = halfArrow || arrowLine;
     this.registerLayer({
       name: "links",
       data: edgeIds,
       ids: edgeIds,
-      sizeMode: halfArrow ? "world" : linkMode,
-      ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
+      sizeMode: filled ? "world" : linkMode,
+      ...(filled ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit || !drawLinks) return;
         if (halfArrow) emitHalfLinks(g, drawn, style.nodeRadii, style.linkWidthOf, style.linkBend, bake);
+        else if (arrowLine) emitArrowLinks(g, drawn, style.linkWidthOf, style.arrowSize, style.nodeRadii, style.linkBend, arrowBake);
         else emitLinks(g, drawn, style.linkWidthOf, style.linkBend);
       },
     });
-    this.registerLayer({
-      name: "arrows",
-      data: edgeIds,
-      ids: edgeIds,
-      // Baked screen-mode arrows live in world coords (like the half-arrow); world mode passes through.
-      sizeMode: arrowBake !== 1 ? "world" : linkMode,
-      fill: (e) => linkColorAt(e as number),
-      build: (g) => {
-        if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, drawn, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
-      },
-    });
+    // The arrows group stays registered (empty) for its canonical slot: only the LOD Scene path draws into it.
+    this.registerLayer({ name: "arrows", data: [], ids: [], sizeMode: linkMode, build: () => {} });
     // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the
     // slot exists in canonical order (above the links, under the nodes, #471) whichever path registers first.
     this.registerLayer({ name: "module-boundaries", data: [], ids: [], sizeMode: "world", build: () => {} });
