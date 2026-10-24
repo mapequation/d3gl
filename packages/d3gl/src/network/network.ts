@@ -15,7 +15,7 @@ import { dominantWedges, physicalPieWedges, type PhysicalPieWedges, type PieWedg
 import { rosettePositions } from "./rosette.js";
 import { packStateNodes, pickBothNodes, regionBothNodes, instanceRuns, type BothStateNodes } from "./both-layout.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
-import { lumpStateGraph, type LumpedStateNetwork, type StateNetworkGraph } from "./state-graph.js";
+import { groupFlow, lumpStateGraph, type LumpedStateNetwork, type PhysicalToState, type StateNetworkGraph } from "./state-graph.js";
 import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type LayoutContinuation, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
@@ -26,6 +26,7 @@ import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import { grownCapacity } from "../webgl/instanced.js";
 import type { NetworkGraph } from "./graph.js";
+import { planNetworkUpdate, type ModuleHierarchy, type NetworkUpdatePlan } from "./network-update.js";
 import { layoutBox, layoutFitTransform, fitCameraPath, type FitBox } from "./fit.js";
 import type { InstancedArrowsData, InstancedCirclesData, InstancedHalfArrowsData, InstancedLayer, InstancedLinesData, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
@@ -757,6 +758,22 @@ export interface NetworkDataOptions {
 }
 
 /**
+ * A change to the **flow and the modules** of the network the engine holds, for {@link Network.update} (#547): what
+ * a re-clustering (an Infomap run) gives. Indexed per node of the loaded network. A field left out is unchanged.
+ */
+export interface NetworkUpdateOptions {
+  /** The new per-node flow ({@link NetworkGraph.flow}), length `nodeCount`. The engine keeps its own copy. */
+  flow?: ArrayLike<number>;
+  /** The new module assignment, as {@link NetworkDataOptions.modules} takes it; `null` removes the modules and their
+   *  links. New modules come with their own `moduleLinks` or none: the links held until now are addressed in the
+   *  old modules' paths, so new modules without `moduleLinks` clear them. */
+  modules?: ArrayLike<ModuleNode> | null;
+  /** The new module links, as {@link NetworkDataOptions.moduleLinks} takes them; `null` removes them. Requires
+   *  modules, given here or held. */
+  moduleLinks?: ArrayLike<ModuleLink> | null;
+}
+
+/**
  * Options for {@link Network.stateNetwork} (#171). The engine ingests a state network + a per-**state-node**
  * module assignment, derives the physical network's overlapping-module pie wedges + module colours, and lets
  * you toggle the state ↔ physical view with {@link Network.view}.
@@ -849,7 +866,7 @@ const CONTAINER_RING_DARKEN = 0.62;
 const CONTAINER_RING_PX = 1;
 
 /** A state network's module hierarchy, or a plain network's (#326): the records with each node's record index. */
-type Hierarchy = { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; recordOf: Int32Array };
+type Hierarchy = ModuleHierarchy;
 
 /**
  * One of a state network's two layouts (#495): the physical graph's (drawn by the physical and both views) and the
@@ -858,10 +875,11 @@ type Hierarchy = { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<Module
  * module tree across switches.
  */
 interface ViewLayout {
-  /** The graph this layout places: `sg.physical` or `sg.state`. */
-  readonly graph: NetworkGraph;
+  /** The graph this layout places: `sg.physical` or `sg.state`, the engine's view of it after an
+   *  {@link Network.update} (#547), which keeps the layout. */
+  graph: NetworkGraph;
   /** The module hierarchy of that graph (the state view's modules), as `data(graph, { modules })` holds it. */
-  readonly hierarchy: Hierarchy | null;
+  hierarchy: Hierarchy | null;
   /** A settled run, parked with its transport alive (a drag reheats it). Never a live run: a switch stops that. */
   handle: WorkerLayoutHandle | null;
   opts: NetworkLayoutOptions;
@@ -922,6 +940,34 @@ function newStateLevel(
 /** A state-network layout that has not run yet (#495). */
 function newViewLayout(graph: NetworkGraph, hierarchy: Hierarchy | null): ViewLayout {
   return { graph, hierarchy, handle: null, opts: {}, laidOut: false, placed: false, interrupted: false, resume: null, nestedDiscs: null, moduleTree: null, moduleSprings: null, lodWorkerSource: null, camera: null, carried: false };
+}
+
+/** Forget what a layout derived from its graph's modules (#547): its module tree, springs and nested discs. */
+function dropLayoutModuleCaches(layout: ViewLayout): void {
+  layout.moduleTree = null;
+  layout.moduleSprings = null;
+  layout.nestedDiscs = null;
+}
+
+/**
+ * Each lump at its state nodes' centroid (#529, #547): `to` gets 2 coordinates per lump of `lumpToState`, from `from`
+ * with 2 per state node, or, with `at`, 2 per node `at[s]` drawn for state node `s` (the lump that held it).
+ * O(state nodes).
+ */
+function lumpCentroids(to: Float32Array, lumpToState: PhysicalToState, from: ArrayLike<number>, at?: ArrayLike<number>): void {
+  const { offsets, states } = lumpToState;
+  for (let l = 0; l + 1 < offsets.length; l++) {
+    const start = offsets[l]!, end = offsets[l + 1]!;
+    let x = 0, y = 0;
+    for (let i = start; i < end; i++) {
+      const st = states[i]!;
+      const k = at ? (at[st] ?? st) : st;
+      x += from[2 * k]!;
+      y += from[2 * k + 1]!;
+    }
+    to[2 * l] = x / (end - start);
+    to[2 * l + 1] = y / (end - start);
+  }
 }
 
 /** `opts` continued from where the nodes are (#495): a warm flat or nested start, for a view laid out on first show
@@ -1390,7 +1436,7 @@ export class Network extends BaseEngine {
   private stateData: StateNetworkGraph | null = null;
   /** The state network as given to {@link stateNetwork}, with its modules and module links (#529, #533): what
    *  {@link lump} lumps. */
-  private stateSource: { graph: StateNetworkGraph; modules: ArrayLike<ModulePathNode> | null; moduleLinks: ArrayLike<ModuleLink> | null } | null = null;
+  private stateSource: { graph: StateNetworkGraph; modules: ArrayLike<ModulePathNode> | null; moduleLinks: ArrayLike<ModuleLink> | null; recordOf: Int32Array | null } | null = null;
   /** The lumped network (#529), built the first time it is drawn and kept for the state network. */
   private lumpedNet: LumpedStateNetwork | null = null;
   /** Whether the state and both views draw {@link lumpedNet} (#529). */
@@ -1432,6 +1478,8 @@ export class Network extends BaseEngine {
   private stateModules: ArrayLike<ModulePathNode> | null = null;
   /** The engine's own module colour scheme ({@link StateNetworkOptions.color}), for the default fill. */
   private stateColorOpts: ModuleColorOptions | undefined = undefined;
+  /** The state network's pie options ({@link StateNetworkOptions.pie}): {@link update} derives the pies again (#547). */
+  private statePie: PieWedgeOptions | undefined = undefined;
   /** The module each node of a view's graph is coloured by (#494): a state node's enclosing module, a
    *  physical node's (first) module at the pie level. Built once per state network, on first use. */
   private stateNodeModules: { state: NodeModules; physical: NodeModules; wedge: Int32Array; dominant: Int32Array } | null = null;
@@ -1498,13 +1546,261 @@ export class Network extends BaseEngine {
    * Leaves any state-network mode ({@link stateNetwork}) — a plain graph replaces it.
    */
   data(graph: NetworkGraph, opts: NetworkDataOptions = {}): this {
-    const { modules, moduleLinks } = opts;
-    if (moduleLinks && !modules) throw new Error("network.data: moduleLinks requires modules");
-    const recordOf = modules ? moduleRecordIndex(graph.nodeCount, modules) : null;
-    if (modules && moduleLinks) checkModuleLinks(graph.nodeCount, modules, moduleLinks);
-    this.hierarchy = modules && recordOf ? { modules, moduleLinks, recordOf } : null;
+    // Load, then the step update() runs (#547): the module checks and the module handling live there.
+    const plan = planNetworkUpdate("network.data", graph.nodeCount, { modules: opts.modules ?? null, moduleLinks: opts.moduleLinks ?? null }, null);
     this.clearStateNetwork();
-    return this.setActiveGraph(graph);
+    this.adoptGraph(graph);
+    this.applyUpdate(plan);
+    return this.rebuild();
+  }
+
+  /**
+   * Change the **flow and the modules** of the network the engine holds (#547), keeping its nodes, links, weights and
+   * positions: what a re-clustering gives. `net.update({ flow, modules, moduleLinks })` — a field left out is
+   * unchanged, `modules: null` removes the modules and their links. Everything is checked first, as {@link data}
+   * checks its hierarchy, and a bad change throws with the engine unchanged; so does a call with no network loaded.
+   *
+   * Kept: the positions and the layout state, the camera, the selected nodes (the same ids), and the style options —
+   * spec styles (`{ by: "flow" }`, `{ by: "module" }`) re-resolve against the new flow and modules. Rebuilt: the
+   * resolved style and module colours, the module tree (and so a LOD cut drawn from it, with its module links), the
+   * module springs and the nested discs. A structural or spatial LOD tree is kept, with its sizes and colours
+   * recomputed. New modules without `moduleLinks` clear the held module links: those name the old modules' paths.
+   * New modules also drop a selected module (a LOD aggregate) of the old ones, and `on("select")` hears the selection
+   * left; an aggregate of a kept tree stays. The hover is cleared, as {@link lump} clears it.
+   *
+   * A running layout stops, as `data()` stops it, and the positions stay where it left them: continue it warm with
+   * {@link layout} if you want to. `update()` itself never lays out. The caller's arrays are never written.
+   *
+   * O(nodes + total module path length + module links) for the checks and the copied flow — no topology rebuild, no
+   * layout — plus the module tree build when a LOD cut draws modules. That build takes the path a reload takes, so
+   * the main thread blocks no longer than on one: on a plain network it runs at the end of the call chain, as
+   * {@link lod} builds one after {@link data}, so a {@link layout} chained after `update()` that builds the tree on a
+   * worker (#428) builds this one there too; nothing is drawn until it lands. On a state network the state view
+   * builds it on the main thread, as {@link stateNetwork} and a view switch do.
+   *
+   * On a {@link stateNetwork} the change is indexed per state node. The physical flow is its state nodes' sum, and
+   * the pies, module colours, the state view's modules and module links, and the both view's packing follow the new
+   * flow and modules. Every view keeps its positions, its camera and its layout state. The runs stop: the active
+   * view's is the caller's to continue, and a parked view whose run had not settled runs again, warm, when it is
+   * shown, from full heat (the heat it had reached belonged to the old flow and modules); a settled parked run is
+   * stopped. Lumped ({@link lump}), the lumps are made again from the new modules: each starts at its state nodes'
+   * centroid in the state view's picture. `update()` starts no layout, so in a lumped state view on screen the new
+   * lumps stay there until the caller's warm {@link layout}; a state view shown later settles them with a warm run of
+   * the app's last {@link layout} options, as after `lump(true)`. The selected nodes are kept, a lump's mapped
+   * through its state nodes, a both-view container's to the same physical node's.
+   */
+  update(opts: NetworkUpdateOptions): this {
+    const graph = this.graph;
+    if (!graph) throw new Error("network.update: no network loaded");
+    if (this.stateData) return this.updateState(opts);
+    const plan = planNetworkUpdate("network.update", graph.nodeCount, opts, this.hierarchy);
+    const replaced = this.replacedModuleTree(plan);
+    this.clearHover(); // as lump() clears it: the hovered glyph may be an old module
+    this.applyUpdate(plan);
+    if (this.lodOptions) {
+      if (this.lodUsesModules() && !this.moduleTreeBuilt()) {
+        // The new module tree is built as lod() builds one after data() (#428): at the end of the call chain, so
+        // a layout() chained after this call builds it on a worker instead, and the main thread blocks no longer
+        // than on a reload. Nothing is drawn until it lands.
+        this.lodTree = null;
+        this.lodModules = false;
+        this.lodHasGeometry = false;
+        this.deferLODBuild();
+      } else this.recomputeLODGeometry(); // a kept tree's sizes and colours
+    }
+    const dropped = this.dropAggregates(replaced);
+    this.rebuild();
+    if (dropped) this.announceSelection();
+    return this;
+  }
+
+  /** The module tree drawn now that `plan` replaces (#547): the engine's own, when the modules change. Null when the
+   *  cut draws no module tree, an explicit `lod({ modules })` one (kept), or the modules stay. */
+  private replacedModuleTree(plan: NetworkUpdatePlan): LODTree | null {
+    return plan.hierarchy !== undefined && this.lodModules && !this.lodOptions?.modules ? this.lodTree : null;
+  }
+
+  /**
+   * Drop the selected aggregates of `tree`, a module tree an {@link update} replaces (#547): their ids belong to the
+   * old modules. A node keeps its id. Silent: returns whether the selection changed, for the caller to announce once
+   * it has rebuilt. O(selected).
+   */
+  private dropAggregates(tree: LODTree | null): boolean {
+    const sel = this.selectedIds(this.NODE_LAYER);
+    if (!tree || !sel) return false;
+    const leaves = tree.leafCount;
+    let dropped = false;
+    for (const id of sel) if (Number(id) >= leaves) dropped = true;
+    if (!dropped) return false;
+    this.remapLaneIds(this.NODE_LAYER, (id) => (Number(id) >= leaves ? null : id));
+    this.invalidateNoLodSelected();
+    return true;
+  }
+
+  /** Announce the node layer's selection as it stands, through {@link select} (`on("select")` hears it). */
+  private announceSelection(): void {
+    const sel = this.selectedIds(this.NODE_LAYER);
+    this.select(this.NODE_LAYER, sel && sel.size > 0 ? [...sel] : null);
+  }
+
+  /**
+   * Apply a checked change to the flow and the modules ({@link planNetworkUpdate}) to the loaded graph: the step
+   * {@link update} runs, and {@link data} runs after it loads a graph (#547). Stops a running layout, as its run was
+   * pulling with the previous modules; keeps the positions and the topology caches. The engine holds its own graph
+   * view with the new flow, sharing every other buffer with the caller's graph. The caller rebuilds.
+   */
+  private applyUpdate(plan: NetworkUpdatePlan): void {
+    const graph = this.graph;
+    if (!graph) return;
+    this.haltLayout();
+    this.moved = null; // the rebuild draws the whole graph
+    if (plan.flow) this.graph = { ...graph, flow: plan.flow };
+    if (plan.hierarchy !== undefined) this.hierarchy = plan.hierarchy;
+    this.dropModuleCaches();
+    this.dropStyleCaches();
+  }
+
+  /**
+   * {@link update} on a state network (#547): the checks, the shared step ({@link applyStateUpdate}), then the active
+   * view drawn as a view switch shows it, with no layout run. Everything is checked before anything changes, so a bad
+   * change throws with the engine unchanged. O(state nodes + total module path length + module links) for the checks,
+   * the physical flow and the pies, plus a lumping (O(state nodes + state links)) while lumped, plus the drawn view's
+   * LOD tree as a view switch builds it.
+   */
+  private updateState(opts: NetworkUpdateOptions): this {
+    const source = this.stateSource;
+    const sg = this.stateData;
+    const layouts = this.viewLayouts;
+    if (!source || !sg || !layouts) return this;
+    const plan = planNetworkUpdate("network.update", source.graph.state.nodeCount, opts, this.heldStateHierarchy());
+    const view = this.activeView;
+    // Lumped, the selection of the state or both view: its state nodes (a container as `stateCount + p`), mapped to
+    // the new lumps below. New modules drop a selected state-view aggregate first: it is an old module.
+    const lumpSel = this.lumpActive && view !== "physical" ? this.selectedIds(this.NODE_LAYER) : undefined;
+    let selStates: number[] | null = null;
+    if (lumpSel && lumpSel.size > 0) {
+      const S = sg.state.nodeCount;
+      const sel = plan.hierarchy !== undefined && view === "state" ? new Set([...lumpSel].filter((id) => Number(id) < S)) : lumpSel;
+      selStates = this.mapLumpSelection(sel, false);
+      this.dropNodeInteraction();
+    }
+    // Unlumped, every id stays but a selected aggregate of the module tree the new modules replace. The app's
+    // explicit `modules` in its LOD request is dropped with them, so its tree goes too.
+    const replaced = !lumpSel && plan.hierarchy !== undefined && this.lodModules ? this.lodTree : null;
+    this.clearHover(); // as lump() clears it
+    // The runs were pulling with the previous flow and modules: they stop, and the positions stay. A parked view whose
+    // run had not settled runs again, warm, when it is shown; the active view is the caller's to continue.
+    this.haltLayout();
+    this.stopParkedLayouts(layouts[layoutFamily(view)]);
+    this.applyStateUpdate(plan);
+    const both = this.bothGraph;
+    if (!both) return this;
+    // Draw the active view as a view switch shows it ({@link applyView}), with no layout run.
+    const layout = layouts[layoutFamily(view)];
+    if (this.lumpActive && view === "state") this.restoreLayout(layout); // the new lumps' layout
+    this.lodOptions = this.stateLODRequest ? this.viewLOD(this.stateLODRequest) : null;
+    this.showGraph(view === "both" ? both : layout.graph);
+    this.hierarchy = view === "state" ? layout.hierarchy : null;
+    if (view === "both") this.syncBoth();
+    if (this.lodOptions) this.recomputeLODGeometry();
+    const dropped = this.dropAggregates(replaced);
+    this.rebuild();
+    const lumpedNet = this.lumpedNet;
+    if (lumpSel && lumpSel.size > 0 && lumpedNet) {
+      const S = lumpedNet.stateToLump.length;
+      const L = lumpedNet.graph.state.nodeCount;
+      const mapped = new Set<number>();
+      for (const id of selStates ?? []) mapped.add(id < S ? (lumpedNet.stateToLump[id] ?? id) : L + id - S);
+      this.select(this.NODE_LAYER, mapped.size > 0 ? [...mapped] : null);
+    } else if (dropped) this.announceSelection();
+    return this;
+  }
+
+  /** The state network's module hierarchy as given, indexed per state node (#547). Null without modules. */
+  private heldStateHierarchy(): ModuleHierarchy | null {
+    const source = this.stateSource;
+    return source?.modules && source.recordOf ? { modules: source.modules, moduleLinks: source.moduleLinks ?? undefined, recordOf: source.recordOf } : null;
+  }
+
+  /**
+   * Apply a checked change to the flow and the modules ({@link planNetworkUpdate}) to the loaded state network: the
+   * step {@link update} runs, and {@link stateNetwork} runs after it loads a network (#547). The engine's own views of
+   * the state and physical graphs take the new flow (the physical flow is its state nodes' sum), sharing links,
+   * weights, CSR, `stateToPhysical` and every positions buffer with the caller's, which is never written. Derives the
+   * pies, the state level's modules and module links and, lumped, new lumps: each starts at its state nodes' centroid
+   * in the state view's picture, settled warm when the state view next shows them, as after lump(true). Every view
+   * keeps its positions, camera and layout state. The caller stops the runs and draws the active view.
+   */
+  private applyStateUpdate(plan: NetworkUpdatePlan): void {
+    const source = this.stateSource;
+    const layouts = this.viewLayouts;
+    if (!source || !layouts) return;
+    const given = source.graph;
+    const graph: StateNetworkGraph = plan.flow
+      ? { ...given, state: { ...given.state, flow: plan.flow }, physical: { ...given.physical, flow: groupFlow(plan.flow, given.stateToPhysical, given.physicalCount) } }
+      : given;
+    const { state, physical } = graph;
+    const hierarchy = plan.hierarchy === undefined ? this.heldStateHierarchy() : plan.hierarchy;
+    const modules = hierarchy?.modules ?? null;
+    const moduleLinks = hierarchy?.moduleLinks ?? null;
+    // Lumped, the lumps of the new modules; otherwise they are made again when lumping is next turned on.
+    const lumpedNet = this.lumpActive ? lumpStateGraph(graph, modules, moduleLinks) : null;
+    this.moved = null; // the rebuild draws the whole graph
+    this.dropModuleCaches();
+    this.stateSource = { graph, modules, moduleLinks, recordOf: hierarchy?.recordOf ?? null };
+    // The pies from the state nodes as given: lumped or not, each wedge's share is the same.
+    this.pieWedges = modules ? physicalPieWedges(graph, modules, this.statePie) : null;
+    this.pieColumns.clear();
+    // An explicit `modules` in the app's LOD request named the previous modules, as on a new state network.
+    const request = this.stateLODRequest;
+    if (plan.hierarchy !== undefined && request?.modules) this.stateLODRequest = { ...request, modules: undefined, moduleLinks: undefined };
+    layouts.physical.graph = physical;
+    dropLayoutModuleCaches(layouts.physical);
+    // The state level as given, drawn or parked, keeps its layout under the new flow and modules.
+    const sg = this.stateData;
+    const both = this.bothGraph;
+    const asGiven = this.lumpActive ? this.otherLevel : sg && both && { data: sg, modules: this.stateModules, layout: layouts.state, both };
+    const givenLevel: StateLevel | null = asGiven ? { data: graph, modules, layout: asGiven.layout, both: { ...state, positions: asGiven.both.positions } } : null;
+    if (givenLevel) {
+      givenLevel.layout.graph = state;
+      givenLevel.layout.hierarchy = hierarchy;
+      dropLayoutModuleCaches(givenLevel.layout);
+    }
+    if (lumpedNet) {
+      // New lumps, one state-view picture (#529): each starts at its state nodes' centroid, where their old lumps are
+      // drawn, and the state view settles them warm when it next shows them, as after lump(true).
+      const left = layouts.state;
+      const next = newStateLevel(lumpedNet.graph, lumpedNet.modules, lumpedNet.moduleLinks);
+      const old = this.lumpedNet;
+      if (left.placed && old) {
+        lumpCentroids(next.layout.graph.positions, lumpedNet.lumpToState, left.graph.positions, old.stateToLump);
+        next.layout.placed = true;
+        next.layout.carried = true;
+        next.layout.camera = left.camera;
+      }
+      this.otherLevel = givenLevel;
+      this.lumpedNet = lumpedNet;
+      this.stateData = lumpedNet.graph;
+      this.stateModules = lumpedNet.modules;
+      layouts.state = next.layout;
+      this.bothGraph = next.both;
+    } else if (givenLevel) {
+      this.otherLevel = null; // the old lumps
+      this.lumpedNet = null;
+      this.stateData = graph;
+      this.stateModules = modules;
+      this.bothGraph = givenLevel.both;
+    }
+    // Derived from the flow and the modules drawn: rebuilt as they are next needed.
+    this.bothPack = null;
+    this.bothBaked = null;
+    this.pendingOffsetChanges = null;
+    this.containerRadii = null;
+    this.containerColumns = null;
+    this.containerSelected = null;
+    this.bothNodeGroups2 = null;
+    this.stateNodeModules = null;
+    this.stateFills = null;
   }
 
   /** Drop the state-network mode and everything derived from it (#494). */
@@ -1531,24 +1827,33 @@ export class Network extends BaseEngine {
     this.pieColumns.clear(); // the previous network's wedges
   }
 
-  /** Point the engine at `graph` and drop the per-graph caches (LOD tree, resolved style, parent cache).
-   *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
-   *  `data` it does NOT clear the state-network mode. */
-  private setActiveGraph(graph: NetworkGraph): this {
-    this.adoptGraph(graph);
-    return this.rebuild();
-  }
-
-  /** {@link setActiveGraph} without its rebuild: the caller rebuilds once it is done with the new graph. */
+  /** Point the engine at `graph` and drop the per-graph caches (layout, module tree, LOD tree, resolved style,
+   *  parent cache); unlike {@link data} it does NOT clear the state-network mode. The caller rebuilds once it is
+   *  done with the new graph. */
   private adoptGraph(graph: NetworkGraph): void {
     this.haltLayout(); // any worker layout is tied to the previous graph's buffers
     // …and so is everything the previous graph was laid out with.
+    this.dropModuleCaches();
+    this.laidOut = false;
+    this.showGraph(graph);
+  }
+
+  /** Drop what the graph's modules derive for its layouts (#547): the module tree, its springs, the nested discs. */
+  private dropModuleCaches(): void {
     this.moduleTreeCache = null;
     this.moduleSpringsCache = null;
     this.cancelModuleTreeJob();
-    this.laidOut = false;
     this.nestedDiscs = null;
-    this.showGraph(graph);
+  }
+
+  /** Drop the resolved style and what it derives from the flow and the modules (#547): ring and module colours,
+   *  module-boundary widths, link colours. */
+  private dropStyleCaches(): void {
+    this.lodBorderStyle = null; // the tree's ring colours
+    this.moduleAggregateFill = null; // and its module colours (#494)
+    this.boundaryWidths = null; // and its module-boundary widths
+    this.resolvedCache = null;
+    this.linkColors = null;
   }
 
   /**
@@ -1573,9 +1878,7 @@ export class Network extends BaseEngine {
       this.styleOpts = { ...this.styleOpts, nodeRadius: undefined };
     }
     // New topology + position buffer: drop the retained LOD tree and the resolved-style cache.
-    this.lodBorderStyle = null; // the previous graph's tree and its ring colours
-    this.moduleAggregateFill = null; // and its module colours (#494)
-    this.boundaryWidths = null; // and its module-boundary widths
+    this.dropStyleCaches();
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodWorkerSource = null;
@@ -1586,8 +1889,6 @@ export class Network extends BaseEngine {
     this.lodSpatial = false;
     this.lodModules = false;
     this.lodHasGeometry = false;
-    this.resolvedCache = null;
-    this.linkColors = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     this.fitBound = null; // tied to the old graph
   }
@@ -1619,40 +1920,32 @@ export class Network extends BaseEngine {
    * modules take its place.
    */
   stateNetwork(graph: StateNetworkGraph, opts: StateNetworkOptions = {}): this {
-    const { modules, moduleLinks } = opts;
-    if (moduleLinks && !modules) throw new Error("network.stateNetwork: moduleLinks requires modules");
-    const recordOf = modules ? moduleRecordIndex(graph.state.nodeCount, modules) : null;
-    if (modules && moduleLinks) checkModuleLinks(graph.state.nodeCount, modules, moduleLinks);
+    // Load the network without modules, then the step update() runs (#547): the module checks and the module
+    // handling live there. Checked first, so a bad hierarchy throws with the engine unchanged.
+    const plan = planNetworkUpdate("network.stateNetwork", graph.state.nodeCount, { modules: opts.modules ?? null, moduleLinks: opts.moduleLinks ?? null }, null);
     // Interaction state belongs to the previous network's ids: drop it before the new graph draws.
     if (this.stateData) this.dropNodeInteraction();
     this.clearStateNetwork();
-    this.stateSource = { graph, modules: modules ?? null, moduleLinks: moduleLinks ?? null };
-    // Lumped (#529): the state and both views draw the lumps; the physical view, its pies included, is the same.
-    this.lumpedNet = opts.lump ? lumpStateGraph(graph, modules, moduleLinks) : null;
-    this.lumpActive = this.lumpedNet !== null;
-    const level = this.lumpedNet
-      ? newStateLevel(this.lumpedNet.graph, this.lumpedNet.modules, this.lumpedNet.moduleLinks)
-      : newStateLevel(graph, modules ?? null, moduleLinks ?? null, recordOf);
-    this.stateData = level.data;
+    this.stateSource = { graph, modules: null, moduleLinks: null, recordOf: null };
+    // Lumped (#529): the state and both views draw the lumps, which the apply step makes; the physical view, its pies
+    // included, is the same. The state level as given is made when lumping is turned off.
+    this.lumpActive = opts.lump ?? false;
+    const level = this.lumpActive ? null : newStateLevel(graph, null, null, null);
+    this.stateData = graph;
+    this.stateModules = null;
+    this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: level?.layout ?? newViewLayout(graph.state, null) };
+    this.bothGraph = level?.both ?? graph.state; // lumped, the lumps' both graph takes its place below
     this.activeView = opts.view ?? "physical";
     this.rosetteRadius = opts.rosetteRadius ?? null;
-    // The app's LOD request holds (#495), as data() keeps it; an explicit `modules` alias in it was keyed to the
-    // previous state graph, so the new network's own hierarchy takes its place.
-    const request = this.stateLODRequest;
-    this.stateLODRequest = request?.modules ? { ...request, modules: undefined, moduleLinks: undefined } : request;
+    this.stateColorOpts = opts.color;
+    this.statePie = opts.pie;
+    // The app's LOD request holds (#495), as data() keeps it; the apply step drops an explicit `modules` alias in it,
+    // keyed to the previous state graph, so the new network's own hierarchy takes its place.
     this.lodOptions = null;
     this.hierarchy = null;
-    // Without modules (#494): no pies and no module colours; every view still draws.
-    this.stateModules = level.modules;
-    this.stateColorOpts = opts.color;
-    // The pies from the state nodes as given: lumped or not, each wedge's share is the same.
-    this.pieWedges = opts.modules ? physicalPieWedges(graph, opts.modules, opts.pie) : null;
-    this.viewLayouts = { physical: newViewLayout(graph.physical, null), state: level.layout };
-    this.bothGraph = level.both;
-    // Packed when the both view is first shown ({@link syncBoth}), and again on a style change of its radii (#509).
-    this.bothPack = null;
-    this.bothBaked = null;
-    this.containerRadii = null;
+    // Without modules (#494): no pies and no module colours; every view still draws. Packed when the both view is
+    // first shown ({@link syncBoth}), and again on a style change of its radii (#509).
+    this.applyStateUpdate(plan);
     this.applyView(null);
     return this;
   }
@@ -1721,15 +2014,8 @@ export class Network extends BaseEngine {
       const from = left.graph.positions;
       const to = next.layout.graph.positions;
       const { offsets, states } = lumped.lumpToState;
-      if (on) {
-        for (let l = 0; l + 1 < offsets.length; l++) {
-          const start = offsets[l]!, end = offsets[l + 1]!;
-          let x = 0, y = 0;
-          for (let i = start; i < end; i++) { const st = states[i]!; x += from[2 * st]!; y += from[2 * st + 1]!; }
-          to[2 * l] = x / (end - start);
-          to[2 * l + 1] = y / (end - start);
-        }
-      } else {
+      if (on) lumpCentroids(to, lumped.lumpToState, from);
+      else {
         // The lumps as the state nodes' "physical" level: a rosette of each lump's state nodes around it.
         const L = lumped.graph.state.nodeCount;
         const around: StateNetworkGraph = { state: next.data.state, physical: left.graph, stateToPhysical: lumped.stateToLump, physicalToState: lumped.lumpToState, physicalCount: L };
@@ -1965,14 +2251,16 @@ export class Network extends BaseEngine {
   }
 
   /** Stop the layout parked by a view switch (#495), and drop any run it would resume: {@link stopLayout}, a new
-   *  state network, or the engine destroyed. */
-  private stopParkedLayouts(): void {
+   *  state network, or the engine destroyed. With `active`, the layout of the view drawn ({@link update}, #547): the
+   *  other views' runs that had not settled run again, warm and from full heat, when their view is shown — the heat
+   *  they had reached belonged to the previous flow and modules. */
+  private stopParkedLayouts(active?: ViewLayout): void {
     const layouts = this.viewLayouts;
     if (!layouts) return;
     for (const layout of [layouts.physical, layouts.state, ...(this.otherLevel ? [this.otherLevel.layout] : [])]) {
       layout.handle?.stop();
       layout.handle = null;
-      layout.interrupted = false;
+      if (!active || layout === active) layout.interrupted = false;
       layout.resume = null;
     }
   }
