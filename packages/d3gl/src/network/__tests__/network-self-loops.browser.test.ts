@@ -8,8 +8,8 @@ import { DROP_HALF_SPREAD, DROP_LENGTH } from "../../core/loop-drop.js";
  * shows its arrowhead; the half-arrow style draws it too; hovering or clicking the loop reports the self-link.
  *
  * Node 0 (at x = 60) has a self-link and one neighbour, node 1 (at x = 140), so its loop points away from it,
- * towards −x: its round far end, the drop's `B(½)`, sits `r·cos α·(2 + 6·DROP_LENGTH)/8` left of the centre, outside
- * the node.
+ * towards −x. The loop runs from the node's centre back to it; its round far end, the drop's `B(½)`, sits
+ * `¾·DROP_LENGTH·cos α·r` left of the centre, outside the node.
  */
 
 const W = 200;
@@ -18,7 +18,23 @@ const SIZE_MODES = ["screen", "world"] as const;
 const R = 10;
 const CX = 60;
 const CY = 100;
-const APEX_X = CX - (R * Math.cos(DROP_HALF_SPREAD) * (2 + 6 * DROP_LENGTH)) / 8;
+const APEX_X = CX - 0.75 * DROP_LENGTH * Math.cos(DROP_HALF_SPREAD) * R;
+
+/** Where the drop's first leg (the upper one, y < CY) crosses the circle of radius `d` round node 0: the cubic
+ *  `c, c + L·u(π + α), c + L·u(π − α), c` (offsets from the centre), bisected on t ∈ (0, ½). */
+function legAt(d: number): [number, number] {
+  const L = DROP_LENGTH * R;
+  const ax = -L * Math.cos(DROP_HALF_SPREAD), ay = -L * Math.sin(DROP_HALF_SPREAD);
+  const at = (t: number): [number, number] => [3 * (1 - t) * t * ax, 3 * (1 - t) * t * (1 - 2 * t) * ay];
+  let lo = 0, hi = 0.5;
+  for (let k = 0; k < 40; k++) {
+    const mid = 0.5 * (lo + hi);
+    if (Math.hypot(...at(mid)) < d) lo = mid;
+    else hi = mid;
+  }
+  const [x, y] = at(lo);
+  return [CX + x, CY + y];
+}
 const POSITIONS = new Float32Array([CX, CY, 140, CY]);
 
 function host(): HTMLElement {
@@ -29,7 +45,8 @@ function host(): HTMLElement {
   return el;
 }
 
-/** How many pixels of the rendered frame in the box are the link colour (red) — the loop sits there alone. */
+/** How many pixels of the rendered frame in the box are the link colour (red) — the loop sits there alone. Each
+ *  counts by its alpha: over the frame's transparent background an edge pixel is pure red at partial coverage. */
 async function redPixels(png: string, x0: number, y0: number, x1: number, y1: number): Promise<number> {
   const img = new Image();
   img.src = png;
@@ -43,7 +60,7 @@ async function redPixels(png: string, x0: number, y0: number, x1: number, y1: nu
   const s = img.width / W;
   const d = ctx.getImageData(Math.round(x0 * s), Math.round(y0 * s), Math.round((x1 - x0) * s), Math.round((y1 - y0) * s)).data;
   let n = 0;
-  for (let i = 0; i < d.length; i += 4) if ((d[i] ?? 0) > 180 && (d[i + 1] ?? 0) < 90 && (d[i + 2] ?? 0) < 90) n++;
+  for (let i = 0; i < d.length; i += 4) if ((d[i] ?? 0) > 180 && (d[i + 1] ?? 0) < 90 && (d[i + 2] ?? 0) < 90) n += (d[i + 3] ?? 255) / 255;
   return n / (s * s);
 }
 
@@ -177,6 +194,23 @@ describe("self-link loops (#505)", () => {
     net.destroy();
   });
 
+  for (const backend of BACKENDS)
+    for (const sizeMode of SIZE_MODES)
+      it(`${backend} / ${sizeMode}: the loop leaves the node from its centre: no gap at the rim, both legs alike`, async () => {
+        const net = await draw({ backend, sizeMode, directed: false });
+        const png = frame(net, backend);
+        // Just outside the rim, where each leg crosses it: the link colour, no background between loop and node.
+        const [ux, uy] = legAt(R + 1.5);
+        const upper = await redPixels(png, ux - 1.5, uy - 1.5, ux + 1.5, uy + 1.5);
+        const lower = await redPixels(png, ux - 1.5, 2 * CY - uy - 1.5, ux + 1.5, 2 * CY - uy + 1.5);
+        // Symmetric about the loop's axis (row CY): the halves above and below it hold the same red.
+        const above = await redPixels(png, 0, CY - 30, CX, CY);
+        const below = await redPixels(png, 0, CY, CX, CY + 30);
+        net.destroy();
+        expect(upper).toBeGreaterThan(4);
+        expect(lower).toBeGreaterThan(4);
+        expect(Math.abs(above - below)).toBeLessThan(0.1 * Math.max(above, below));
+      });
   for (const backend of BACKENDS)
     for (const sizeMode of SIZE_MODES)
       it(`${backend} / ${sizeMode}: the half-arrow loop's band is one link width thick at its far end`, async () => {
