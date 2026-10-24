@@ -186,7 +186,7 @@ describe("arrowShaft (strip)", () => {
       const p = params(4, 3, bend);
       const back = p.radius + headLength(3);
       const c = linkCubic(p, back);
-      const [, , , , p2x, p2y, p3x, p3y] = c;
+      const [, , , , p2x = NaN, p2y = NaN, p3x = NaN, p3y = NaN] = c;
       // E1 sits `back` out of the target centre, and P2 − P3 points along E1 − c1: the end tangent is radial.
       expect(Math.hypot(p3x - p.tx, p3y - p.ty)).toBeCloseTo(back, 9);
       expect((p2x - p3x) * (p3y - p.ty) - (p2y - p3y) * (p3x - p.tx)).toBeCloseTo(0, 9);

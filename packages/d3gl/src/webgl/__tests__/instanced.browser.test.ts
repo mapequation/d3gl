@@ -292,7 +292,7 @@ describe("whole arrows on the line lane (#542)", () => {
     draw(device, framebuffer, lines);
     const h = new Float64Array(6);
     arrowHead(h, 0, a); // left barb, tip, right barb
-    const [lx, ly, tx, ty, rx, ry] = Array.from(h);
+    const [lx = NaN, ly = NaN, tx = NaN, ty = NaN, rx = NaN, ry = NaN] = h;
     const ux = (tx - (lx + rx) / 2) / 8; // head axis (length 2·size = 8)
     const uy = (ty - (ly + ry) / 2) / 8;
     expect(Math.hypot(tx - a.tx, ty - a.ty)).toBeCloseTo(a.radius, 5);
