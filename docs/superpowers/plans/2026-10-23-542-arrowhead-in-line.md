@@ -178,3 +178,40 @@ A zoom frame with LOD off uploads nothing before and after (assert in network-sw
 - Half-arrow style: the same curve as the undirected loop; before reaching the node, the outer part of the line
   ends and forms the half-arrowhead (barb rule), tapering to the tip on the rim.
 - Example (#528): the Arrow / Half-arrow choice is only for directed links (done in b54ffb7f).
+
+## One link geometry for every link (user, 2026-10-24) — supersedes the loop drawing above where they differ
+
+Self-links and other links use the SAME maths and drawing functions; only three parameters differ.
+
+**Centreline.** Every link is the cubic `K(t)` from the source centre `P0` to the target centre `P3`, with legs
+`C1 = P0 + ℓ·u(θ + β)` and `C2 = P3 + ℓ·u(θ + π − β)` (`u(a) = (cos a, sin a)`).
+
+| | θ | β | ℓ |
+|---|---|---|---|
+| link (`linkBend` = b) | chord angle | `atan(2b)` | `⅔·|chord|·√(¼ + b²)` → 0 with the chord (straight in the limit) |
+| self-link | loop axis φ − 90° | 90° + α (α = 35°) | `3.75·r`, fixed |
+
+The link row is today's quadratic, degree-elevated (the same curve); the self-link row is today's undirected loop.
+
+**Tip and head axis.** `t*` is where `K` last crosses the target rim: `|K(t*) − P3| = r`. Tip `T = K(t*)`, axis
+`τ = K'(t*)/|K'(t*)|`. Straight link: `t* = 1 − r/|chord|` (as today). Self-link: `t* = 0.893663`, a constant (every
+loop is a similarity of one drop); `τ` is 7.95° off the inward radial. Bent link: 3 Newton steps from
+`t0 = 1 − r/|K'(1)|` (exact to 1e-6 on the test cases). Bent links' heads change against the centre-tangent rule of
+08ba33d4: 2–20° (short, strongly bent links most), tip moves ≤ 2 px.
+
+**Arrow (line style).** Head: length `2·size`, half-width `w/2 + 2√w`, base centre `B = T − 2·size·τ`. Shaft: split
+`K` at `t*` (de Casteljau: `S0 = P0`, `S1 = P0 + t*(C1 − P0)`, `S2 = T − (t*/3)·K'(t*)`), then pull its end back
+along `τ` to `B`: the shaft is the cubic `S0, S1, S2, B`. `S2` is on the axis, so the shaft enters the head along it:
+no step, no corner. Valid while `2·size < |T − S2| = (t*/3)|K'(t*)|` (self-link: 2.31·r); beyond, the head is
+capped there.
+
+**Width.** Each sample of the shaft is offset by `±w/2` along its normal (constant width; the strip on WebGL, the
+same samples in the Canvas/SVG outline).
+
+**Half-arrow.** Inner edge: the same split-and-pulled-back cubic, ending at `B' = T − h·τ`, `h` the half-arrow head
+length, then straight to `T`. Outer edge: the inner edge offset by `w` along its outward normal (sampled, exact
+constant width), up to the base, out by the barb `2√w`, then straight to `T`. A self-link's inner edge is the
+undirected loop up to the rim, so the band is symmetric except for its head.
+
+**Cost.** Per vertex: the rim solve (3 Newton steps, ~30 flops; skipped for straight links, a constant for loops)
+and one split (~20 flops). No new attributes, buffers or passes; O(links × samples) as today.
