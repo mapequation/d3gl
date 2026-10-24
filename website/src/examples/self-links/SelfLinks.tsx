@@ -2,11 +2,12 @@ import Example from "../../components/Example.js";
 import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
-/** Self-links drawn as loops on a small directed network. Switch the link style and the sizing mode. */
+/** Self-links drawn as loops on a modular weighted network. Toggle directed / undirected, switch the link style and the sizing mode. */
 export default function SelfLinks() {
   return (
     <Example
       controls={[
+        { type: "segmented", key: "links", label: "Links", options: ["Directed", "Undirected"] },
         { type: "segmented", key: "style", label: "Style", options: ["Half-arrow", "Arrow"] },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["World", "Screen"] },
       ]}

@@ -1,35 +1,39 @@
 import { network, buildGraph } from "@mapequation/d3gl/network";
-import { scaleLinear } from "d3-scale";
+import { scaleLinear, scaleOrdinal, scaleSqrt } from "d3-scale";
+import { schemeTableau10 } from "d3-scale-chromatic";
 import type { ImperativeSetup } from "../types.js";
-import { buildSelfLinkGraph, BOUNDS } from "./data.js";
+import { buildSelfLinkGraph } from "./data.js";
 
 /**
  * **Self-links** draw as a loop at their node, placed opposite the mean direction of the node's neighbours,
- * and styled like the other links. Switch the link **Style** and the **Sizing** mode, and the **backend** (WebGL / Canvas / SVG).
+ * and styled like the other links: the loop's width follows its weight. Toggle **Directed** / **Undirected**,
+ * switch the link **Style** and the **Sizing** mode, and the **backend** (WebGL / Canvas / SVG).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
-  const { minX, maxX, minY, maxY } = BOUNDS;
-  const k = Math.min(width / (maxX - minX), height / (maxY - minY)) * 0.95;
-  net.setTransform({ k, x: width / 2 - ((minX + maxX) / 2) * k, y: height / 2 - ((minY + maxY) / 2) * k });
-  net.enableZoom([k * 0.3, k * 12]);
+  net.enableZoom([0.1, 12]);
 
   const g = buildSelfLinkGraph();
   const graph = buildGraph({ nodeCount: g.nodeCount, source: g.source, target: g.target, weight: g.weight, directed: true });
-  net.data(graph).layout({ backend: "positions", positions: g.positions });
+  const color = scaleOrdinal(schemeTableau10);
+  const radius = scaleSqrt().domain([1, 12]).range([5, 12]);
+  const linkWidth = scaleLinear().domain([1, 5]).range([1, 5]);
+  const linkColor = scaleLinear<string>().domain([1, 5]).range(["#b8c7dc", "#3a5a8c"]);
 
-  const linkWidth = scaleLinear().domain([1, 4]).range([2, 7]);
-  const linkColor = scaleLinear<string>().domain([1, 4]).range(["#9ecae1", "#2171b5"]);
+  net
+    .data(graph)
+    .interactive({ hover: true })
+    .layout({ backend: "worker", iterations: 300, fit: true });
 
   return {
     engine: net,
     render: (options) => {
       net.style({
-        directed: true,
+        directed: options.links === "Directed",
         linkStyle: options.style === "Arrow" ? "line" : "half-arrow",
         sizeMode: options.sizing === "Screen" ? "screen" : "world",
-        nodeRadius: 18,
-        nodeFill: "#f28e2b",
+        nodeRadius: { by: "degree", scale: radius },
+        nodeFill: (i) => color(String(g.module[i])),
         linkWidth, // ∝ weight, loops included
         linkStroke: linkColor,
       });
