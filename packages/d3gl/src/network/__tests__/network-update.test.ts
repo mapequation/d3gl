@@ -39,16 +39,17 @@ describe("planNetworkUpdate (#547)", () => {
     expect(() => planNetworkUpdate("network.update", 4, { flow: [1, 2, 3] }, null)).toThrow(/network\.update: flow length 3 !== nodeCount 4/);
   });
 
-  it("new modules keep the held module links, checked against them", () => {
+  it("new modules without module links clear the held ones: they are addressed in the old modules' paths", () => {
     const plan = planNetworkUpdate("t", 4, { modules: PAIRS }, held());
     expect(plan.hierarchy?.modules).toBe(PAIRS);
-    expect(plan.hierarchy?.moduleLinks).toBe(LINKS);
+    expect(plan.hierarchy?.moduleLinks).toBeUndefined();
     expect(Array.from(plan.hierarchy?.recordOf ?? [])).toEqual([0, 1, 2, 3]);
-    // A held link to the leaf 1:2: still a leaf of PAIRS, but of no module in a hierarchy of four singletons.
+    // A held link to the leaf 1:2 is no endpoint of a hierarchy of four singletons, and is not checked against it.
     const leafLinked = planNetworkUpdate("t", 4, { modules: MODULES, moduleLinks: [{ source: [1, 2], target: [2], flow: 1 }] }, null).hierarchy ?? fail();
-    expect(() => planNetworkUpdate("t", 4, { modules: PAIRS }, leafLinked)).not.toThrow();
     const singletons: ModuleNode[] = [0, 1, 2, 3].map((id) => ({ id, path: [id + 1, 1] }));
-    expect(() => planNetworkUpdate("t", 4, { modules: singletons }, leafLinked)).toThrow(/endpoint 1:2/);
+    expect(planNetworkUpdate("t", 4, { modules: singletons }, leafLinked).hierarchy?.moduleLinks).toBeUndefined();
+    // New links with new modules are checked against the new modules.
+    expect(() => planNetworkUpdate("t", 4, { modules: singletons, moduleLinks: leafLinked.moduleLinks }, leafLinked)).toThrow(/endpoint 1:2/);
   });
 
   it("new module links on the held modules", () => {
