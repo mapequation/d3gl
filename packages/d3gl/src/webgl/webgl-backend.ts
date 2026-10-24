@@ -4,12 +4,12 @@ import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, VectorLayer, RenderDelta, ViewTransform, InstancedLayer, InstancedHighlight } from "../core/index.js";
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector, TextData } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
-import { InstancedCircles, InstancedPie, InstancedLines, InstancedHalfArrows } from "./instanced.js";
+import { InstancedCircles, InstancedPie, InstancedLines, InstancedHalfArrows, InstancedLoops } from "./instanced.js";
 import { IndexedLines, IndexedHalfArrows } from "./indexed-links.js";
 import { PickReadback } from "./pick-readback.js";
 
 /** A link layer's renderer: by instance (attribute arrays) or by edge id (#447, per-edge tables). */
-type LinkRenderer = InstancedLines | InstancedHalfArrows | IndexedLines | IndexedHalfArrows;
+type LinkRenderer = InstancedLines | InstancedHalfArrows | InstancedLoops | IndexedLines | IndexedHalfArrows;
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
@@ -259,8 +259,8 @@ export class WebGLBackend implements Backend {
     this.instanced.get(layer.name)?.destroy();
     // Link layers (lines/arrows/half-arrows) may opt into the GPU-readback pick pass (#141); the
     // primitive builds an extra id-encoded pick model when `pick` is set. Node glyphs (circles, pie) never do.
-    // A link layer with an `index` (#447) draws by edge id from per-edge tables (indexed-links.ts). Lines, whole
-    // arrows and self-link loops share the line lane, the primitive (a loop layer's `head`) picking the program (#542).
+    // A link layer with an `index` (#447) draws by edge id from per-edge tables (indexed-links.ts). Lines and whole
+    // arrows share the line lane, the primitive picking the program; self-link loops have their own lane (#542).
     const pick =
       (layer.primitive === "lines" || layer.primitive === "arrows" || layer.primitive === "half-arrows" || layer.primitive === "loops") && !!layer.pickable;
     let r: InstancedCircles | InstancedPie | LinkRenderer;
@@ -275,7 +275,7 @@ export class WebGLBackend implements Backend {
       r = h.index ? new IndexedHalfArrows(this.device, h, this.width, this.height, pick) : new InstancedHalfArrows(this.device, h, this.width, this.height, pick);
       r.setPickBase(layer.pickBase ?? 0);
     } else if (layer.primitive === "loops") {
-      r = new InstancedLines(this.device, layer.loops, this.width, this.height, pick);
+      r = new InstancedLoops(this.device, layer.loops, this.width, this.height, pick);
       r.setPickBase(layer.pickBase ?? 0);
     } else {
       r = layer.primitive === "pie" ? new InstancedPie(this.device, layer.pie, this.width, this.height) : new InstancedCircles(this.device, layer.circles, this.width, this.height);
@@ -291,8 +291,8 @@ export class WebGLBackend implements Backend {
 
   /**
    * Update-in-place for instanced layers: if the layer already exists as the matching
-   * primitive type, call `update()` (GPU sub-upload, no teardown). Lines/arrows/half-arrows
-   * return `false` from `update()` when a structural property changed (samples, head, link vs loop, indexed or not)
+   * primitive type, call `update()` (GPU sub-upload, no teardown). Lines/arrows/half-arrows/loops
+   * return `false` from `update()` when a structural property changed (samples, head, indexed or not)
    * — fall back to `setInstancedLayer` (destroy+recreate) in that case. Also recreates when the
    * primitive type changes (e.g. lines → arrows) OR when the layer's `pickable` state no longer
    * matches the existing renderer's pick-model presence (toggling `pickLinks` builds/drops the
@@ -322,7 +322,7 @@ export class WebGLBackend implements Backend {
       else if (layer.primitive === "arrows" && existing instanceof InstancedLines) updated = existing.update(this.device, layer.arrows, "arrow");
       else if (layer.primitive === "arrows" && existing instanceof IndexedLines) updated = existing.update(this.device, layer.arrows, true);
       else if (layer.primitive === "half-arrows" && (existing instanceof InstancedHalfArrows || existing instanceof IndexedHalfArrows)) updated = existing.update(this.device, layer.halfArrows);
-      else if (layer.primitive === "loops" && existing instanceof InstancedLines) updated = existing.update(this.device, layer.loops);
+      else if (layer.primitive === "loops" && existing instanceof InstancedLoops) updated = existing.update(this.device, layer.loops);
     }
     if (updated && existing && !(existing instanceof InstancedCircles) && !(existing instanceof InstancedPie) && layer.primitive !== "circles" && layer.primitive !== "pie") {
       existing.setSizeMode(layer.sizeMode ?? "world");

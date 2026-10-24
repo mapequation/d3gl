@@ -3,7 +3,7 @@ import type { Buffer, Device, RenderPass } from "@luma.gl/core";
 import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_HEAD_LINE_VS, INSTANCED_HALF_ARROW_VS, INSTANCED_LOOP_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
 import { LOOP_LEG, loopStubLength, loopsSpreadCot } from "../core/loop-drop.js";
-import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedHalfArrowsData, InstancedLoopsData, InstancedHighlight } from "../core/index.js";
+import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedHalfArrowsData, InstancedLoopsData, InstancedLoopHead, InstancedHighlight } from "../core/index.js";
 
 /** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
  *  `groups2` is the link's OTHER endpoint (target), so an undirected hover matches incident links on either
@@ -678,34 +678,14 @@ export function headLineTemplate(samples: number): Float32Array {
 }
 
 /**
- * What the shared line lane draws at a link's end (#542), fixed per layer by its primitive: `"none"` a `lines`
- * layer (headless), `"arrow"` an `arrows` layer (whole arrows), `"half"` a `half-arrows` layer's self-link loops
- * (the half-arrow band and its one-sided head; a `half-arrows` link layer runs {@link InstancedHalfArrows}).
+ * What the line lane draws at a link's end (#542), fixed per layer by its primitive: `"none"` a `lines` layer
+ * (headless), `"arrow"` an `arrows` layer (whole arrows). Self-link loops run {@link InstancedLoops}, `half-arrows`
+ * links {@link InstancedHalfArrows}.
  */
-export type LinkHead = "none" | "arrow" | "half";
+export type LinkHead = "none" | "arrow";
 
-/** The line lane's columns: a `lines` layer's, or an `arrows` layer's (with `radii` and `arrowSize`). A `loops`
- *  layer's are read into this shape by {@link loopLaneColumns}. */
+/** The line lane's columns: a `lines` layer's, or an `arrows` layer's (with `radii` and `arrowSize`). */
 export type LineLaneData = InstancedLinesData & { radii?: Float32Array; arrowSize?: number };
-
-/** A `loops` layer's columns as the line program reads them (#542): the node centre at both ends, the rim ends as the
- *  end offsets, no bends (the leg length is the `u_loopLeg` uniform). Refilled IN PLACE on each update of the layer
- *  (`out`), so a loop frame allocates nothing; the arrays are the layer's own. */
-function loopLaneColumns(d: InstancedLoopsData, out?: LineLaneData): LineLaneData {
-  if (!out) return { sources: d.centers, targets: d.centers, widths: d.widths, colors: d.colors, samples: d.samples, groups: d.groups, selected: d.selected, sourceOffsets: d.startOffsets, targetOffsets: d.endOffsets, endOffsetsChanged: d.offsetsChanged, count: d.count };
-  out.sources = d.centers;
-  out.targets = d.centers;
-  out.widths = d.widths;
-  out.colors = d.colors;
-  out.samples = d.samples;
-  out.groups = d.groups;
-  out.selected = d.selected;
-  out.sourceOffsets = d.startOffsets;
-  out.targetOffsets = d.endOffsets;
-  out.endOffsetsChanged = d.offsetsChanged;
-  out.count = d.count;
-  return out;
-}
 
 /**
  * The self-link loop's strip (#542, `INSTANCED_LOOP_VS`): (−1, ±1) the pair at the node centre, the
@@ -713,7 +693,7 @@ function loopLaneColumns(d: InstancedLoopsData, out?: LineLaneData): LineLaneDat
  * vertices); `"arrow"`: (2, 1) left barb, (2, −1) right barb, (3, 0) tip, as {@link headLineTemplate} (`2·M + 5`);
  * `"half"`: (3, 0) tip, (2, 1) barb, whose two triangles off the last pair tile the one-sided head (`2·M + 4`).
  */
-export function loopTemplate(samples: number, head: LinkHead): Float32Array {
+export function loopTemplate(samples: number, head: InstancedLoopHead["head"]): Float32Array {
   const cubic = lineTemplate(samples);
   const end = head === "none" ? [4, -1, 4, 1] : head === "arrow" ? [2, 1, 2, -1, 3, 0] : [3, 0, 2, 1];
   const t = new Float32Array(4 + cubic.length + end.length);
@@ -793,47 +773,35 @@ export class InstancedLines {
   private target: Buffer;
   private widthBuf: Buffer;
   private color: Buffer;
-  /** The per-link bends; null on a `loops` layer, whose program reads no `a_bend` (#542). */
-  private bend: Buffer | null;
+  private bend: Buffer;
   /** The ends' offsets (#509); the constant zero without them. */
   private readonly ends = new EndOffsets();
   /** The layer's head (#542), fixed per layer by its primitive: a change recreates (like `samples`). */
   readonly head: LinkHead;
-  /** A whole-arrow link layer (#542, `"arrow"` and no loop): the headed program. */
-  private readonly headed: boolean;
-  /** The target radii of a headed layer (#542); null on an unheaded one (no attribute, today's program). */
+  /** The target radii of a whole-arrow layer (#542); null on a headless one (no attribute, today's program). */
   private readonly radius: RadiusColumn | null;
-  /** A `loops` layer's head (#542); null on a link layer. Fixed per layer, like `headed`. */
-  private readonly loop: LinkHead | null;
-  /** A `loops` layer's columns in the line program's shape ({@link loopLaneColumns}), refilled per update; null on a
-   *  link layer. Its two ends are one centre, so `target` is `source` (one buffer, one upload). */
-  private readonly loopColumns: LineLaneData | null;
   private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
-  /** A link layer (`lines`, or `arrows` with `head: "arrow"`), or a `loops` layer, whose own `head` then applies. */
-  constructor(device: Device, input: LineLaneData | InstancedLoopsData, width = 0, height = 0, pick = false, head: LinkHead = "none") {
-    const loops = "centers" in input ? input : null;
-    const data = "centers" in input ? loopLaneColumns(input) : input;
-    this.loopColumns = loops ? data : null;
+  /** A `lines` layer, or an `arrows` layer with `head: "arrow"`. */
+  constructor(device: Device, data: LineLaneData, width = 0, height = 0, pick = false, head: LinkHead = "none") {
     this.count = data.count;
     this._capacity = data.count;
     const samples = Math.max(2, (data.samples ?? 2) | 0);
     this._samples = samples;
-    this.head = loops ? loops.head : head;
-    this.loop = loops ? loops.head : null;
-    this.headed = this.loop === null && head === "arrow";
-    this.radius = this.headed ? new RadiusColumn() : null;
-    const template = this.loop ? loopTemplate(samples, this.loop) : this.headed ? headLineTemplate(samples) : lineTemplate(samples);
-    const vs = this.loop ? INSTANCED_LOOP_VS : this.headed ? INSTANCED_HEAD_LINE_VS : INSTANCED_LINE_VS;
+    this.head = head;
+    const headed = head === "arrow";
+    this.radius = headed ? new RadiusColumn() : null;
+    const template = headed ? headLineTemplate(samples) : lineTemplate(samples);
+    const vs = headed ? INSTANCED_HEAD_LINE_VS : INSTANCED_LINE_VS;
     const vertexCount = template.length / 2;
     this.corner = device.createBuffer({ data: template });
     this.source = device.createBuffer({ data: data.sources });
-    this.target = loops ? this.source : device.createBuffer({ data: data.targets });
+    this.target = device.createBuffer({ data: data.targets });
     this.widthBuf = device.createBuffer({ data: data.widths });
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ straight (control on the chord).
-    this.bend = loops ? null : device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+    this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
     this._lastWidths = data.widths;
     this._lastColors = data.colors;
     this._lastBends = data.bends;
@@ -844,9 +812,7 @@ export class InstancedLines {
       u_viewport: [width, height],
       u_pickBase: 0,
       ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
-      ...(this.headed ? { u_arrowSize: data.arrowSize ?? 0 } : {}),
-      // A loop's straight pieces past the rim (`h`), its centre solve (cot α) and its band (#542).
-      ...(loops ? { u_loopStub: loopStubLength(loops), u_loopCot: loopsSpreadCot(loops.spread), u_loopHalf: loops.head === "half" ? 1 : 0, u_loopLeg: loops.legLength ?? LOOP_LEG } : {}),
+      ...(headed ? { u_arrowSize: data.arrowSize ?? 0 } : {}),
     };
     const bufferLayout = [
       { name: "a_corner", format: "float32x2" as const },
@@ -854,9 +820,9 @@ export class InstancedLines {
       { name: "a_target", format: "float32x2" as const, stepMode: "instance" as const },
       { name: "a_width", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
-      ...(this.bend ? [{ name: "a_bend", format: "float32" as const, stepMode: "instance" as const }] : []),
+      { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
       ...this.ends.layout,
-      ...(this.headed ? RadiusColumn.layout : []),
+      ...(headed ? RadiusColumn.layout : []),
       ...this.hl.layout,
     ];
     const attributes = {
@@ -865,7 +831,7 @@ export class InstancedLines {
       a_target: this.target,
       a_width: this.widthBuf,
       a_color: this.color,
-      ...(this.bend ? { a_bend: this.bend } : {}),
+      a_bend: this.bend,
       ...this.hl.attributes(),
     };
     this.model = new Model(device, {
@@ -931,36 +897,25 @@ export class InstancedLines {
    * The pick model tracks the same instance buffers (shared references), so endpoint moves are
    * automatically reflected in the pick pass — ids/count are unchanged, only positions moved.
    */
-  update(device: Device, input: LineLaneData | InstancedLoopsData, head: LinkHead = "none"): boolean {
-    // A link layer and a loop layer run different programs and templates, as do two heads (#542): recreate.
-    let data: LineLaneData;
-    if ("centers" in input) {
-      if (!this.loopColumns || input.head !== this.loop) return false;
-      data = loopLaneColumns(input, this.loopColumns);
-      this.uniforms["u_loopStub"] = loopStubLength(input);
-      this.uniforms["u_loopCot"] = loopsSpreadCot(input.spread);
-      this.uniforms["u_loopLeg"] = input.legLength ?? LOOP_LEG;
-    } else {
-      if (this.loopColumns || head !== this.head) return false;
-      data = input;
-      if (this.headed) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
-    }
+  update(device: Device, data: LineLaneData, head: LinkHead = "none"): boolean {
+    if (head !== this.head) return false; // two heads run different programs and templates (#542): recreate
+    if (this.radius) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
     if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? 2) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();
-      if (this.target !== this.source) this.target.destroy();
+      this.target.destroy();
       this.widthBuf.destroy();
       this.color.destroy();
-      this.bend?.destroy();
+      this.bend.destroy();
       this._capacity = grownCapacity(data.count, this._capacity);
       this.source = grownBuffer(device, data.sources, data.count, this._capacity);
-      this.target = this.loopColumns ? this.source : grownBuffer(device, data.targets, data.count, this._capacity);
+      this.target = grownBuffer(device, data.targets, data.count, this._capacity);
       this.widthBuf = grownBuffer(device, data.widths, data.count, this._capacity);
       this.color = grownBuffer(device, data.colors, data.count, this._capacity);
-      this.bend = this.bend && grownBuffer(device, data.bends ?? new Float32Array(data.count), data.count, this._capacity);
+      this.bend = grownBuffer(device, data.bends ?? new Float32Array(data.count), data.count, this._capacity);
       // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
       this._lastWidths = data.widths;
       this._lastColors = data.colors;
@@ -970,7 +925,7 @@ export class InstancedLines {
         a_target: this.target,
         a_width: this.widthBuf,
         a_color: this.color,
-        ...(this.bend ? { a_bend: this.bend } : {}),
+        a_bend: this.bend,
         ...this.hl.recreate(data, this._capacity),
       });
       if (this.pickModel) {
@@ -979,7 +934,7 @@ export class InstancedLines {
           a_target: this.target,
           a_width: this.widthBuf,
           a_color: this.color,
-          ...(this.bend ? { a_bend: this.bend } : {}),
+          a_bend: this.bend,
           ...this.hl.attributes(),
         });
       }
@@ -987,10 +942,10 @@ export class InstancedLines {
       // Sub-update: endpoints are freshly allocated each frame ⇒ always upload; style-derived buffers
       // (widths/colours/bends) skip when their array reference is unchanged (the position-only fast path, #179).
       this.source.write(data.sources);
-      if (this.target !== this.source) this.target.write(data.targets);
+      this.target.write(data.targets);
       this._lastWidths = writeIfChanged(this.widthBuf, data.widths, this._lastWidths);
       this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
-      if (this.bend && data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
+      if (data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
       this.hl.write(data);
     }
     this.ends.sync(device, this.models(), data, this._capacity);
@@ -1013,12 +968,181 @@ export class InstancedLines {
     this.pickModel?.destroy();
     this.corner.destroy();
     this.source.destroy();
-    if (this.target !== this.source) this.target.destroy();
+    this.target.destroy();
     this.widthBuf.destroy();
     this.color.destroy();
-    this.bend?.destroy();
+    this.bend.destroy();
     this.ends.destroy();
     this.radius?.destroy();
+    this.hl.destroy();
+  }
+}
+
+/** The rim-end attributes of a `loops` layer (#542): its `startOffsets` / `endOffsets` from the node centre. */
+const LOOP_OFFSETS = ["a_startOffset", "a_endOffset"] as const;
+
+/**
+ * A `loops` layer's lane (#542, `INSTANCED_LOOP_VS`, {@link loopTemplate}): per loop its node `centers`, its two rim
+ * ends as offsets from the centre (#509 columns: uploaded when the array is new, or by `offsetsChanged`), `widths`,
+ * `colors` and the highlight columns; per layer the head (fixed: a change recreates, like `samples`) and the shape
+ * uniforms — `u_loopStub` (`h`), `u_loopCot` (`cot α`), `u_loopLeg` (`L`) and `u_loopHalf` (the half-arrow band).
+ */
+export class InstancedLoops {
+  count: number;
+  /** Instances the buffers have room for (≥ `count`): kept on a shrink, at least doubled on a grow. */
+  private _capacity: number;
+  get capacity(): number {
+    return this._capacity;
+  }
+  /** Vertex samples (M) baked into the corner template buffer: a change recreates. */
+  private _samples: number;
+  /** How every loop ends, fixed per layer: a change recreates (another template). */
+  readonly head: InstancedLoopHead["head"];
+  /** Last-uploaded style columns (#179): a sub-update skips a buffer whose array is unchanged. */
+  private _lastWidths?: Float32Array;
+  private _lastColors?: Uint8Array;
+  private model: Model;
+  /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
+  private pickModel?: Model;
+  private corner: Buffer;
+  private center: Buffer;
+  private widthBuf: Buffer;
+  private color: Buffer;
+  private readonly start = new OffsetColumn(LOOP_OFFSETS[0]);
+  private readonly end = new OffsetColumn(LOOP_OFFSETS[1]);
+  private hl: HighlightBuffers;
+  private uniforms: Record<string, unknown>;
+
+  constructor(device: Device, data: InstancedLoopsData, width = 0, height = 0, pick = false) {
+    this.count = data.count;
+    this._capacity = data.count;
+    const samples = Math.max(2, (data.samples ?? 2) | 0);
+    this._samples = samples;
+    this.head = data.head;
+    const template = loopTemplate(samples, data.head);
+    const vertexCount = template.length / 2;
+    this.corner = device.createBuffer({ data: template });
+    this.center = device.createBuffer({ data: data.centers });
+    this.widthBuf = device.createBuffer({ data: data.widths });
+    this.color = device.createBuffer({ data: data.colors });
+    this._lastWidths = data.widths;
+    this._lastColors = data.colors;
+    this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
+    this.uniforms = {
+      u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
+      u_screen: 0,
+      u_viewport: [width, height],
+      u_pickBase: 0,
+      ...highlightUniforms(1), // loops recolour toward the highlight hue, like links (recolor = 1)
+      u_loopHalf: data.head === "half" ? 1 : 0,
+    };
+    this.setShape(data);
+    const bufferLayout = [
+      { name: "a_corner", format: "float32x2" as const },
+      { name: "a_center", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_width", format: "float32" as const, stepMode: "instance" as const },
+      { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+      ...LOOP_OFFSETS.map(offsetLayout),
+      ...this.hl.layout,
+    ];
+    const attributes = { a_corner: this.corner, a_center: this.center, a_width: this.widthBuf, a_color: this.color, ...this.hl.attributes() };
+    const model = { vs: INSTANCED_LOOP_VS, bufferLayout, attributes, uniforms: this.uniforms, topology: "triangle-strip" as const, vertexCount, instanceCount: this.count };
+    this.model = new Model(device, { ...model, fs: FILL_FS, parameters: BLEND });
+    // Pick twin: identical geometry + shared instance buffers/uniforms, PICK_FS writes gl_InstanceID.
+    if (pick) this.pickModel = new Model(device, { ...model, fs: PICK_FS, parameters: NO_BLEND });
+    for (const m of this.models()) zeroOffsets(m, LOOP_OFFSETS);
+    this.syncEnds(device, data);
+  }
+
+  /** The fill model and its pick twin, which share the instance attributes. */
+  private models(): Model[] {
+    return this.pickModel ? [this.model, this.pickModel] : [this.model];
+  }
+
+  /** The layer's shape uniforms: the straight pieces past the rim (`h`), the centre solve (`cot α`), the legs (`L`). */
+  private setShape(data: InstancedLoopsData): void {
+    this.uniforms["u_loopStub"] = loopStubLength(data);
+    this.uniforms["u_loopCot"] = loopsSpreadCot(data.spread);
+    this.uniforms["u_loopLeg"] = data.legLength ?? LOOP_LEG;
+  }
+
+  private syncEnds(device: Device, data: InstancedLoopsData): void {
+    const models = this.models();
+    this.start.sync(device, models, data.startOffsets, data.count, this._capacity, data.offsetsChanged);
+    this.end.sync(device, models, data.endOffsets, data.count, this._capacity, data.offsetsChanged);
+  }
+
+  setTransform(m: Float32Array): void {
+    this.uniforms["u_transform"] = m;
+  }
+  setViewport(width: number, height: number): void {
+    this.uniforms["u_viewport"] = [width, height];
+  }
+  setSizeMode(mode: "world" | "screen"): void {
+    this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
+  }
+  /** Offset added to the pick pass's instance id (#447), so two pickable link layers decode to disjoint ids. */
+  setPickBase(base: number): void {
+    this.uniforms["u_pickBase"] = base;
+  }
+  /** Set shader-highlight uniforms (#162) — recolour/dim with no geometry touch (shared with the pick twin). */
+  setHighlight(h: InstancedHighlight): void {
+    applyHighlight(this.uniforms, h);
+    if (h.selected) this.hl.writeSelected(h.selected, this.count);
+  }
+
+  /**
+   * Update the instance data in place, as {@link InstancedLines.update}: a sub-upload within capacity, a grow
+   * (same object) past it. Returns `false` when the head or `samples` changed (another template): the caller
+   * recreates.
+   */
+  update(device: Device, data: InstancedLoopsData): boolean {
+    if (data.head !== this.head) return false;
+    if (Math.max(2, (data.samples ?? 2) | 0) !== this._samples) return false;
+    this.setShape(data);
+    if (data.count > this._capacity) {
+      this.center.destroy();
+      this.widthBuf.destroy();
+      this.color.destroy();
+      this._capacity = grownCapacity(data.count, this._capacity);
+      this.center = grownBuffer(device, data.centers, data.count, this._capacity);
+      this.widthBuf = grownBuffer(device, data.widths, data.count, this._capacity);
+      this.color = grownBuffer(device, data.colors, data.count, this._capacity);
+      this._lastWidths = data.widths;
+      this._lastColors = data.colors;
+      const columns = { a_center: this.center, a_width: this.widthBuf, a_color: this.color };
+      this.model.setAttributes({ ...columns, ...this.hl.recreate(data, this._capacity) });
+      this.pickModel?.setAttributes({ ...columns, ...this.hl.attributes() });
+    } else {
+      // Sub-update: the centres always upload (a position frame); the style columns skip an unchanged array (#179).
+      this.center.write(data.centers);
+      this._lastWidths = writeIfChanged(this.widthBuf, data.widths, this._lastWidths);
+      this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
+      this.hl.write(data);
+    }
+    this.syncEnds(device, data);
+    this.count = data.count;
+    this.model.setInstanceCount(data.count);
+    this.pickModel?.setInstanceCount(data.count);
+    return true;
+  }
+
+  render(pass: RenderPass): void {
+    if (this.count > 0) this.model.draw(pass);
+  }
+  /** Draw the id-encoded pick pass (#141). No-op unless built with `pick`. */
+  renderPick(pass: RenderPass): void {
+    if (this.pickModel && this.count > 0) this.pickModel.draw(pass);
+  }
+  destroy(): void {
+    this.model.destroy();
+    this.pickModel?.destroy();
+    this.corner.destroy();
+    this.center.destroy();
+    this.widthBuf.destroy();
+    this.color.destroy();
+    this.start.destroy();
+    this.end.destroy();
     this.hl.destroy();
   }
 }

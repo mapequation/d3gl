@@ -864,7 +864,7 @@ tolerance depends on how a drawable is *drawn*. World-scaled geometry bakes at t
 
 ## A loop's shape must come from its stored offsets, never from `centre + offset` (#505, #542)
 
-A self-link loop is one instance of the `loops` layer (`InstancedLoopsData`, drawn by the line lane's loop program
+A self-link loop is one instance of the `loops` layer (`InstancedLoopsData`, drawn on WebGL by its own lane, `InstancedLoops`,
 `INSTANCED_LOOP_VS`): its node centre, and its two rim ends as float32 offsets from it (`startOffsets` /
 `endOffsets`). The loop is short and sits beside its centre, so `(c + to) − (c + so)` in float32 is rounding noise
 around a far larger `c` (in world mode that once bowed a loop level with its neighbour, a vertical chord, INTO its

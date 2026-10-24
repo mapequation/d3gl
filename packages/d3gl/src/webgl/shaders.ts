@@ -448,11 +448,10 @@ function headLineVS(vs: string): string {
 
 export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
 
-// INSTANCED_LOOP_VS — the self-link loop (#505, #542) as one instance of the line lane: the GLSL twin of
-// `core/loop-drop.ts` (`traceLoop`, `loopArrowOutline`, `loopHalfArrowOutline`), every variant one strip.
-// A `loops` layer (`InstancedLoopsData`) on the lane: `a_source` = `a_target` its node centre (one buffer), and its
-// two rim ends are that centre plus the end offsets (`startOffsets` / `endOffsets`, size units, any #509 node offset
-// in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
+// INSTANCED_LOOP_VS — the self-link loop (#505, #542), one instance of the loop lane (`InstancedLoops`): the GLSL
+// twin of `core/loop-drop.ts` (`traceLoop`, `loopArrowOutline`, `loopHalfArrowOutline`), every variant one strip.
+// A `loops` layer (`InstancedLoopsData`): `a_center` its node centre, and its two rim ends are that centre plus
+// `a_startOffset` / `a_endOffset` (size units, any #509 node offset in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
 // T − c = n + D/2 = r·u1. The centre curve is c → E0, the cubic E0, E0 + ℓ·u0, E1 + ℓ·u1, E1 (E_k = c + (r + h)·u_k,
 // ℓ = L·r: `u_loopLeg` is the layer's `legLength`, L in node radii), then the variant's end. The template (`loopTemplate`):
 // (−1, ±1) the pair at c with the straight leg's normal ⟂(u0); (t ∈ [0, 1], ±1) the cubic; then the end —
@@ -469,9 +468,10 @@ const LOOP_BODY = `  float t = a_corner.x;
   float side = a_corner.y;
   bool screen = u_screen > 0.5;
   bool halfArrow = u_loopHalf > 0.5;
-  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
-  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
-  vec2 hd = 0.5 * (a_targetOffset - a_sourceOffset);       // D/2, exact: the two centres are one point
+  vec2 cp = screen ? worldToPx(a_center) : a_center;
+  vec2 src = cp + a_startOffset;
+  vec2 tgt = cp + a_endOffset;
+  vec2 hd = 0.5 * (a_endOffset - a_startOffset);           // D/2, exact: both ends share the centre
   vec2 nd = vec2(-hd.y, hd.x) * u_loopCot;
   vec2 a0 = nd - hd;                                        // S − c = r·u0
   float r = length(a0);
@@ -509,14 +509,28 @@ const LOOP_BODY = `  float t = a_corner.x;
     : vec4((u_transform * vec3(pos, 1.0)).xy, 0.0, 1.0);
 }`;
 
-function loopVS(vs: string): string {
-  const at = vs.indexOf("  float t = a_corner.x;");
-  if (at < 0 || !vs.includes("\nin float a_bend;")) throw new Error("loopVS: unexpected line shader");
-  // A loop has no bend: its arms are the layer's u_loopLeg, so the line's `a_bend` attribute is dropped.
-  return vs.slice(0, at).replace("\nin float a_bend;", LOOP_DECL) + LOOP_BODY;
+export const INSTANCED_LOOP_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
+uniform vec2 u_viewport;    // device px, for screen mode
+layout(location = 0) in vec2 a_corner; // per-vertex (t, side), see loopTemplate; location 0 stays buffer-backed (OffsetColumn, instanced.ts)
+in vec2 a_center;           // per-instance world centre of the loop's node
+in vec2 a_startOffset;      // per-instance rim ends as offsets from the centre, in size units (#509)
+in vec2 a_endOffset;
+in float a_width;           // per-instance line width
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
+uniform float u_pickBase;   // added to the instance's pick id (#447)${LOOP_DECL}
+out vec4 v_color;
+flat out float v_id;        // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
+vec2 worldToPx(vec2 w) {
+  vec2 clip = (u_transform * vec3(w, 1.0)).xy;
+  return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
 }
-
-export const INSTANCED_LOOP_VS = loopVS(INSTANCED_LINE_VS);
+void main() {
+  v_color = a_color;${HL_APPLY}
+  v_id = float(gl_InstanceID) + u_pickBase;
+${LOOP_BODY}`;
 
 // INSTANCED_HALF_ARROW_VS — the "map of networks" directed-link glyph (#104 N6): one filled shape
 // per link that pinches to the source centre, bows around a shared centre curve, and ends in a barbed
