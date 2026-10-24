@@ -29,7 +29,7 @@ const P = 3;
 const sizes = (): NodeRadiusSpec => (_value, _index, graph) => (graph.nodeCount === P ? 24 : 6);
 
 function fixture() {
-  return buildStateGraph({ stateCount: S, stateToPhysical: STATE_TO_PHYSICAL, source: [0, 1, 3, 2], target: [3, 5, 5, 4], directed: false });
+  return buildStateGraph({ stateCount: S, stateToPhysical: STATE_TO_PHYSICAL, source: [0, 1, 3, 2], target: [3, 5, 5, 4] });
 }
 
 /** The last circles emitted per layer name, as the WebGL backend received them. */

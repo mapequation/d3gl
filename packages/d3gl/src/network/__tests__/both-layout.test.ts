@@ -150,7 +150,7 @@ describe("packStateNodes (#509, the both view's area spiral)", () => {
   });
 
   it("takes the state graph's CSR as built", () => {
-    const graph = buildStateGraph({ stateCount: 5, stateToPhysical: [1, 0, 1, 1, 0], source: [0], target: [1], directed: true });
+    const graph = buildStateGraph({ stateCount: 5, stateToPhysical: [1, 0, 1, 1, 0], source: [0], target: [1] });
     const radii = Float32Array.of(2, 3, 2, 1, 3);
     const { offsets, radii: physical } = packChecked(radii, graph.physicalToState, 0);
     expect(offsets.length).toBe(10);

@@ -575,7 +575,7 @@ describe("interactive({ hover, tooltip }) without an on() handler (#519)", () =>
   // physical nodes are placed; the state view starts from its rosette, where state node 2, alone in physical node 1,
   // sits on that physical node's centre (100, 100).
   const state = (net: Network): void => {
-    const graph = buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 2], source: [0, 1, 2], target: [1, 2, 3], directed: false });
+    const graph = buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 2], source: [0, 1, 2], target: [1, 2, 3] });
     net.style({ nodeRadius: 8 }).stateNetwork(graph, { view: "physical" });
     net.layout({ backend: "positions", positions: new Float32Array([40, 40, 100, 100, 160, 60]) });
     net.view("state");

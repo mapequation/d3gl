@@ -211,7 +211,6 @@ export function generateStateNetwork(opts: StateNetworkOptions = {}): SyntheticS
     weight,
     nodeFlow,
     physicalCount,
-    directed: true,
   });
 
   // Module of state node (i,j) = previous node i's community (memory separates flow by origin). Two-level

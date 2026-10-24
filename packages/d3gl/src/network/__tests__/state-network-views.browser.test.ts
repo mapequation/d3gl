@@ -33,7 +33,6 @@ function fixture() {
     source: [0, 1, 4],
     target: [2, 3, 0],
     nodeFlow: [1, 1, 1, 1, 1],
-    directed: false,
   });
   const modules: ModulePathNode[] = [
     { id: 0, path: [1, 1, 1] },
@@ -571,7 +570,7 @@ describe("hits and labels name their level in state mode (#494)", () => {
 
 /** Two physical nodes 120 apart on one row, one state node each, one directed link 0 → 1: a horizontal link. */
 function pairFixture() {
-  const graph = buildStateGraph({ stateCount: 2, stateToPhysical: [0, 1], source: [0], target: [1], nodeFlow: [1, 1], directed: true });
+  const graph = buildStateGraph({ stateCount: 2, stateToPhysical: [0, 1], source: [0], target: [1], nodeFlow: [1, 1] });
   return { graph, positions: new Float32Array([40, 100, 160, 100]) };
 }
 const LINK_RGB: [number, number, number] = [0, 200, 0];
@@ -640,7 +639,6 @@ function offsetFixture() {
     source: [0, 4, 2],
     target: [1, 3, 5],
     nodeFlow: [1, 1, 1, 1, 1, 1],
-    directed: true,
   });
   return { graph, positions: new Float32Array([70, 115, 130, 115, 100, 72]) };
 }
@@ -933,7 +931,7 @@ describe("module LOD aggregates take their module's colour under nodeFill { by: 
 
   it("the state view's module LOD likewise; a spatial cell (no module) keeps its members' mean", async () => {
     // Physical 0 holds module [1]'s state nodes (in [1,1] and [1,2]) on a tight rosette; physical 1 holds [2]'s.
-    const graph = buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 1], source: [0, 2], target: [2, 3], nodeFlow: [1, 1, 1, 1], directed: false });
+    const graph = buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 1], source: [0, 2], target: [2, 3], nodeFlow: [1, 1, 1, 1] });
     const modules: ModulePathNode[] = [
       { id: 0, path: [1, 1, 1] },
       { id: 1, path: [1, 2, 1] },
@@ -1089,7 +1087,6 @@ describe("a physical node takes its dominant module's colour, not its first wedg
       source: [0, 1, 4],
       target: [2, 3, 0],
       nodeFlow: [0.1, 0.9, 1, 1, 1],
-      directed: false,
     });
     return { graph, modules };
   }

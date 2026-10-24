@@ -29,7 +29,6 @@ function fixture() {
     source: [0, 1, 0, 4, 5],
     target: [2, 2, 1, 3, 0],
     nodeFlow: [1, 1, 1, 1, 1, 1],
-    directed: true,
   });
   const modules: ModulePathNode[] = [
     { id: 0, path: [1, 1] },

@@ -37,8 +37,6 @@ export interface BuildStateGraphInput {
    * **sum** of its state nodes' flow.
    */
   nodeFlow?: ArrayLike<number>;
-  /** Whether links render with arrowheads (applies to both views). Defaults to false. */
-  directed?: boolean;
   /**
    * Number of physical nodes. Defaults to `max(stateToPhysical) + 1`. Pass it when some physical node
    * has no state node in this slice (so the physical graph still allocates a slot for it).
@@ -57,7 +55,10 @@ export interface PhysicalToState {
   states: Uint32Array;
 }
 
-/** A state network plus its engine-derived physical network and the maps between the two levels. */
+/**
+ * A state network plus its engine-derived physical network and the maps between the two levels. A state network
+ * is **directed** (#549): its state, physical and lumped graphs all have `directed: true`.
+ */
 export interface StateNetworkGraph {
   /** State-level graph: nodes = state nodes, edges = state edges. A full {@link NetworkGraph}. */
   state: NetworkGraph;
@@ -78,6 +79,12 @@ export interface StateNetworkGraph {
  * Assemble a {@link StateNetworkGraph} from a state-level edge list + a per-state-node physical id.
  * The physical network is derived once (its links are the directed, flow-summed aggregation of state
  * edges that cross a physical boundary). Positions in both graphs are left zeroed for layout to fill.
+ *
+ * A state network is always **directed** (#549): a state node's links are its out-links, with flow per direction,
+ * so both graphs are built with `directed: true` and draw with arrowheads by default (a `style({ directed })`
+ * overrides the drawing). This holds even when the source file calls its links undirected: Infomap writes
+ * `*Links undirected` into a state network's `.ftree` when run without `--directed`, yet lists links both ways
+ * with different flows.
  */
 export function buildStateGraph(input: BuildStateGraphInput): StateNetworkGraph {
   const { stateCount } = input;
@@ -111,7 +118,7 @@ export function buildStateGraph(input: BuildStateGraphInput): StateNetworkGraph 
     target: input.target,
     weight: input.weight,
     nodeFlow: input.nodeFlow,
-    directed: input.directed,
+    directed: true, // a state network is directed (#549): a state node's links are its out-links
   });
 
   const physical = mergeGroups(state, stateToPhysical, physicalCount);

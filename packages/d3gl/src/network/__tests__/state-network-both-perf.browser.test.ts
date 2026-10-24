@@ -213,7 +213,7 @@ function fixture(n: number, cols = COLS) {
     if ((p + 1) % cols !== 0 && p + 1 < n) { source.push(first[p] ?? 0); target.push(first[p + 1] ?? 0); }
     if (p + cols < n) { source.push(first[p] ?? 0); target.push(first[p + cols] ?? 0); }
   }
-  const graph = buildStateGraph({ stateCount: stateToPhysical.length, stateToPhysical, source, target, directed: false });
+  const graph = buildStateGraph({ stateCount: stateToPhysical.length, stateToPhysical, source, target });
   const positions = new Float32Array(n * 2);
   for (let p = 0; p < n; p++) {
     positions[2 * p] = (p % cols) * SPACING;
@@ -790,10 +790,11 @@ describe(`state-network both view — per-interaction cost at N=${N.toLocaleStri
     expect(hoverOff.medianMs, `hover median ${hoverOff.medianMs.toFixed(2)}ms (worst ${hoverOff.worstMs.toFixed(2)}ms)`).toBeLessThan(HOVER_MS);
   });
 
-  it("selection change: exactly the flag columns (state nodes, state links, containers) + the ring", () => {
+  it("selection change: exactly the flag columns (state nodes, state links and their arrowheads, containers) + the ring", () => {
     expect(selectOff.baseEmits, "a selection re-emitted base-lane geometry").toBe(0);
     expect(selectOff.containerFlags, "the selected container is not the one flagged").toBe(1);
-    expect(selectOff.flagBytes / selectOff.events, "flag bytes per selection are not 4 B per state node + state link + container").toBe(4 * (stateCount + stateEdges + N));
+    // A state network is directed (#549): each state link is a line plus an arrowhead, each layer with its flag column.
+    expect(selectOff.flagBytes / selectOff.events, "flag bytes per selection are not 4 B per state node + state link line + arrowhead + container").toBe(4 * (stateCount + 2 * stateEdges + N));
     expect(selectOff.gpu.uploadedBytes).toBeLessThanOrEqual(selectOff.flagBytes + SELECT_SLACK_BYTES * selectOff.events);
   });
 

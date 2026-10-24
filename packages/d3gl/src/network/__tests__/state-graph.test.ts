@@ -42,6 +42,16 @@ describe("buildStateGraph", () => {
     expect(state.directed).toBe(true);
   });
 
+  it("always builds directed state, physical and lumped graphs: a state network is directed (#549)", () => {
+    const sg = buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 1], source: [0, 2], target: [2, 1] });
+    expect(sg.state.directed, "state graph").toBe(true);
+    expect(sg.physical.directed, "physical graph").toBe(true);
+    const lumped = lumpStateGraph(sg, [{ id: 0, path: [1, 1] }, { id: 1, path: [2, 1] }, { id: 2, path: [1, 2] }, { id: 3, path: [2, 2] }]);
+    expect(lumped.graph.state.directed, "lumped state graph").toBe(true);
+    expect(lumped.graph.physical.directed, "lumped physical graph").toBe(true);
+    expect(lumpStateGraph(sg).graph.state.directed, "lumped without modules").toBe(true);
+  });
+
   it("derives the physical network by summing state edges across physical boundaries (directed)", () => {
     const { physical, physicalCount } = buildStateGraph(input);
     expect(physicalCount).toBe(2);
@@ -95,7 +105,6 @@ describe("lumpStateGraph (#529)", () => {
     target: [1, 3, 3, 4, 0, 0],
     weight: [7, 2, 1, 4, 5, 6],
     nodeFlow: [0.1, 0.2, 0.3, 0.15, 0.25],
-    directed: true,
   });
   const modules = [
     { id: 0, path: [1, 1] },
@@ -133,7 +142,6 @@ describe("lumpStateGraph (#529)", () => {
       source: graph.state.source,
       target: graph.state.target,
       weight: graph.state.weight,
-      directed: true,
     });
     expect(physEdges(remerged.physical)).toEqual(physEdges(sg.physical));
   });
@@ -175,7 +183,6 @@ describe("lumpStateGraph with module links (#533)", () => {
     target: [1, 3, 3, 4, 0, 0],
     weight: [7, 2, 1, 4, 5, 6],
     nodeFlow: [0.1, 0.2, 0.3, 0.15, 0.25],
-    directed: true,
   });
   const modules = [
     { id: 0, path: [1, 1] },
@@ -215,7 +222,7 @@ describe("lumpStateGraph with module links (#533)", () => {
 
   it("gives a ragged module's lumps ranks its sub-modules do not use, so a leaf endpoint names the lump", () => {
     // Module 1 holds sub-modules 1:1, 1:2 and the leaf 1:3 (state 4), as Infomap numbers a ragged module's children.
-    const ragged = buildStateGraph({ stateCount: 5, stateToPhysical: [0, 1, 2, 3, 4], source: [0], target: [1], directed: true });
+    const ragged = buildStateGraph({ stateCount: 5, stateToPhysical: [0, 1, 2, 3, 4], source: [0], target: [1] });
     const records = [
       { id: 0, path: [1, 1, 1] },
       { id: 1, path: [1, 1, 2] },

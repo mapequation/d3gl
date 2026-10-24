@@ -120,7 +120,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // The "both" view draws its state nodes at this nodeRadius and sizeMode, packed in physical nodes that enclose them.
       net.style({
         moduleColor: options.colors === "Palette" ? palette : undefined,
-        directed: true,
         sizeMode: options.sizing === "World" ? "world" : "screen",
         linkStyle: halfArrow ? "half-arrow" : "line",
         linkBend: 0.15, // fraction of the link's length, for half-arrows and lines alike

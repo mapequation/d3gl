@@ -30,7 +30,7 @@ function fixture(P = 24): { graph: StateNetworkGraph; modules: ModulePathNode[] 
     source.push(2 * p, 2 * p + 1);
     target.push(2 * ((p + 1) % P) + 1, 2 * ((p + 5) % P));
   }
-  const graph = buildStateGraph({ stateCount: 2 * P, stateToPhysical, source, target, directed: true });
+  const graph = buildStateGraph({ stateCount: 2 * P, stateToPhysical, source, target });
   const rank = new Map<string, number>();
   const modules: ModulePathNode[] = [];
   for (let s = 0; s < 2 * P; s++) {

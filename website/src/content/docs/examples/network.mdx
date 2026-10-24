@@ -922,7 +922,8 @@ the physical view a physical node has an **overlapping** module membership.
 
 `net.stateNetwork(graph, { modules })` ingests the state network (built by `buildStateGraph`, which also
 derives the physical network) plus a per-**state-node** module assignment, and `net.view("physical" |
-"state" | "both")` toggles three renderings of the *same* data:
+"state" | "both")` toggles three renderings of the *same* data. A state network is always **directed**: a state
+node's links are its out-links, so every view draws its links with arrows (or half-arrows), with no flag to set.
 
 - **Physical** — the derived physical network (flow-sized nodes + directed, flow-summed aggregated
   half-arrow links). A physical node whose state nodes span ≥2 modules renders as a **pie chart** — one

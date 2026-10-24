@@ -628,7 +628,6 @@ describe("backend:'auto' (#375)", () => {
       source: [0, 1],
       target: [2, 3],
       nodeFlow: [1, 1, 1, 1],
-      directed: false,
     });
     const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [2, 1] }, { id: 2, path: [1, 2] }, { id: 3, path: [2, 2] }];
     const net = await engine();

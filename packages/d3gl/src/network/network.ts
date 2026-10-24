@@ -1905,6 +1905,10 @@ export class Network extends BaseEngine {
    *    boundary rings, `layout({ nested })` lays it out by module, and hits carry {@link NetworkHit.path};
    *  - the **both view** — the state nodes inside their physical node's container disc, with state-level links.
    *
+   * A state network is **directed** (#549): {@link buildStateGraph} builds directed graphs, so every view draws its
+   * links, and the state view its module links, with the directed link style ({@link NetworkStyle.linkStyle}) unless
+   * {@link style}'s `directed` overrides it.
+   *
    * Each view keeps its own layout (#495): {@link layout} lays out the active view's graph — the physical graph
    * in the physical and both views, which share that layout, the state graph in the state view — and a view
    * switch keeps every view's positions. A view whose layout never ran is laid out when it is first shown, with

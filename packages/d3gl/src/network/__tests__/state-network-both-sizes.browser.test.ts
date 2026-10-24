@@ -37,7 +37,7 @@ function fixture() {
   source.push(7, 3, 10);
   target.push(2, 9, 0);
   const nodeFlow = Array.from({ length: n }, (_, s) => (s + 1) / ((n * (n + 1)) / 2));
-  const graph = buildStateGraph({ stateCount: n, stateToPhysical, source, target, nodeFlow, directed: true });
+  const graph = buildStateGraph({ stateCount: n, stateToPhysical, source, target, nodeFlow });
   const positions = new Float32Array([0, 0, 100, 0, 200, 0, 0, 100, 100, 100]);
   return { graph, positions };
 }

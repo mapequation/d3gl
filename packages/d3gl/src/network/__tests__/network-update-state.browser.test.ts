@@ -32,7 +32,7 @@ const FLOW = [3, 1, 2, 1, 1, 4];
 const STYLE: NetworkStyle = { nodeRadius: { by: "flow", scale: (f) => 4 + 3 * f } };
 
 function stateGraph(flow: ArrayLike<number>): StateNetworkGraph {
-  return buildStateGraph({ stateCount: S, stateToPhysical: STATE_TO_PHYSICAL, source: [0, 1, 0, 4, 5], target: [2, 2, 1, 3, 0], nodeFlow: flow, directed: true });
+  return buildStateGraph({ stateCount: S, stateToPhysical: STATE_TO_PHYSICAL, source: [0, 1, 0, 4, 5], target: [2, 2, 1, 3, 0], nodeFlow: flow });
 }
 
 function host(): HTMLElement {

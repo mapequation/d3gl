@@ -8,7 +8,6 @@ const graph = buildStateGraph({
   stateToPhysical: [0, 0, 0, 1],
   source: [0, 3],
   target: [3, 0],
-  directed: true,
 });
 
 describe("rosettePositions", () => {

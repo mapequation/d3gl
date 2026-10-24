@@ -41,7 +41,7 @@ function stateNet() {
   source.push(1, 3); target.push(2 * (P - 1), 2 * (P - 2) + 1);
   const modules: ModulePathNode[] = [];
   for (let s = 0; s < stateCount; s++) modules.push({ id: s, path: [(s % 2) + 1, Math.floor(s / 2) + 1] });
-  const graph = buildStateGraph({ stateCount, stateToPhysical, source, target, nodeFlow: new Array(stateCount).fill(1), directed: false });
+  const graph = buildStateGraph({ stateCount, stateToPhysical, source, target, nodeFlow: new Array(stateCount).fill(1) });
   return { graph, modules, P };
 }
 

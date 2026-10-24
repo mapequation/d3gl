@@ -39,7 +39,6 @@ function fixture() {
     source: [0, 1, 4, 5],
     target: [1, 2, 3, 3],
     nodeFlow: [1, 1, 1, 1, 1, 1],
-    directed: true,
   });
   const modules: ModulePathNode[] = [
     { id: 0, path: [1, 1] },
@@ -147,6 +146,27 @@ describe("state network module links (#533)", () => {
     net.style(STYLE).stateNetwork(graph, { modules, moduleLinks: LINKS, view: "state", lump: true });
     place(net);
     await expectStateViewDrawsLinks(net, "lumped state view");
+    net.destroy();
+  });
+
+  it("draws its links and module links with the directed link style, lumped or not: a state network is directed (#549)", async () => {
+    const { graph, modules } = fixture();
+    expect(graph.state.directed).toBe(true);
+    const net = await engine();
+    net.style(STYLE).stateNetwork(graph, { modules, moduleLinks: LINKS, view: "state" });
+    for (const lump of [false, true]) {
+      net.lump(lump);
+      place(net);
+      const lumped = net.lumped;
+      const state = lumped ? lumped.graph.state : graph.state;
+      const stateModules = lumped ? (lumped.modules ?? []) : modules;
+      const links = lumped ? (lumped.moduleLinks ?? undefined) : LINKS;
+      const positions = Float32Array.from(net.positions ?? []);
+      const svg = net.toSVG();
+      const what = lump ? "lumped state view" : "state view";
+      expect(svg, `${what}: as the plain directed network`).toBe(await plainSVG({ ...state, directed: true }, positions, stateModules, links));
+      expect(svg, `${what}: not as the plain undirected one`).not.toBe(await plainSVG({ ...state, directed: false }, positions, stateModules, links));
+    }
     net.destroy();
   });
 

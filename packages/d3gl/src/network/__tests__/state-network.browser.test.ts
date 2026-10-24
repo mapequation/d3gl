@@ -29,7 +29,6 @@ function tinyStateNetwork() {
     source: [0, 1],
     target: [2, 3], // state edges 0-2 (phys0-phys1), 1-3 (phys0-phys2) → physical edges 0-1, 0-2
     nodeFlow: [1, 1, 1, 1],
-    directed: false,
   });
   const modules: ModulePathNode[] = [
     { id: 0, path: [1, 1] },
@@ -40,7 +39,10 @@ function tinyStateNetwork() {
   return { graph, modules };
 }
 
-const filledPaths = (svg: string) => (svg.match(/<path[^>]*fill="rgba/g) ?? []).length;
+/** The link colour of the pie test: its links' arrowheads (a state network is directed, #549) are filled paths in it. */
+const LINK_STROKE = "#123456";
+/** The filled paths that are not arrowheads: the pie wedges. */
+const filledPaths = (svg: string) => (svg.match(/<path[^>]*fill="rgba[^"]*"/g) ?? []).filter((p) => !/18,\s*52,\s*86/.test(p)).length;
 const circles = (svg: string) => (svg.match(/<circle/g) ?? []).length;
 
 describe("state-network engine (#171)", () => {
@@ -50,7 +52,7 @@ describe("state-network engine (#171)", () => {
     await net.whenReady();
 
     net
-      .style({ nodeRadius: 8 })
+      .style({ nodeRadius: 8, linkStroke: LINK_STROKE })
       .stateNetwork(graph, { modules, view: "physical" })
       .layout({ backend: "positions", positions: new Float32Array([40, 100, 120, 40, 120, 160]) });
 
@@ -242,7 +244,6 @@ function pieStateNetwork() {
     source: [0, 1, 3],
     target: [2, 4, 4],
     nodeFlow: [1, 3, 1, 3, 1],
-    directed: false,
   });
   const modules: ModulePathNode[] = [
     { id: 0, path: [1, 1] },

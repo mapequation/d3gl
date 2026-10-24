@@ -169,7 +169,7 @@ function fixture(n: number) {
     if ((p + 1) % COLS !== 0 && p + 1 < n) { source.push(first[p] ?? 0); target.push(first[p + 1] ?? 0); }
     if (p + COLS < n) { source.push(first[p] ?? 0); target.push(first[p + COLS] ?? 0); }
   }
-  const graph = buildStateGraph({ stateCount: stateToPhysical.length, stateToPhysical, source, target, directed: false });
+  const graph = buildStateGraph({ stateCount: stateToPhysical.length, stateToPhysical, source, target });
   const positions = new Float32Array(n * 2);
   for (let p = 0; p < n; p++) {
     positions[2 * p] = (p % COLS) * SPACING;
@@ -502,7 +502,8 @@ describe(`state-network pie highlight — per-interaction cost at N=${N.toLocale
     ).toBeLessThanOrEqual(selectOff.flagBytes + SELECT_SLACK_BYTES * selectOff.events);
     // Pin that bound's base exactly: one float flag per node, per link and per wedge — a column pushed
     // twice (or a geometry column riding along) moves this, even though the upload check above is relative.
-    expect(selectOff.flagBytes / selectOff.events, "the flag bytes per selection are not exactly 4 B per node + link + wedge").toBe(4 * (N + edgeCount + wedgeCount));
+    // A state network is directed (#549): each link is a line plus an arrowhead, each layer with its flag column.
+    expect(selectOff.flagBytes / selectOff.events, "the flag bytes per selection are not exactly 4 B per node + link line + arrowhead + wedge").toBe(4 * (N + 2 * edgeCount + wedgeCount));
   });
 
   it("LOD OFF — zoom sweep with a selection: the static lane never re-emits, accessors stay flat", () => {

@@ -124,7 +124,7 @@ describe("share-mode flow border (#510): the border covers the exit-flow share o
   // 2 one state node each. Each view takes its own graph's node flow: a physical node's flow is the sum of its
   // state nodes' flow.
   const stateNetwork = () =>
-    buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 2], source: [], target: [], nodeFlow: [0.2, 0.2, 0.4, 0.2], directed: false });
+    buildStateGraph({ stateCount: 4, stateToPhysical: [0, 0, 1, 2], source: [], target: [], nodeFlow: [0.2, 0.2, 0.4, 0.2] });
   const stateModules = [
     { id: 0, path: [1, 1] },
     { id: 1, path: [1, 2] },
