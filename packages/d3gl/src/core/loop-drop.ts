@@ -27,7 +27,7 @@ import { barbOverhang, headHalfWidth, headLength, legCubic, type PointBuffer } f
 import type { InstancedLoopHead } from "./backend.js";
 
 /** The angle between the loop's two legs at the centre (degrees): the default of the network style's `selfLinkSpread`. */
-export const LOOP_SPREAD = 40;
+export const LOOP_SPREAD = 25;
 /** Half the angle between the loop's two legs at the centre (radians): the default `α`, half {@link LOOP_SPREAD}. */
 export const DROP_HALF_SPREAD = (LOOP_SPREAD * Math.PI) / 360;
 /** `cot α`: recovers the loop's centre from its rim ends ({@link solveLoop}); the WebGL loop lane reads it as `u_loopCot`.
@@ -36,7 +36,7 @@ export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
 /** The loop's leg length in node radii (`ℓ = L·r`): with {@link DROP_HALF_SPREAD}, the teardrop. The default of the
  *  network style's `selfLinkLength`: the writers take `L` as an argument, and the WebGL loop lane reads it per loop
  *  from its `bends` column. */
-export const LOOP_LEG = 3;
+export const LOOP_LEG = 1.5;
 
 /** `cot α` for half-spread `α` (radians): what the writers and the WebGL loop lane solve the centre with. */
 export function spreadCot(halfSpread: number): number {

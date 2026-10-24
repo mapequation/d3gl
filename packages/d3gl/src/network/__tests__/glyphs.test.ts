@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { nodeCircles, linkLines, linkHeads, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
+import { LOOP_LEG, LOOP_SPREAD } from "../../core/loop-drop.js";
 import { scaleSqrt } from "d3-scale";
 import { rgb } from "d3-color";
 
@@ -22,8 +23,8 @@ const style = (n: number): ResolvedNetworkStyle => ({
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
-  selfLinkSpread: 40,
-  selfLinkLength: 3,
+  selfLinkSpread: LOOP_SPREAD,
+  selfLinkLength: LOOP_LEG,
 });
 
 describe("resolveImportance", () => {

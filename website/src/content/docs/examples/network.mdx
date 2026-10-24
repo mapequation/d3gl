@@ -273,8 +273,8 @@ and a directed loop's arrowhead sits on the rim pointing into the node, like an 
 target. Each loop is one shape with its head, like a directed link. A node with several self-link edges draws
 **one** loop: their weights are summed, and the loop's width, colour and flow come from that sum. The
 placement is a fixed rule, not a style option, but the shape is tunable: `selfLinkSpread` sets the angle
-between the loop's two legs (degrees, default 40) and `selfLinkLength` its leg length (node radii, default
-3); both names are provisional. The demo's controls also bend the other links with `linkBend`. Loops follow the link style (`line`, with an arrowhead
+between the loop's two legs (degrees, default 25) and `selfLinkLength` its leg length (node radii, default
+1.5); both names are provisional. The demo's controls also bend the other links with `linkBend`. Loops follow the link style (`line`, with an arrowhead
 when `directed`, or `half-arrow`) and the `sizeMode`, on WebGL, Canvas and SVG alike, and in `toSVG()`.
 
 Hovering or clicking a loop reports the node's first self-link edge with the summed weight, and the

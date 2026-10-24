@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, loopHalfHeadLength, traceLoop } from "../../core/loop-drop.js";
+import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, LOOP_SPREAD, loopArrowOutline, loopHalfArrowOutline, loopsSpreadCot, spreadCot, loopHalfHeadLength, traceLoop } from "../../core/loop-drop.js";
 import { headHalfWidth, headLength } from "../../core/arrowhead.js";
 import { StableColumns } from "../../core/stable-columns.js";
 import {
@@ -40,8 +40,8 @@ const style = (n: number, over: Partial<ResolvedNetworkStyle> = {}): ResolvedNet
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
-  selfLinkSpread: 40,
-  selfLinkLength: 3,
+  selfLinkSpread: LOOP_SPREAD,
+  selfLinkLength: LOOP_LEG,
   ...over,
 });
 
@@ -395,7 +395,7 @@ describe("an LOD frame's loops on kept leaves", () => {
     directed: false,
   });
   g.positions.set(Array.from({ length: 20 }, (_, i) => (i % 2 ? 0 : 10 * (i / 2))));
-  const style = { nodeRadii: new Float32Array(10).fill(2), linkWidthOf: () => 1, linkColorOf: (): [number, number, number, number] => [255, 0, 0, 255], directed: false, arrowSize: 3, linkStyle: "line", sizeMode: "world" as const, selfLinkSpread: 40, selfLinkLength: 3 };
+  const style = { nodeRadii: new Float32Array(10).fill(2), linkWidthOf: () => 1, linkColorOf: (): [number, number, number, number] => [255, 0, 0, 255], directed: false, arrowSize: 3, linkStyle: "line", sizeMode: "world" as const, selfLinkSpread: LOOP_SPREAD, selfLinkLength: LOOP_LEG };
 
   it("lists the loops of kept leaves in min(S, frontier) reads, by either pass", () => {
     const c = selfLoopCache(g, style);

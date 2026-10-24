@@ -303,10 +303,10 @@ export interface InstancedLoopColumns {
   /** RGBA bytes per loop, length `4 * count`. */
   colors: Uint8Array;
   /** The length of the loops' cubic arms `ℓ`, in multiples of each loop's radius `r` (the centre-to-rim distance).
-   *  One value per layer (a uniform). Absent ⇒ 3 (`LOOP_LEG`). */
+   *  One value per layer (a uniform). Absent ⇒ 1.5 (`LOOP_LEG`). */
   legLength?: number;
   /** The angle between each loop's two straight pieces at the centre, in radians: the angle between its rim ends.
-   *  One value per layer (a uniform). Absent ⇒ 40° (`LOOP_SPREAD`). */
+   *  One value per layer (a uniform). Absent ⇒ 25° (`LOOP_SPREAD`). */
   spread?: number;
   /** Path samples (M) along the cubic; a draw setting, not per-instance. Default 2. */
   samples?: number;
