@@ -42,14 +42,34 @@ describe("buildStateGraph", () => {
     expect(state.directed).toBe(true);
   });
 
-  it("derives the physical network by summing state edges across physical boundaries (directed)", () => {
+  it("derives the physical network by summing state edges per physical pair (directed)", () => {
     const { physical, physicalCount } = buildStateGraph(input);
     expect(physicalCount).toBe(2);
-    // A→B aggregates 0->2 (2) and 1->2 (1) = 3; B→A is 2->0 (3). Intra-A edge 0->1 collapses (not a link).
+    // A→B aggregates 0->2 (2) and 1->2 (1) = 3; B→A is 2->0 (3). Intra-A edge 0->1 is A's self-link (#535).
     const edges = physEdges(physical);
     expect(edges.get("0->1")).toBe(3);
     expect(edges.get("1->0")).toBe(3);
-    expect(physical.edgeCount).toBe(2); // exactly the two cross-physical directed links
+    expect(edges.get("0->0")).toBe(5);
+    expect(physical.edgeCount).toBe(3); // the two cross-physical directed links + A's self-link
+  });
+
+  it("sums every state link inside one physical node into that node's one self-link (#535)", () => {
+    // A (0) holds state nodes 0, 1, 2: 0->1 (w2), 1->2 (w3) and 2->2 (w4, a state self-link) stay in A.
+    const g = buildStateGraph({
+      stateCount: 4,
+      stateToPhysical: [0, 0, 0, 1],
+      source: [0, 1, 2, 2],
+      target: [1, 2, 2, 3],
+      weight: [2, 3, 4, 1],
+      nodeFlow: [0.25, 0.25, 0.25, 0.25],
+      directed: true,
+    });
+    const edges = physEdges(g.physical);
+    expect(edges).toEqual(new Map([["0->0", 9], ["0->1", 1]]));
+    // Physical flow is the state flow summed, as before; the self-link counts once in degree and strength.
+    expect(Array.from(g.physical.flow!)).toEqual([0.75, 0.25]);
+    expect(Array.from(g.physical.degree)).toEqual([2, 1]);
+    expect(Array.from(g.physical.strength)).toEqual([10, 1]); // 9 (self, once) + 1
   });
 
   it("maps physical → state (CSR) as the inverse of stateToPhysical", () => {
@@ -116,9 +136,10 @@ describe("lumpStateGraph (#529)", () => {
     expect(Array.from(graph.physicalToState.states)).toEqual([0, 1, 2, 3]);
   });
 
-  it("sums the links between lumps and drops the links inside one, as the physical graph's merge does", () => {
+  it("sums the links between lumps, and the links inside one into its self-link, as the physical graph's merge does", () => {
     const { graph } = lumpStateGraph(sg, modules);
-    expect(physEdges(graph.state)).toEqual(new Map([["0->2", 3], ["1->3", 4], ["3->0", 5], ["1->0", 6]]));
+    // 0 → 1 (7) stays inside lump 0 (#535).
+    expect(physEdges(graph.state)).toEqual(new Map([["0->0", 7], ["0->2", 3], ["1->3", 4], ["3->0", 5], ["1->0", 6]]));
     expect(graph.state.directed).toBe(true);
     expect(Array.from(graph.state.flow ?? [])).toEqual(Array.from(Float32Array.from([0.3, 0.3, 0.15, 0.25])));
   });

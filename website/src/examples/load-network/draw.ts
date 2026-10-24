@@ -30,7 +30,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     // Size nodes by degree so hubs stand out: a d3 `scaleSqrt` (area-proportional) over the degree
     // range, handed straight to `nodeRadius` via { by: "degree", scale }. Resolved once, no draw cost.
     let maxDegree = 1;
-    for (const d of graph.csr.degree) if (d > maxDegree) maxDegree = d;
+    for (const d of graph.degree) if (d > maxDegree) maxDegree = d;
     const radius = scaleSqrt().domain([1, maxDegree]).range([4, 16]);
     net
       .data(graph)

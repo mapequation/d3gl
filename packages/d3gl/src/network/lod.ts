@@ -1709,7 +1709,7 @@ export function computeLODStyle(
  *
  * `leafRadii` is the resolved per-node radius (so aggregates respect the node sizing); `leafWeight`
  * is the per-leaf importance, defaulting to `graph.strength` (weighted degree) — pass `graph.flow`
- * or `graph.csr.degree` to prioritise differently. `discs` places each module on its nested-layout
+ * or `graph.degree` to prioritise differently. `discs` places each module on its nested-layout
  * disc (#329, see {@link computeLODPositions}); `bounds` is the position pass's reusable box scratch —
  * without one the pass reuses a shared scratch, so a repeated call allocates nothing for it.
  */
