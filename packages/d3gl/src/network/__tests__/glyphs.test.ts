@@ -22,6 +22,8 @@ const style = (n: number): ResolvedNetworkStyle => ({
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
+  selfLinkSpread: 40,
+  selfLinkLength: 3,
 });
 
 describe("resolveImportance", () => {

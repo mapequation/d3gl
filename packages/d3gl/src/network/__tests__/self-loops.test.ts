@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
-import { DROP_HALF_SPREAD, LOOP_LEG, loopArrowOutline, loopHalfArrowOutline, loopHalfHeadLength, traceLoop } from "../../core/loop-drop.js";
+import { DROP_COT, DROP_HALF_SPREAD, LOOP_LEG, loopArrowOutline, loopCot, loopHalfArrowOutline, loopHalfHeadLength, traceLoop } from "../../core/loop-drop.js";
 import { headHalfWidth, headLength } from "../../core/arrowhead.js";
 import { StableColumns } from "../../core/stable-columns.js";
 import {
@@ -40,6 +40,8 @@ const style = (n: number, over: Partial<ResolvedNetworkStyle> = {}): ResolvedNet
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
+  selfLinkSpread: 40,
+  selfLinkLength: 3,
   ...over,
 });
 
@@ -301,6 +303,72 @@ describe("self-loop cache and layers (per-frame cost)", () => {
   });
 });
 
+describe("selfLinkSpread and selfLinkLength (#542)", () => {
+  // Node 1 loops; its one neighbour sits at −x, so the loop points along +x (θ = 0).
+  const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 1], directed: false });
+  g.positions.set([0, 0, 10, 0]);
+  const loopLayer = (s: ResolvedNetworkStyle) => {
+    const layer = networkLayersFromCache(g, s, noLodStyleCache(g, s)).find((l) => l.name === SELF_LOOP_LAYER);
+    if (!layer || layer.primitive !== "lines") throw new Error("expected the loop lines layer");
+    return layer.lines;
+  };
+  const ends = (l: ReturnType<typeof loopLayer>): [number, number] => [
+    Math.atan2(l.sourceOffsets?.[1] ?? 0, l.sourceOffsets?.[0] ?? 0),
+    Math.atan2(l.targetOffsets?.[1] ?? 0, l.targetOffsets?.[0] ?? 0),
+  ];
+
+  it("the defaults reproduce α = 20°, cot α and L = 3", () => {
+    const c = selfLoopCache(g, style(2));
+    if (!c) throw new Error("expected loops");
+    expect(c.halfSpread).toBe(DROP_HALF_SPREAD);
+    expect(c.loopCot).toBe(DROP_COT);
+    expect([...c.legs]).toEqual([LOOP_LEG]);
+    const l = loopLayer(style(2));
+    expect(l.loopCot).toBe(DROP_COT);
+    const [a0, a1] = ends(l);
+    expect(a0).toBeCloseTo(DROP_HALF_SPREAD, 6);
+    expect(a1).toBeCloseTo(-DROP_HALF_SPREAD, 6);
+  });
+
+  it("the spread moves the rim ends to θ ± spread/2 and the centre solve follows it", () => {
+    const l = loopLayer(style(2, { selfLinkSpread: 90 }));
+    const [a0, a1] = ends(l);
+    expect(a0).toBeCloseTo(Math.PI / 4, 6);
+    expect(a1).toBeCloseTo(-Math.PI / 4, 6);
+    expect(Math.hypot(l.sourceOffsets?.[0] ?? 0, l.sourceOffsets?.[1] ?? 0)).toBeCloseTo(4, 5); // on the rim
+    expect(l.loopCot).toBeCloseTo(1, 12); // cot 45°
+    expect(l.loopCot).toBe(loopCot(Math.PI / 4));
+    // The writers recover the node centre from those ends with that cot: the path starts and ends there.
+    const seg: [number, number][] = [];
+    const so = l.sourceOffsets ?? new Float32Array(2), to = l.targetOffsets ?? new Float32Array(2);
+    traceLoop({ moveTo: (x, y) => void seg.push([x, y]), lineTo: (x, y) => void seg.push([x, y]), bezierCurveTo: (_a, _b, _c, _d, x, y) => void seg.push([x, y]) }, 10 + (so[0] ?? 0), so[1] ?? 0, 10 + (to[0] ?? 0), to[1] ?? 0, 0, LOOP_LEG, l.loopCot);
+    expect(seg[0]?.[0]).toBeCloseTo(10, 5);
+    expect(seg[0]?.[1]).toBeCloseTo(0, 5);
+    // E0 = c + r·u0 at h = 0: the ends themselves.
+    expect(seg[1]?.[0]).toBeCloseTo(10 + (so[0] ?? 0), 5);
+  });
+
+  it("the length fills the legs column (the lane's bends) and leaves the ends alone", () => {
+    const l = loopLayer(style(2, { selfLinkLength: 4.5 }));
+    expect([...(l.bends ?? [])]).toEqual([4.5]);
+    const [a0, a1] = ends(l);
+    expect(a0).toBeCloseTo(DROP_HALF_SPREAD, 6);
+    expect(a1).toBeCloseTo(-DROP_HALF_SPREAD, 6);
+    expect(l.loopCot).toBe(DROP_COT);
+  });
+
+  it("an LOD frame's subset keeps the spread and the length", () => {
+    const c = selfLoopCache(g, style(2, { selfLinkSpread: 60, selfLinkLength: 2 }));
+    if (!c) throw new Error("expected loops");
+    const sc = makeKeptLoopsScratch();
+    const m = keptLeafLoops(c.loops, 2, Uint32Array.of(1), null, sc);
+    const sub = selfLoopSubset(c, g, m, { cx: Float32Array.of(0, 10), cy: new Float32Array(2) }, new StableColumns(), sc);
+    expect(sub.loopCot).toBe(c.loopCot);
+    expect([...sub.legs]).toEqual([2]);
+    expect(Math.atan2(sub.sourceOffsets[1] ?? 0, sub.sourceOffsets[0] ?? 0)).toBeCloseTo(Math.PI / 6, 6);
+  });
+});
+
 describe("an LOD frame's loops on kept leaves", () => {
   // Nodes 0..9 on a line; self-links on 2, 5 and 7 (5 twice: one loop, summed weight).
   const g = buildGraph({
@@ -311,7 +379,7 @@ describe("an LOD frame's loops on kept leaves", () => {
     directed: false,
   });
   g.positions.set(Array.from({ length: 20 }, (_, i) => (i % 2 ? 0 : 10 * (i / 2))));
-  const style = { nodeRadii: new Float32Array(10).fill(2), linkWidthOf: () => 1, linkColorOf: (): [number, number, number, number] => [255, 0, 0, 255], directed: false, arrowSize: 3, linkStyle: "line", sizeMode: "world" as const };
+  const style = { nodeRadii: new Float32Array(10).fill(2), linkWidthOf: () => 1, linkColorOf: (): [number, number, number, number] => [255, 0, 0, 255], directed: false, arrowSize: 3, linkStyle: "line", sizeMode: "world" as const, selfLinkSpread: 40, selfLinkLength: 3 };
 
   it("lists the loops of kept leaves in min(S, frontier) reads, by either pass", () => {
     const c = selfLoopCache(g, style);

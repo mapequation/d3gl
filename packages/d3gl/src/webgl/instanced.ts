@@ -813,7 +813,7 @@ export class InstancedLines {
       ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
       ...(this.headed ? { u_arrowSize: data.arrowSize ?? 0 } : {}),
       // A loop's head length (`2·arrowSize`, line style), its centre solve (cot α) and its band (#542).
-      ...(this.loop ? { u_arrowSize: data.arrowSize ?? 0, u_loopCot: DROP_COT, u_loopHalf: this.loop === "half" ? 1 : 0 } : {}),
+      ...(this.loop ? { u_arrowSize: data.arrowSize ?? 0, u_loopCot: data.loopCot ?? DROP_COT, u_loopHalf: this.loop === "half" ? 1 : 0 } : {}),
     };
     const bufferLayout = [
       { name: "a_corner", format: "float32x2" as const },
@@ -906,6 +906,7 @@ export class InstancedLines {
     if (loop !== this.loop) return false; // a loop's variant changes its template (#542)
     if ((loop === null && data.arrowSize !== undefined) !== this.headed) return false; // head on/off changes the program (#542)
     if (this.headed || loop) this.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
+    if (loop) this.uniforms["u_loopCot"] = data.loopCot ?? DROP_COT;
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
       this.source.destroy();

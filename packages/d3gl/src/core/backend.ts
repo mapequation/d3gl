@@ -164,6 +164,9 @@ export interface InstancedLinesData {
    *  tip on the rim, `"half"`: the half-arrow band (one link width on the outside) and its one-sided head. A draw
    *  setting like `samples`: a change recreates the layer. */
   loopHead?: "arrow" | "half";
+  /** `curve: "drop"` only: `cot α`, `α` half the angle between a loop's legs, with which its centre is recovered from
+   *  its two rim ends (`core/loop-drop.ts`). One value per layer (a uniform). Absent ⇒ `DROP_COT` (α = 20°). */
+  loopCot?: number;
   /** [x, y] world source per line, length `2 * count`. */
   sources: Float32Array;
   /** [x, y] world target per line, length `2 * count`. */

@@ -2709,6 +2709,10 @@ export interface ResolvedNetworkStyle {
    * for half-arrows the bow side is derived from the link direction so a reciprocal pair nests.
    */
   linkBend: number;
+  /** The angle between a self-link loop's two legs (degrees; `selfLinkSpread`, default 40). */
+  selfLinkSpread: number;
+  /** A self-link loop's leg length in node radii (`selfLinkLength`, default 3). */
+  selfLinkLength: number;
 }
 
 /**

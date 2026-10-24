@@ -70,6 +70,9 @@ interface Case {
   lod?: boolean;
   /** The link width (default 3). */
   linkWidth?: number;
+  /** The loop's spread (degrees) and leg length (radii); absent ⇒ the defaults. */
+  selfLinkSpread?: number;
+  selfLinkLength?: number;
 }
 
 async function draw(c: Case) {
@@ -79,7 +82,7 @@ async function draw(c: Case) {
   const g = buildGraph({ nodeCount: 2, source: [0, ...self.map(() => 0)], target: [1, ...self.map(() => 0)], weight: [1, ...self], directed: c.directed });
   net
     .data(g)
-    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: c.linkWidth ?? 3, arrowSize: ARROW_SIZE, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode })
+    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: c.linkWidth ?? 3, arrowSize: ARROW_SIZE, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode, selfLinkSpread: c.selfLinkSpread, selfLinkLength: c.selfLinkLength })
     .lod(c.lod ? { expandPx: 1, declutter: false } : false)
     .layout({ backend: "positions", positions: POSITIONS });
   net.setTransform({ k: 1, x: 0, y: 0 });
@@ -247,10 +250,21 @@ async function frameRedMask(png: string): Promise<Uint8Array> {
   return out;
 }
 
+/** A non-default loop shape: a wider spread and shorter legs (still inside the mask's box). */
+const SHAPE = { selfLinkSpread: 70, selfLinkLength: 2 };
+
 describe("self-link loops: WebGL draws the Canvas Scene's shape (#542)", () => {
+  const variants: Omit<Case, "backend" | "sizeMode">[] = [
+    { directed: false },
+    { directed: true },
+    { directed: true, linkStyle: "half-arrow" },
+    { directed: false, ...SHAPE },
+    { directed: true, ...SHAPE },
+    { directed: true, linkStyle: "half-arrow", ...SHAPE },
+  ];
   for (const sizeMode of SIZE_MODES)
-    for (const v of [{ directed: false }, { directed: true }, { directed: true, linkStyle: "half-arrow" as const }])
-      it(`${sizeMode} / ${v.directed ? (v.linkStyle ?? "line") : "undirected"}: the GPU loop covers the Canvas loop's pixels`, async () => {
+    for (const v of variants)
+      it(`${sizeMode} / ${v.directed ? (v.linkStyle ?? "line") : "undirected"}${v.selfLinkSpread ? " / spread 70°, length 2" : ""}: the GPU loop covers the Canvas loop's pixels`, async () => {
         const gl = await draw({ backend: "webgl", sizeMode, ...v });
         const cv = await draw({ backend: "canvas", sizeMode, ...v });
         const ma = await frameRedMask(gl.toPNG());
@@ -275,6 +289,18 @@ describe("self-link loops: WebGL draws the Canvas Scene's shape (#542)", () => {
         expect(red, "the Canvas loop drew nothing (non-vacuity)").toBeGreaterThan(20);
         expect(diff, `${diff} of ${red} loop pixels differ by more than a pixel`).toBe(0);
       });
+
+  it("selfLinkSpread / selfLinkLength change the loop's shape (non-vacuity of the cases above)", async () => {
+    const a = await draw({ backend: "canvas", sizeMode: "world", directed: true });
+    const b = await draw({ backend: "canvas", sizeMode: "world", directed: true, ...SHAPE });
+    const ma = await frameRedMask(a.toPNG());
+    const mb = await frameRedMask(b.toPNG());
+    a.destroy();
+    b.destroy();
+    let diff = 0;
+    for (let i = 0; i < ma.length; i++) if (ma[i] !== mb[i]) diff++;
+    expect(diff).toBeGreaterThan(50);
+  });
 });
 
 /** The red mask of an SVG document, rasterized, over the loop's box (1 = link colour). */
@@ -297,10 +323,10 @@ async function svgRedMask(svg: string): Promise<Uint8Array> {
 
 describe("self-link drop export (#505)", () => {
   for (const sizeMode of SIZE_MODES)
-    for (const linkStyle of ["line", "half-arrow"] as const)
-      it(`${sizeMode} / ${linkStyle}: WebGL toSVG() draws the same drop as the Canvas Scene`, async () => {
-        const gl = await draw({ backend: "webgl", sizeMode, directed: true, linkStyle });
-        const cv = await draw({ backend: "canvas", sizeMode, directed: true, linkStyle });
+    for (const [linkStyle, shape] of [["line", {}], ["half-arrow", {}], ["line", SHAPE], ["half-arrow", SHAPE]] as const)
+      it(`${sizeMode} / ${linkStyle}${"selfLinkSpread" in shape ? " / spread 70°, length 2" : ""}: WebGL toSVG() draws the same drop as the Canvas Scene`, async () => {
+        const gl = await draw({ backend: "webgl", sizeMode, directed: true, linkStyle, ...shape });
+        const cv = await draw({ backend: "canvas", sizeMode, directed: true, linkStyle, ...shape });
         const a = gl.toSVG();
         const b = cv.toSVG();
         const ma = await svgRedMask(a);

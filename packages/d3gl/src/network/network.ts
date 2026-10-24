@@ -1,4 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type LayerSpec, type NodeDragSession } from "../map/base-engine.js";
+import { LOOP_LEG, LOOP_SPREAD } from "../core/loop-drop.js";
 import { emitSelfLoops, emitSelfLoopArrows, emitSelfLoopHalfArrows, updateSelfLoops, selfLoopOfEdge, selfLoopSelected, selfLoopLayers, selfLoopSubset, keptLeafLoops, makeKeptLoopsScratch, SELF_LOOP_LAYER, type SelfLoopCache } from "./self-loops.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrowLinks, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, resolveNodeColors, isModuleFill, moduleFillColors, modulePalette, paletteRGBA, pathRGBA, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ResolvedNodeFill, type ModulePalette, type ModuleColor, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue, resolveNodeBorder, darkenedCss } from "./glyphs.js";
 import { rgb } from "d3-color";
@@ -322,6 +323,16 @@ export interface NetworkStyle {
    * reciprocal A→B / B→A pair nests around a shared centre curve instead of colliding.
    */
   linkBend?: number;
+  /**
+   * Self-link loops (#542): the angle between a loop's two legs where they leave and re-enter the node, in degrees
+   * (default `40`). Wider spreads a rounder loop. A provisional name: it may change before it is settled.
+   */
+  selfLinkSpread?: number;
+  /**
+   * Self-link loops (#542): how far a loop reaches out, as its leg length in node radii (default `3`). A provisional
+   * name: it may change before it is settled.
+   */
+  selfLinkLength?: number;
 }
 
 /** How node positions are produced. Applies to plain graphs ({@link Network.layout}) and, since #182,
@@ -6575,6 +6586,8 @@ export class Network extends BaseEngine {
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
       constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,
+      selfLinkSpread: this.styleOpts.selfLinkSpread ?? LOOP_SPREAD,
+      selfLinkLength: this.styleOpts.selfLinkLength ?? LOOP_LEG,
     };
   }
 

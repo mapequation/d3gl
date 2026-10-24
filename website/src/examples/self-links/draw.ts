@@ -7,7 +7,9 @@ import { buildSelfLinkGraph } from "./data.js";
 /**
  * **Self-links** draw as a loop at their node, placed opposite the mean direction of the node's neighbours,
  * and styled like the other links: the loop's width follows its weight. Toggle **Directed** / **Undirected**,
- * switch the link **Style** and the **Sizing** mode, and the **backend** (WebGL / Canvas / SVG).
+ * switch the link **Style** and the **Sizing** mode, and the **backend** (WebGL / Canvas / SVG). **Bend** the
+ * other links (`linkBend`, with its **Bend strength**), and shape the loop: **Loop spread** is the angle between its
+ * two legs (`selfLinkSpread`, degrees) and **Loop length** how far it reaches out (`selfLinkLength`, node radii).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -37,6 +39,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         nodeFill: (i) => color(String(g.module[i])),
         linkWidth, // ∝ weight, loops included
         linkStroke: linkColor,
+        linkBend: options.bend === "Bent" ? Number(options.bendStrength) : 0,
+        selfLinkSpread: Number(options.loopSpread),
+        selfLinkLength: Number(options.loopLength),
       });
     },
   };
