@@ -4,6 +4,7 @@
  * texelFetch + textureSize (recolor = texture update, no geometry change). A
  * parallel R8 flags texture culls hidden drawables (visible flag in bit 0).
  */
+import { DROP_LINE_GLSL, DROP_HALF_ARROW_GLSL } from "../core/loop-drop.js";
 
 // Shader-driven selection/hover highlight for the instanced lanes (#162). Injected into each instanced
 // vertex shader: per-instance `a_group` (node id / link source id) + `a_selected` (0/1), and uniforms
@@ -310,7 +311,8 @@ void main() {
 // the chord length); `a_bend = 0` ⇒ the control sits on the chord ⇒ a straight line (so straight
 // links draw exactly as before, at M=2). The strip offsets each sample by the *tangent's*
 // perpendicular, so a continuous strip gets its joins for free. Pairs with FILL_FS.
-export const INSTANCED_LINE_VS = `#version 300 es
+function lineVS(curve: string): string {
+  return `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
@@ -341,11 +343,7 @@ void main() {
   // of the chord, so the bezier on the projected ends is the projection of the world bezier (a similarity).
   vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
   vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
-  vec2 d = tgt - src;
-  vec2 ctrl = 0.5 * (src + tgt) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
-  float u = 1.0 - t;
-  vec2 p = u * u * src + 2.0 * u * t * ctrl + t * t * tgt;  // B(t)
-  vec2 tang = 2.0 * u * (ctrl - src) + 2.0 * t * (tgt - ctrl); // B'(t)
+${curve}
   if (screen) {
     // Constant-pixel width: offset the px centreline point along the tangent's perpendicular, then px -> clip.
     vec2 dir = normalize(tang);
@@ -358,6 +356,16 @@ void main() {
     gl_Position = vec4((u_transform * vec3(p + perp * side * hw, 1.0)).xy, 0.0, 1.0);
   }
 }`;
+}
+const QUADRATIC_LINE_GLSL = `
+  vec2 d = tgt - src;
+  vec2 ctrl = 0.5 * (src + tgt) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
+  float u = 1.0 - t;
+  vec2 p = u * u * src + 2.0 * u * t * ctrl + t * t * tgt;  // B(t)
+  vec2 tang = 2.0 * u * (ctrl - src) + 2.0 * t * (tgt - ctrl); // B'(t)`;
+export const INSTANCED_LINE_VS = lineVS(QUADRATIC_LINE_GLSL);
+/** The self-link drop's lane (#505): the line lane with the drop cubic for the quadratic, for the loop layers only. */
+export const DROP_LINE_VS = lineVS(DROP_LINE_GLSL);
 
 // INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
 // One triangle per instance: per-vertex a_tri = (back, across), tip (0,0); the symmetric template
@@ -428,7 +436,8 @@ void main() {
 // constant pixel size while the endpoints still move with zoom. The geometry math is scale-free, so
 // only the input/output space differs: screen mode adds two world→px projections up front and a px→clip
 // convert at the end (a uniform branch — the world path is untouched).
-export const INSTANCED_HALF_ARROW_VS = `#version 300 es
+function halfArrowVS(geometry: string, inner: string, outer: string): string {
+  return `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
@@ -449,6 +458,10 @@ vec2 bez(vec2 p0, vec2 c, vec2 p2, float t) {
   float u = 1.0 - t;
   return u * u * p0 + 2.0 * u * t * c + t * t * p2;
 }
+vec2 cub(vec2 p0, vec2 c1, vec2 c2, vec2 p3, float t) {
+  float u = 1.0 - t;
+  return u * u * u * p0 + 3.0 * u * u * t * c1 + 3.0 * u * t * t * c2 + t * t * t * p3;
+}
 vec2 worldToPx(vec2 w) {
   vec2 clip = (u_transform * vec3(w, 1.0)).xy;
   return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
@@ -468,6 +481,26 @@ void main() {
   float width = a_widths.x;
   float oppositeWidth = a_widths.y;
 
+${geometry}
+
+  vec2 pos;
+  if (code < 0.5) pos = p0;
+  else if (code < 1.5) pos = x02;
+  else if (code < 2.5) pos = x03;
+  else if (code < 3.5) pos = x04;
+  else if (code < 4.5) pos = x11;
+  else if (code < 5.5) pos = x12;
+  else if (code < 6.5) pos = x13;
+  else if (code < 7.5) pos = x14;
+  else if (code < 8.5) pos = ${inner};
+  else pos = ${outer};
+
+  // World: project the world-space point. Screen: pos is already px, so convert px to clip.
+  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
+  gl_Position = vec4(clip, 0.0, 1.0);
+}`;
+}
+const QUADRATIC_HALF_ARROW_GLSL = `
   vec2 d = p1 - p0;
   float l = length(d);
   float lBetween = l - r0 - r1;
@@ -504,24 +537,10 @@ void main() {
   vec2 x12 = x11 + tipLength * dir1;
   vec2 left1 = vec2(dir1.y, -dir1.x);
   vec2 x13 = x12 + width * left1;
-  vec2 x14 = x13 + tipWidth * left1;
-
-  vec2 pos;
-  if (code < 0.5) pos = p0;
-  else if (code < 1.5) pos = x02;
-  else if (code < 2.5) pos = x03;
-  else if (code < 3.5) pos = x04;
-  else if (code < 4.5) pos = x11;
-  else if (code < 5.5) pos = x12;
-  else if (code < 6.5) pos = x13;
-  else if (code < 7.5) pos = x14;
-  else if (code < 8.5) pos = bez(x02, cp1, x12, t);
-  else pos = bez(x03, cp2, x13, t);
-
-  // World: project the world-space point. Screen: pos is already px, so convert px to clip.
-  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
-  gl_Position = vec4(clip, 0.0, 1.0);
-}`;
+  vec2 x14 = x13 + tipWidth * left1;`;
+export const INSTANCED_HALF_ARROW_VS = halfArrowVS(QUADRATIC_HALF_ARROW_GLSL, "bez(x02, cp1, x12, t)", "bez(x03, cp2, x13, t)");
+/** The self-link drop's half-arrow lane (#505), for the loop layer only. */
+export const DROP_HALF_ARROW_VS = halfArrowVS(DROP_HALF_ARROW_GLSL, "cub(x02, c1, c2, x12, t)", "cub(x03, cp1, cp2, x13, t)");
 
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space
