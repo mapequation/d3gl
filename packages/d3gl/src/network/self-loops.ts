@@ -7,9 +7,9 @@
  *   the settled link cubic (`legCubic`), its far end round: a teardrop given by its two rim ends. On Canvas / SVG
  *   it is ONE shape in the `links` group: a stroked path (undirected), a filled arrow outline (directed `line`
  *   style, its tip on the rim) or a filled half-arrow outline. On WebGL it is the same ONE shape: one instance of
- *   the `lines` lane with its two ends set off the node centre by `sourceOffsets` / `targetOffsets` (#509), drawn by
- *   the lane's `curve: "drop"` program (`loopHead` picks the variant) in the loop layer only, so ordinary links run
- *   their program unchanged.
+ *   the `lines`, `arrows` or `half-arrows` layer (the variant) with its two ends set off the node centre by
+ *   `sourceOffsets` / `targetOffsets` (#509), drawn by the line lane's `curve: "drop"` program in the loop layer
+ *   only, so ordinary links run their program unchanged.
  * - `θ` points away from the node's neighbours: opposite the weighted mean of the unit vectors to them, or
  *   {@link FALLBACK_ANGLE} when they cancel (or the node has none).
  *
@@ -280,40 +280,35 @@ export const SELF_LOOP_LAYER = "self-loops";
 
 /**
  * The instanced layer that draws the loops on WebGL, over the cache's current columns (call {@link updateSelfLoops}
- * first): ONE `lines` layer whose `curve: "drop"` program draws each loop as the Scene's one shape (#542), its
- * `loopHead` the variant (undirected, `"arrow"`, `"half"`), its `bends` the leg `L`, its `loopCot` the legs' spread, its `arrowSize` the line style's
- * head length. Instance `i` is loop `i`; its pick resolves to `loops.edges[i]`. O(1): no array is built.
+ * first): ONE layer whose `curve: "drop"` program draws each loop as the Scene's one shape (#542), its primitive the
+ * variant (`lines` undirected, `arrows` the line style's arrow, `half-arrows` the half-arrow), its `bends` the leg
+ * `L`, its `loopCot` the legs' spread, its `arrowSize` the line style's head length. Instance `i` is loop `i`; its
+ * pick resolves to `loops.edges[i]`. O(1): no array is built.
  */
 export function selfLoopLayers(c: SelfLoopCache, pickable?: true, pickBase?: number): InstancedLayer[] {
   const pick = pickBase === undefined ? {} : { pickable, pickBase };
   const { centres, sourceOffsets, targetOffsets, changed, sizeMode } = c;
-  const loopHead = c.halfArrow ? "half" : c.arrowheads ? "arrow" : undefined;
-  return [
-    {
-      name: SELF_LOOP_LAYER,
-      primitive: "lines",
-      sizeMode,
-      ...pick,
-      lines: {
-        curve: "drop",
-        loopHead,
-        loopCot: c.loopCot,
-        arrowSize: c.arrowSize,
-        sources: centres,
-        targets: centres,
-        widths: c.widths,
-        colors: c.colors,
-        bends: c.legs,
-        samples: LOOP_SAMPLES,
-        groups: c.groups,
-        selected: c.selected,
-        sourceOffsets,
-        targetOffsets,
-        endOffsetsChanged: changed,
-        count: c.loops.count,
-      },
-    },
-  ];
+  const loops = {
+    curve: "drop" as const,
+    loopCot: c.loopCot,
+    arrowSize: c.arrowSize,
+    sources: centres,
+    targets: centres,
+    widths: c.widths,
+    colors: c.colors,
+    bends: c.legs,
+    samples: LOOP_SAMPLES,
+    groups: c.groups,
+    selected: c.selected,
+    sourceOffsets,
+    targetOffsets,
+    endOffsetsChanged: changed,
+    count: c.loops.count,
+  };
+  // `radii` is unused by a loop (its tip is on the rim): the cache's node radii stand in, never uploaded.
+  if (c.halfArrow) return [{ name: SELF_LOOP_LAYER, primitive: "half-arrows", sizeMode, ...pick, halfArrows: { ...loops, radii: c.radii } }];
+  if (c.arrowheads) return [{ name: SELF_LOOP_LAYER, primitive: "arrows", sizeMode, ...pick, arrows: { ...loops, radii: c.radii } }];
+  return [{ name: SELF_LOOP_LAYER, primitive: "lines", sizeMode, ...pick, lines: loops }];
 }
 
 /** Per-loop `selected` flags (#162) from the per-edge link flags: a loop is selected with its edge. O(S). */

@@ -1,12 +1,13 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass, Texture } from "@luma.gl/core";
-import { INDEXED_LINE_VS, INDEXED_HEAD_LINE_VS, INDEXED_ARROW_VS, INDEXED_HALF_ARROW_VS, FILL_FS, PICK_FS } from "./shaders.js";
+import { INDEXED_LINE_VS, INDEXED_HEAD_LINE_VS, INDEXED_HALF_ARROW_VS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import { ARROW_TEMPLATE, HALF_ARROW_TEMPLATE, HALF_ARROW_SAMPLES, END_OFFSETS, halfArrowTemplate, headLineTemplate, lineTemplate, offsetLayout, zeroOffsets } from "./instanced.js";
-import type { InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
+import { HALF_ARROW_SAMPLES, END_OFFSETS, halfArrowTemplate, headLineTemplate, lineTemplate, offsetLayout, zeroOffsets } from "./instanced.js";
+import type { InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
+import type { LineLaneData } from "./instanced.js";
 
 /**
- * **Indexed link draws** (#447): the link primitives (lines, arrowheads, half-arrows) drawn from per-edge
+ * **Indexed link draws** (#447): the link primitives (lines, whole arrows, half-arrows) drawn from per-edge
  * tables resident on the GPU, one instance per listed edge.
  *
  * The attribute primitives (`instanced.ts`) take one array entry per drawn instance, so a caller that shows a
@@ -348,7 +349,7 @@ function selectedSpec(selected: Uint8Array | undefined): TableSpec {
   };
 }
 
-function lineSpecs(d: InstancedLinesData): TableSpec[] {
+function lineSpecs(d: LineLaneData, headed: boolean): TableSpec[] {
   return [
     {
       name: "u_edgeStyle0",
@@ -358,11 +359,11 @@ function lineSpecs(d: InstancedLinesData): TableSpec[] {
     },
     colorSpec(d.colors),
     selectedSpec(d.selected),
-    ...(d.arrowSize !== undefined ? [radiusSpec(d.radii)] : []),
+    ...(headed ? [radiusSpec(d.radii)] : []),
   ];
 }
 
-/** A headed line layer's target radii (#542): one r32float texel (4 B) per edge; zeros without `radii`. */
+/** A whole-arrow layer's target radii (#542): one r32float texel (4 B) per edge; zeros without `radii`. */
 function radiusSpec(radii: Float32Array | undefined): TableSpec {
   return {
     name: "u_edgeRadius",
@@ -373,20 +374,6 @@ function radiusSpec(radii: Float32Array | undefined): TableSpec {
       else out.set(radii.subarray(0, n));
     },
   };
-}
-
-function arrowSpecs(d: InstancedArrowsData): TableSpec[] {
-  return [
-    {
-      name: "u_edgeStyle0",
-      format: "rgba32float",
-      refs: [d.sizes, d.radii, d.bends, d.groups],
-      pack: (out, n) => packRGBA(out, n, [[d.sizes, 1, 0], [d.radii, 1, 0], [d.bends, 1, 0], [d.groups, 1, 0]], [0, 0, 0, -1]),
-    },
-    { name: "u_edgeStyle1", format: "rgba32float", refs: [d.groups2], pack: (out, n) => packRGBA(out, n, [[d.groups2, 1, 0], null, null, null], [-1, 0, 0, 0]) },
-    colorSpec(d.colors),
-    selectedSpec(d.selected),
-  ];
 }
 
 function halfArrowSpecs(d: InstancedHalfArrowsData): TableSpec[] {
@@ -474,53 +461,33 @@ function instancesOf(d: { index?: Float32Array; tableCount?: number; sources: Fl
   return { inst: { index, sources: d.sources, targets: d.targets, fade: d.fade, count: d.count }, tableCount: d.tableCount ?? d.count };
 }
 
-/** Lines drawn by edge id ({@link IndexedLinkDraw}); `samples` is fixed per instance (a change recreates). */
+/** Lines, or whole arrows, drawn by edge id ({@link IndexedLinkDraw}); `samples` and the head are fixed per
+ *  instance (a change recreates). */
 export class IndexedLines extends IndexedLinks {
   protected readonly draw: IndexedLinkDraw;
   protected readonly template: Buffer;
   private readonly samples: number;
-  /** Drawn with its arrowhead (#542, `arrowSize` set): fixed per layer, a change recreates. */
-  private readonly headed: boolean;
-  constructor(device: Device, data: InstancedLinesData, width = 0, height = 0, pick = false) {
+  /** An `arrows` layer (#542): the headed program, fixed per layer by the primitive. */
+  readonly headed: boolean;
+  constructor(device: Device, data: LineLaneData, width = 0, height = 0, pick = false, headed = false) {
     const { inst, tableCount } = instancesOf(data);
     super(tableCount);
     this.samples = Math.max(2, (data.samples ?? 2) | 0);
-    this.headed = data.arrowSize !== undefined;
+    this.headed = headed;
     this.template = device.createBuffer({ data: this.headed ? headLineTemplate(this.samples) : lineTemplate(this.samples) });
     const vs = this.headed ? INDEXED_HEAD_LINE_VS : INDEXED_LINE_VS;
     const vertexCount = this.headed ? this.samples * 2 + 3 : this.samples * 2;
-    this.draw = new IndexedLinkDraw(device, { vs, template: this.template, templateName: "a_corner", ends: ["a_source", "a_target"], vertexCount, topology: "triangle-strip" }, inst, tableCount, lineSpecs(data), width, height, pick);
+    this.draw = new IndexedLinkDraw(device, { vs, template: this.template, templateName: "a_corner", ends: ["a_source", "a_target"], vertexCount, topology: "triangle-strip" }, inst, tableCount, lineSpecs(data, headed), width, height, pick);
     if (this.headed) this.draw.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
   }
   /** `false` when the data is not indexed or its sample count or head changed: the caller recreates. */
-  update(_device: Device, data: InstancedLinesData): boolean {
+  update(_device: Device, data: LineLaneData, headed = false): boolean {
     if (!data.index || Math.max(2, (data.samples ?? 2) | 0) !== this.samples) return false;
-    if ((data.arrowSize !== undefined) !== this.headed) return false;
+    if (headed !== this.headed) return false;
     if (this.headed) this.draw.uniforms["u_arrowSize"] = data.arrowSize ?? 0;
     const { inst, tableCount } = instancesOf(data);
     this.tableCount = tableCount;
-    this.draw.update(inst, tableCount, lineSpecs(data));
-    return true;
-  }
-}
-
-/** Arrowheads drawn by edge id; the `half` flag is fixed per instance (a change recreates). */
-export class IndexedArrows extends IndexedLinks {
-  protected readonly draw: IndexedLinkDraw;
-  protected readonly template: Buffer;
-  private readonly half: boolean;
-  constructor(device: Device, data: InstancedArrowsData, width = 0, height = 0, pick = false) {
-    const { inst, tableCount } = instancesOf(data);
-    super(tableCount);
-    this.half = !!data.half;
-    this.template = device.createBuffer({ data: this.half ? HALF_ARROW_TEMPLATE : ARROW_TEMPLATE });
-    this.draw = new IndexedLinkDraw(device, { vs: INDEXED_ARROW_VS, template: this.template, templateName: "a_tri", ends: ["a_source", "a_target"], vertexCount: 3, topology: "triangle-list" }, inst, tableCount, arrowSpecs(data), width, height, pick);
-  }
-  update(_device: Device, data: InstancedArrowsData): boolean {
-    if (!data.index || !!data.half !== this.half) return false;
-    const { inst, tableCount } = instancesOf(data);
-    this.tableCount = tableCount;
-    this.draw.update(inst, tableCount, arrowSpecs(data));
+    this.draw.update(inst, tableCount, lineSpecs(data, headed));
     return true;
   }
 }

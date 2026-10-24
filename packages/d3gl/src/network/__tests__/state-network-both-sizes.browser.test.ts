@@ -137,8 +137,8 @@ describe("state network both view: state nodes sized by the state view's spec, i
 
           // D4: offset columns only in screen mode, on the state nodes and both ends of every link.
           const links = spy.last.get("links");
-          const lineEnds = links?.primitive === "lines" ? links.lines : null;
-          // #542: a directed link's head rides on its line instance (its ends, its offsets); no arrows layer.
+          const lineEnds = links?.primitive === "arrows" ? links.arrows : null;
+          // #542: a directed link is a whole arrow, its head on its ends and offsets; no separate "arrows" layer.
           expect(spy.last.has("arrows")).toBe(false);
           expect(lineEnds?.arrowSize).toBeGreaterThan(0);
           if (sizeMode === "screen") {

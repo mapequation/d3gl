@@ -88,28 +88,8 @@ describe("instancedVectorLayers (#200)", () => {
     expect(bent?.drawables[1]?.subpaths[0]?.points).toEqual([0, 0, 10, 0]); // bend 0 stays straight
   });
 
-  it("arrows: a filled triangle set back to the target boundary, baked in screen sizeMode", () => {
+  it("arrows (#542): ONE filled outline per whole arrow, shaft to the head's base then barb, tip, barb", () => {
     const arrows = {
-      sources: Float32Array.from([0, 0]),
-      targets: Float32Array.from([100, 0]),
-      radii: Float32Array.from([10]), // node radius: the tip stops here
-      sizes: Float32Array.from([4]),
-      colors: Uint8Array.from([0, 0, 0, 255]),
-      count: 1,
-    };
-    const world = instancedVectorLayers([{ name: "arrows", primitive: "arrows", arrows }], 3)[0];
-    expect(world?.sizeMode).toBeUndefined();
-    expect(world?.drawables[0]?.subpaths[0]?.points.slice(0, 2)).toEqual([90, 0]); // tip = target − radius
-
-    // Screen sizeMode: the constant-px setback/size are solved at k and emitted ÷k as world coords,
-    // so the view's ×k transform reproduces the GPU's constant-pixel head.
-    const screen = instancedVectorLayers([{ name: "arrows", primitive: "arrows", sizeMode: "screen", arrows }], 3)[0];
-    expect(screen?.sizeMode).toBe("world");
-    expect(screen?.drawables[0]?.subpaths[0]?.points[0]).toBeCloseTo(100 - 10 / 3, 5);
-  });
-
-  it("headed lines (#542): ONE filled outline per link, shaft to the head's base then barb, tip, barb", () => {
-    const lines = {
       sources: Float32Array.from([0, 0]),
       targets: Float32Array.from([100, 0]),
       widths: Float32Array.from([4]),
@@ -122,7 +102,7 @@ describe("instancedVectorLayers (#200)", () => {
       expect(got?.length).toBeGreaterThanOrEqual(want.length);
       want.forEach((v, i) => expect(got?.[i] ?? NaN).toBeCloseTo(v, 5));
     };
-    const world = instancedVectorLayers([{ name: "links", primitive: "lines", lines }], 3)[0];
+    const world = instancedVectorLayers([{ name: "links", primitive: "arrows", arrows }], 3)[0];
     const d = world?.drawables[0];
     expect(world?.sizeMode).toBeUndefined();
     expect(d?.fill).toEqual([0, 0, 0, 128]);
@@ -132,12 +112,12 @@ describe("instancedVectorLayers (#200)", () => {
     close(d?.subpaths[0]?.points, [0, 2, 80, 2, 80, 6, 90, 0, 80, -6, 80, -2, 0, -2]);
 
     // Screen sizeMode: solved in px at k = 2 and emitted ÷k as world coordinates.
-    const screen = instancedVectorLayers([{ name: "links", primitive: "lines", sizeMode: "screen", lines }], 2)[0];
+    const screen = instancedVectorLayers([{ name: "links", primitive: "arrows", sizeMode: "screen", arrows }], 2)[0];
     expect(screen?.sizeMode).toBe("world");
     close(screen?.drawables[0]?.subpaths[0]?.points, [0, 1, 90, 1, 90, 3, 95, 0, 90, -3, 90, -1, 0, -1]);
 
     // Bent: still one outline whose tip sits `radius` from the target along the curve's end tangent.
-    const bent = instancedVectorLayers([{ name: "links", primitive: "lines", lines: { ...lines, bends: Float32Array.from([0.2]), samples: 8 } }], 1)[0];
+    const bent = instancedVectorLayers([{ name: "links", primitive: "arrows", arrows: { ...arrows, bends: Float32Array.from([0.2]), samples: 8 } }], 1)[0];
     const pts = bent?.drawables[0]?.subpaths[0]?.points ?? [];
     expect(pts.length).toBeGreaterThanOrEqual(2 * (2 * 8 + 3));
     const tip = 8 + 1; // points 0…7 left edge, 8 left barb, 9 tip

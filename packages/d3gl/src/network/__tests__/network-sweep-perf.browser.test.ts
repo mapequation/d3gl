@@ -43,7 +43,7 @@ import type { InstancedLayer } from "../../core/index.js";
  *      column (widths, colours, group/selected flags) goes out as the SAME array as the frame before,
  *      so the GPU layers' identity skip drops its upload — the bytes moved equal exactly the columns
  *      that are always written (link endpoints; node centres, radii, colours). Held for each link
- *      primitive the LOD lane emits: lines, directed lines with arrowheads, and half-arrows.
+ *      primitive the LOD lane emits: lines, whole arrows (directed lines), and half-arrows.
  *   5. **The declutter's cost signature through the real trigger** — `net.declutterStats` after every
  *      `setTransform`: distance tests and grid cells per frontier glyph stay O(1), and the reused grid
  *      scratch stays within ~2 cells per frontier glyph. Asserted on the LOD sweep above and on a dense
@@ -139,11 +139,12 @@ class LayerSpy {
   }
 }
 
-/** Instances in a frame's link layers (half-arrows / lines) — the super-edges drawn. */
+/** Instances in a frame's link layers (half-arrows / lines / arrows) — the super-edges drawn. */
 function drawnLinks(layers: readonly InstancedLayer[]): number {
   let n = 0;
   for (const l of layers) {
     if (l.primitive === "lines") n += l.lines.count;
+    else if (l.primitive === "arrows") n += l.arrows.count;
     else if (l.primitive === "half-arrows") n += l.halfArrows.count;
   }
   return n;
@@ -172,6 +173,7 @@ function gatheredLinks(layers: readonly InstancedLayer[]): number {
   let n = 0;
   for (const l of layers) {
     if (l.primitive === "lines" && l.name === "links") n += l.lines.count;
+    else if (l.primitive === "arrows" && l.name === "links") n += l.arrows.count;
     else if (l.primitive === "half-arrows" && l.name === "links") n += l.halfArrows.count;
   }
   return n;
@@ -186,6 +188,7 @@ function alwaysWrittenBytes(layers: readonly InstancedLayer[]): number {
       bytes += c.centers.byteLength + c.radii.byteLength + c.colors.byteLength;
       if (c.borders) bytes += c.borders.byteLength + (c.borderColors?.byteLength ?? 0);
     } else if (l.primitive === "lines") bytes += l.lines.sources.byteLength + l.lines.targets.byteLength;
+    else if (l.primitive === "arrows") bytes += l.arrows.sources.byteLength + l.arrows.targets.byteLength;
     else if (l.primitive === "half-arrows") bytes += l.halfArrows.sources.byteLength + l.halfArrows.targets.byteLength;
   }
   return bytes;
@@ -202,10 +205,17 @@ function styleColumns(layers: readonly InstancedLayer[]): Map<string, ArrayBuffe
       put("lines.widths", l.lines.widths);
       put("lines.colors", l.lines.colors);
       put("lines.bends", l.lines.bends);
-      put("lines.radii", l.lines.radii);
       put("lines.groups", l.lines.groups);
       put("lines.groups2", l.lines.groups2);
       put("lines.selected", l.lines.selected);
+    } else if (l.primitive === "arrows") {
+      put("arrows.widths", l.arrows.widths);
+      put("arrows.colors", l.arrows.colors);
+      put("arrows.bends", l.arrows.bends);
+      put("arrows.radii", l.arrows.radii);
+      put("arrows.groups", l.arrows.groups);
+      put("arrows.groups2", l.arrows.groups2);
+      put("arrows.selected", l.arrows.selected);
     } else if (l.primitive === "half-arrows") {
       put("half-arrows.radii", l.halfArrows.radii);
       put("half-arrows.widths", l.halfArrows.widths);
@@ -616,7 +626,7 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
 
   const holdLegs = (): [string, HoldLeg, string[]][] => [
     ["lines", lodHold, ["lines"]],
-    ["directed lines (head in the line, #542)", lodHoldArrows, ["lines"]],
+    ["directed lines (whole arrows, #542)", lodHoldArrows, ["arrows"]],
     ["half-arrows", lodHoldHalfArrows, ["half-arrows"]],
   ];
 

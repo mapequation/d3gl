@@ -364,7 +364,7 @@ const QUADRATIC_LINE_GLSL = `
   vec2 tang = 2.0 * u * (ctrl - src) + 2.0 * t * (tgt - ctrl); // B'(t)`;
 export const INSTANCED_LINE_VS = lineVS(QUADRATIC_LINE_GLSL);
 
-// INSTANCED_HEAD_LINE_VS — a line WITH its arrowhead as one instance (#542): the whole arrow is one strip.
+// INSTANCED_HEAD_LINE_VS — the `arrows` primitive: a whole arrow, shaft + head, as one instance (#542): one strip.
 // The twin of `core/arrowhead.ts` `arrowOutline`: the tip sits `a_radius` back from the target along the
 // curve's end tangent; the head is `2·u_arrowSize` long and `a_width/2 + 2·sqrt(a_width)` wide each side
 // (the half-arrow barb rule, `barbOverhang`); the shaft is the settled cubic (`legCubic`) src → base, whose end
@@ -496,57 +496,6 @@ function loopVS(vs: string): string {
 }
 
 export const INSTANCED_LOOP_VS = loopVS(INSTANCED_LINE_VS);
-
-// INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
-// One triangle per instance: per-vertex a_tri = (back, across), tip (0,0); the symmetric template
-// has base (2,-1)/(2,1), the half template (2,0)/(2,1) (one-sided, for bent map links so reciprocal
-// arrows don't collide). a_target is the target node's *centre*; the tip is set back along the bezier's
-// *end* tangent by a_radius (the target's draw radius) so it lands on the node boundary even when nodes
-// are flow/degree-sized, then scaled by a_size. a_bend = 0 ⇒ oriented along the chord. Pairs with FILL_FS.
-//
-// sizeMode (mirrors the line + half-arrow shaders): in **world** mode the shape is built in world units,
-// then projected — so size/setback scale with zoom. In **screen** mode both endpoints are first projected
-// to px and the same scale-free math runs in px (a_size/a_radius are px), so the arrowhead stays a
-// constant pixel size and meets the node boundary. The end-tangent direction is identical in either space
-// (the view transform is an isotropic scale), so only the working space differs.
-export const INSTANCED_ARROW_VS = `#version 300 es
-precision highp float;
-uniform mat3 u_transform;
-uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
-uniform vec2 u_viewport;  // device px, for screen sizeMode
-layout(location = 0) in vec2 a_tri; // per-vertex (back, across); location 0 stays buffer-backed (OffsetColumn, instanced.ts)
-in vec2 a_source;     // per-instance source centre (orientation)
-in vec2 a_target;     // per-instance target centre (tip set back by a_radius)
-in vec2 a_sourceOffset; // per-instance offsets of the two ends in size units (#509); the constant (0, 0) without them
-in vec2 a_targetOffset;
-in float a_size;      // per-instance arrow size (world or px per sizeMode)
-in float a_radius;    // per-instance target node radius (setback to the boundary)
-in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
-in vec4 a_color;${HL_UNIFORMS}
-uniform float u_pickBase;   // added to the instance's pick id (#447): two pickable link layers decode apart
-out vec4 v_color;
-flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
-vec2 worldToPx(vec2 w) {
-  vec2 clip = (u_transform * vec3(w, 1.0)).xy;
-  return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
-}
-void main() {
-  v_color = a_color;${HL_APPLY}
-  v_id = float(gl_InstanceID) + u_pickBase;
-  bool screen = u_screen > 0.5;
-  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
-  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
-  vec2 d = tgt - src;
-  // Quadratic-bezier end tangent (t=1): 2·(P1 − C), C = midpoint + ⟂(chord)·bend.
-  vec2 endTan = 0.5 * d - vec2(-d.y, d.x) * a_bend;
-  vec2 dir = normalize(endTan);
-  vec2 perp = vec2(-dir.y, dir.x);
-  // World-sized nodes under px-sized arrows (#494): the setback is the node's radius at this zoom, in px.
-  vec2 tip = tgt - dir * a_radius; // set back to the target node's boundary
-  vec2 pos = tip - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
-  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
-  gl_Position = vec4(clip, 0.0, 1.0);
-}`;
 
 // INSTANCED_HALF_ARROW_VS — the "map of networks" directed-link glyph (#104 N6): one filled shape
 // per link that pinches to the source centre, bows around a shared centre curve, and ends in a barbed
@@ -749,27 +698,13 @@ const LINE_FIELDS = ["a_width", "a_color", "a_bend", ...HL_FIELDS];
 const LINE_SAMPLERS = ["u_edgeStyle0", "u_edgeColor", "u_edgeSelected"];
 export const INDEXED_LINE_VS = indexedVS(INSTANCED_LINE_VS, LINE_FIELDS, LINE_SAMPLERS, LINE_FETCH);
 
-/** Headed lines by edge (#542): the line's tables plus an r32float target-radius table. */
+/** Whole arrows by edge (#542): the line's tables plus an r32float target-radius table. */
 export const INDEXED_HEAD_LINE_VS = indexedVS(
   INSTANCED_HEAD_LINE_VS,
   [...LINE_FIELDS, "a_radius"],
   [...LINE_SAMPLERS, "u_edgeRadius"],
   `${LINE_FETCH}
   a_radius = edgeFetch(u_edgeRadius).r;`,
-);
-
-/** Arrowheads by edge: style0 (size, radius, bend, group); style1 (group2); colour; selected. */
-export const INDEXED_ARROW_VS = indexedVS(
-  INSTANCED_ARROW_VS,
-  ["a_size", "a_radius", "a_bend", "a_color", ...HL_FIELDS],
-  ["u_edgeStyle0", "u_edgeStyle1", "u_edgeColor", "u_edgeSelected"],
-  `
-  vec4 s = edgeFetch(u_edgeStyle0);
-  a_size = s.x;
-  a_radius = s.y;
-  a_bend = s.z;
-  a_group = s.w;
-  a_group2 = edgeFetch(u_edgeStyle1).x;${SELECTED_FETCH}`,
 );
 
 /** Half-arrows by edge: style0 (r0, r1, width, oppositeWidth); style1 (bend, group, group2); colour; selected. */

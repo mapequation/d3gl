@@ -2,11 +2,11 @@ import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import { InstancedCircles, InstancedLines, InstancedArrows, radiusColumnStats } from "../instanced.js";
+import { InstancedCircles, InstancedLines, radiusColumnStats } from "../instanced.js";
 import { IndexedLines } from "../indexed-links.js";
 import { arrowHead } from "../../core/arrowhead.js";
 import type { ArrowParams } from "../../core/arrowhead.js";
-import type { InstancedLinesData } from "../../core/index.js";
+import type { InstancedArrowsData } from "../../core/index.js";
 import { clipFromView } from "../index.js";
 import { WebGLBackend } from "../webgl-backend.js";
 
@@ -148,38 +148,6 @@ describe("InstancedLines", () => {
   });
 });
 
-describe("InstancedArrows", () => {
-  it("draws a triangle arrowhead at the tip, oriented from source to target", async () => {
-    const { device, framebuffer } = await setup();
-    const arrows = new InstancedArrows(
-      device,
-      {
-        sources: new Float32Array([0, 32]),
-        targets: new Float32Array([54, 32]), // tip at x=54, pointing +x
-        sizes: new Float32Array([10]),
-        colors: new Uint8Array([255, 0, 0, 255]),
-        count: 1,
-      },
-      W,
-      H,
-    );
-    arrows.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
-
-    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 0] });
-    arrows.render(pass);
-    pass.end();
-    device.submit();
-
-    const inside = px(device, framebuffer, 48, 32); // on axis, between tip (54) and base (34)
-    const before = px(device, framebuffer, 20, 32); // before the base — outside the triangle
-    expect(inside[0]).toBeGreaterThan(200); // red arrowhead
-    expect(before[3]).toBe(0); // transparent before the base
-
-    arrows.destroy();
-    device.destroy();
-  });
-});
-
 // #162 — verify the SHADER HIGHLIGHT actually renders (not just that uniforms are set): a hover/selection
 // is a uniform change on the existing geometry, dimming non-highlighted instances and tinting links red.
 describe("instanced shader highlight (#162)", () => {
@@ -248,10 +216,11 @@ function draw(device: Device, framebuffer: Framebuffer, layer: Layer, pick = fal
 }
 const pickId = (c: ArrayLike<number>): number => (c[0] ?? 0) + 256 * (c[1] ?? 0) + 65536 * (c[2] ?? 0) - 1;
 
-// #542: a headed line is ONE strip, shaft + head, the twin of core/arrowhead.ts `arrowOutline`.
-describe("InstancedLines with an arrowhead (#542)", () => {
+// #542: a whole arrow (an `arrows` layer) is ONE strip of the line lane, shaft + head, the twin of
+// core/arrowhead.ts `arrowOutline`.
+describe("whole arrows on the line lane (#542)", () => {
   // A straight arrow (4,32)→(60,32): width 4, radius 6, size 5 ⇒ tip x = 54, base x = 44, head half-width 2 + 2·√4 = 6.
-  const straight = (alpha: number): InstancedLinesData => ({
+  const straight = (alpha: number): InstancedArrowsData => ({
     sources: new Float32Array([4, 32]),
     targets: new Float32Array([60, 32]),
     widths: new Float32Array([4]),
@@ -277,7 +246,7 @@ describe("InstancedLines with an arrowhead (#542)", () => {
 
   it("world sizeMode: tip at target − radius, no line beside the tip, no gap, a translucent arrow blends once", async () => {
     const { device, framebuffer } = await setup();
-    const lines = new InstancedLines(device, straight(128), W, H);
+    const lines = new InstancedLines(device, straight(128), W, H, false, "arrow");
     lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
     draw(device, framebuffer, lines);
     checkStraight(device, framebuffer, 1);
@@ -289,7 +258,7 @@ describe("InstancedLines with an arrowhead (#542)", () => {
     const { device, framebuffer } = await setup();
     const d = straight(128);
     // Ends at half the coordinates under k = 2 project to the world test's px.
-    const lines = new InstancedLines(device, { ...d, sources: new Float32Array([2, 16]), targets: new Float32Array([30, 16]) }, W, H);
+    const lines = new InstancedLines(device, { ...d, sources: new Float32Array([2, 16]), targets: new Float32Array([30, 16]) }, W, H, false, "arrow");
     lines.setTransform(clipFromView({ k: 2, x: 0, y: 0 }, W, H));
     lines.setSizeMode("screen");
     draw(device, framebuffer, lines);
@@ -316,6 +285,8 @@ describe("InstancedLines with an arrowhead (#542)", () => {
       },
       W,
       H,
+      false,
+      "arrow",
     );
     lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
     draw(device, framebuffer, lines);
@@ -337,7 +308,7 @@ describe("InstancedLines with an arrowhead (#542)", () => {
     device.destroy();
   });
 
-  it("a pick on a head pixel returns the line's own id (+ pick base); absent radii put the tip on the target", async () => {
+  it("a pick on a head pixel returns the arrow's own id (+ pick base); zero radii put the tip on the target", async () => {
     const { device, framebuffer } = await setup();
     const lines = new InstancedLines(
       device,
@@ -346,12 +317,14 @@ describe("InstancedLines with an arrowhead (#542)", () => {
         targets: new Float32Array([60, 12, 60, 40]),
         widths: new Float32Array([2, 2]),
         colors: new Uint8Array([0, 0, 255, 255, 0, 0, 255, 255]),
+        radii: new Float32Array(2),
         arrowSize: 5,
         count: 2,
       },
       W,
       H,
       true,
+      "arrow",
     );
     lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
     draw(device, framebuffer, lines, true);
@@ -383,6 +356,7 @@ describe("InstancedLines with an arrowhead (#542)", () => {
       W,
       H,
       true,
+      true,
     );
     lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
     draw(device, framebuffer, lines);
@@ -394,11 +368,11 @@ describe("InstancedLines with an arrowhead (#542)", () => {
     device.destroy();
   });
 
-  it("costs 4 B/instance (radius) and uploads no radius on a position frame; unheaded lines add nothing", async () => {
+  it("costs 4 B/instance (radius) and uploads no radius on a position frame; headless lines add nothing", async () => {
     const { device } = await setup();
     const base = straight(255);
     const radii = new Float32Array([6, 6, 6]);
-    const data: InstancedLinesData = {
+    const data: InstancedArrowsData = {
       ...base,
       sources: new Float32Array(6),
       targets: new Float32Array(6).fill(30),
@@ -408,17 +382,17 @@ describe("InstancedLines with an arrowhead (#542)", () => {
       count: 3,
     };
     const b0 = radiusColumnStats.buffers, n0 = radiusColumnStats.bytes;
-    const lines = new InstancedLines(device, data, W, H);
+    const lines = new InstancedLines(device, data, W, H, false, "arrow");
     expect(radiusColumnStats.buffers - b0).toBe(1);
     expect(radiusColumnStats.bytes - n0).toBe(4 * 3);
     // A position frame: new ends, the same radii ⇒ no radius upload; a new size is a uniform.
-    expect(lines.update(device, { ...data, sources: new Float32Array(6).fill(1), arrowSize: 7 })).toBe(true);
+    expect(lines.update(device, { ...data, sources: new Float32Array(6).fill(1), arrowSize: 7 }, "arrow")).toBe(true);
     expect(radiusColumnStats.bytes - n0).toBe(4 * 3);
-    // Turning the head off changes the program: the caller recreates.
-    expect(lines.update(device, { ...data, arrowSize: undefined })).toBe(false);
+    // A `lines` layer in its place changes the program: the caller recreates.
+    expect(lines.update(device, data, "none")).toBe(false);
     lines.destroy();
-    const plain = new InstancedLines(device, { ...data, arrowSize: undefined, radii: undefined }, W, H);
-    plain.update(device, { ...data, arrowSize: undefined, radii: undefined, sources: new Float32Array(6).fill(2) });
+    const plain = new InstancedLines(device, data, W, H);
+    plain.update(device, { ...data, sources: new Float32Array(6).fill(2) });
     expect(radiusColumnStats.buffers - b0).toBe(1);
     expect(radiusColumnStats.bytes - n0).toBe(4 * 3);
     plain.destroy();

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkHeads, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 import { scaleSqrt } from "d3-scale";
 import { rgb } from "d3-color";
@@ -181,20 +181,13 @@ describe("linkLines", () => {
   });
 });
 
-describe("linkArrows", () => {
-  it("carries the target *centre* + the *target* node's radius (the tip sets back in-shader)", () => {
+describe("linkHeads (#542)", () => {
+  it("carries the arrow size and the *target* node's radius per edge (the tip sets back in-shader)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
-    g.positions.set([0, 0, 10, 0]); // node0 at origin, node1 at (10,0)
-
     // node0 radius 5, node1 (the target) radius 2 → setback uses the target's 2, not the source's 5.
-    const a = linkArrows(g, { size: 4, nodeRadii: new Float32Array([5, 2]), colorOf: () => [255, 0, 0, 255] });
-
-    expect(a.count).toBe(1);
-    expect(Array.from(a.sources)).toEqual([0, 0]);
-    expect(Array.from(a.targets)).toEqual([10, 0]); // the target centre (setback is in-shader)
-    expect(Array.from(a.radii)).toEqual([2]); // target radius → the shader sets the tip back to the boundary
-    expect(Array.from(a.sizes)).toEqual([4]);
-    expect(Array.from(a.colors)).toEqual([255, 0, 0, 255]);
+    const h = linkHeads(g, 4, new Float32Array([5, 2]));
+    expect(h.arrowSize).toBe(4);
+    expect(Array.from(h.radii)).toEqual([2]);
   });
 });
 
@@ -230,33 +223,32 @@ describe("networkLayers", () => {
     expect(layers.map((l) => l.primitive)).toEqual(["lines", "circles"]);
   });
 
-  it("draws a directed link's head in its line instance — no separate arrows layer (#542)", () => {
+  it("draws a directed line link as a whole arrow: ONE arrows layer, shaft + head per link (#542)", () => {
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
     const s = { ...style(3), directed: true };
     s.nodeRadii = new Float32Array([3, 5, 7]);
     const layers = networkLayers(g, s);
 
     expect(layers.map((l) => l.name)).toEqual(["links", "nodes"]);
-    expect(layers.map((l) => l.primitive)).toEqual(["lines", "circles"]);
+    expect(layers.map((l) => l.primitive)).toEqual(["arrows", "circles"]);
     const links = layers[0];
-    if (links?.primitive !== "lines") throw new Error("expected a lines layer");
-    expect(links.lines.arrowSize).toBe(s.arrowSize);
-    expect(Array.from(links.lines.radii ?? [])).toEqual([5, 7]); // the TARGET node's radius per edge
-    // The position-frame path carries the same head, with the radii cached once per style version.
+    if (links?.primitive !== "arrows") throw new Error("expected an arrows layer");
+    expect(links.arrows.arrowSize).toBe(s.arrowSize);
+    expect(Array.from(links.arrows.radii)).toEqual([5, 7]); // the TARGET node's radius per edge
+    // The position-frame path draws the same arrows, with the radii cached once per style version.
     const cache = noLodStyleCache(g, s);
     const a = networkLayersFromCache(g, s, cache);
     const b = networkLayersFromCache(g, s, cache);
     expect(a.map((l) => l.name)).toEqual(["links", "nodes"]);
     const la = a[0], lb = b[0];
-    if (la?.primitive !== "lines" || lb?.primitive !== "lines") throw new Error("expected lines layers");
-    expect(la.lines.arrowSize).toBe(s.arrowSize);
-    expect(Array.from(la.lines.radii ?? [])).toEqual([5, 7]);
-    expect(lb.lines.radii).toBe(la.lines.radii); // same array ⇒ no per-frame upload
-    // Undirected links stay headless.
+    if (la?.primitive !== "arrows" || lb?.primitive !== "arrows") throw new Error("expected arrows layers");
+    expect(la.arrows.arrowSize).toBe(s.arrowSize);
+    expect(Array.from(la.arrows.radii)).toEqual([5, 7]);
+    expect(lb.arrows.radii).toBe(la.arrows.radii); // same array ⇒ no per-frame upload
+    // Undirected links are headless lines.
     const u = networkLayers(g, { ...s, directed: false })[0];
     if (u?.primitive !== "lines") throw new Error("expected a lines layer");
     expect(u.lines.arrowSize).toBeUndefined();
-    expect(u.lines.radii).toBeUndefined();
   });
 
   it("emits only nodes when there are no edges", () => {
@@ -266,7 +258,7 @@ describe("networkLayers", () => {
     expect(layers.map((l) => l.name)).toEqual(["nodes"]);
   });
 
-  it("threads sizeMode to nodes and links (the headed line shader honours it in-shader)", () => {
+  it("threads sizeMode to nodes and links (the whole-arrow shader honours it in-shader)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     const layers = networkLayers(g, { ...style(2), directed: true, sizeMode: "screen" });
 
@@ -404,7 +396,7 @@ describe("networkLayersFromCache (#179 position-only frame)", () => {
   // and rebuilding only endpoints/centres from moved positions yields exactly what networkLayers would.
   function linkOf(layers: ReturnType<typeof networkLayers>) {
     const l = layers.find((x) => x.name === "links")!;
-    return l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : null;
+    return l.primitive === "lines" ? l.lines : l.primitive === "arrows" ? l.arrows : l.primitive === "half-arrows" ? l.halfArrows : null;
   }
 
   it("undirected lines: cached path reuses style bytes, rebuilds endpoints from new positions", () => {

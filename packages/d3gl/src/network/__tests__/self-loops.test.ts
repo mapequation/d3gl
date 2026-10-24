@@ -273,11 +273,11 @@ describe("self-loop cache and layers (per-frame cost)", () => {
       const layers = networkLayersFromCache(g, s, cache).filter((l) => l.name === SELF_LOOP_LAYER);
       const out = { lines: [] as Float32Array[], layers: layers.length };
       for (const l of layers)
-        if (l.primitive === "lines") out.lines = [l.lines.sources, l.lines.widths, l.lines.bends ?? new Float32Array(), l.lines.sourceOffsets ?? new Float32Array(), l.lines.targetOffsets ?? new Float32Array()];
+        if (l.primitive === "arrows") out.lines = [l.arrows.sources, l.arrows.widths, l.arrows.bends ?? new Float32Array(), l.arrows.sourceOffsets ?? new Float32Array(), l.arrows.targetOffsets ?? new Float32Array()];
       return out;
     };
     const a = frame();
-    expect(a.layers).toBe(1); // the directed loop's head is part of its one instance (#542)
+    expect(a.layers).toBe(1); // the directed loop is ONE arrows layer, its head part of each instance (#542)
     expect(a.lines.length).toBe(5);
     const u0 = selfLoopStats.updates;
     const i0 = selfLoopStats.instances;
@@ -289,17 +289,18 @@ describe("self-loop cache and layers (per-frame cost)", () => {
     expect(b.lines[0]?.[1]).toBe(5); // the centre moved, in place
   });
 
-  it("every style draws ONE lines loop layer, its loopHead the variant", () => {
+  it("every style draws ONE loop layer, its primitive the variant (#542)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 1], directed: true });
     g.positions.set([0, 0, 10, 0]);
     const heads = (opts: Parameters<typeof style>[1]): (string | undefined)[] => {
       const s = style(2, opts);
       const layers = networkLayersFromCache(g, s, noLodStyleCache(g, s)).filter((l) => l.name === SELF_LOOP_LAYER);
-      return layers.map((l) => (l.primitive === "lines" && l.lines.curve === "drop" ? (l.lines.loopHead ?? "none") : l.primitive));
+      const curve = (l: (typeof layers)[number]) => (l.primitive === "lines" ? l.lines.curve : l.primitive === "arrows" ? l.arrows.curve : l.primitive === "half-arrows" ? l.halfArrows.curve : undefined);
+      return layers.map((l) => `${l.primitive}:${curve(l) ?? "link"}`);
     };
-    expect(heads({ directed: true, linkStyle: "half-arrow" })).toEqual(["half"]);
-    expect(heads({ directed: true })).toEqual(["arrow"]);
-    expect(heads({ directed: false })).toEqual(["none"]);
+    expect(heads({ directed: true, linkStyle: "half-arrow" })).toEqual(["half-arrows:drop"]);
+    expect(heads({ directed: true })).toEqual(["arrows:drop"]);
+    expect(heads({ directed: false })).toEqual(["lines:drop"]);
   });
 });
 

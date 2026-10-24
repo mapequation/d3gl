@@ -1,6 +1,5 @@
-import type { InstancedLinesData } from "../../core/index.js";
 import { boundaryCircle, type LODTree } from "../lod.js";
-import type { SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
+import type { LineBatch, SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
 
 /**
  * The super-edge gather as it was before #364, when its per-call scratch was `Map`s and `Set`s keyed by
@@ -418,7 +417,7 @@ export function superEdgesMapReference(
   const widths = new Float32Array(count);
   for (let e = 0; e < count; e++) widths[e] = style.widthOf(wS[e]!);
   const bends = new Float32Array(count).fill(style.bend);
-  const lines: InstancedLinesData = style.bend
+  const lines: LineBatch = style.bend
     ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
     : { sources, targets, widths, colors, count };
   if (!style.directed) return { lines, ids, flows };

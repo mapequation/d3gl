@@ -149,21 +149,22 @@ export interface InstancedCirclesData {
   count: number;
 }
 
-/** SoA for a batch of instanced lines (e.g. network links); straight, or bent via {@link bends}. */
+/**
+ * SoA for a batch of instanced **headless** lines (e.g. undirected network links); straight, or bent via
+ * {@link bends}. A `lines` layer never draws a head: a directed link with its head is an `arrows` layer
+ * ({@link InstancedArrowsData}), a one-sided one a `half-arrows` layer ({@link InstancedHalfArrowsData}).
+ */
 export interface InstancedLinesData {
   /**
    * `"drop"`: the self-link loop (#505, #542, `core/loop-drop.ts`): each instance is ONE loop on its node, given by
    * its two rim ends (`sources` = `targets` = the node centre, plus {@link sourceOffsets} / {@link targetOffsets}),
-   * drawn on the settled link geometry: centre → `E0`, the leg cubic, `E1`, then {@link loopHead}'s end. `bends` is
-   * read as the leg `L` in node radii, and {@link arrowSize} sets the line style's head length `2·arrowSize` (the
-   * undirected loop's too, so it runs the arrow's path); the half-arrow's is `10·∛width`. A separate program, chosen
-   * per layer, so an ordinary link layer runs its lane unchanged. Absent = a link.
+   * drawn on the settled link geometry: centre → `E0`, the leg cubic, `E1`, then the primitive's end — stroked on a
+   * `lines` layer, the line-style head (tip on the rim) on an `arrows` layer. `bends` is read as the leg `L` in node
+   * radii, and {@link arrowSize} sets the line style's head length `2·arrowSize` (the undirected loop's too, so it
+   * runs the arrow's path). A separate program, chosen per layer, so an ordinary link layer runs its lane unchanged.
+   * Absent = a link. Plain draws only (no `index`).
    */
   curve?: "drop";
-  /** `curve: "drop"` only (#542): the loop's end — absent: undirected (stroked), `"arrow"`: the line-style head, the
-   *  tip on the rim, `"half"`: the half-arrow band (one link width on the outside) and its one-sided head. A draw
-   *  setting like `samples`: a change recreates the layer. */
-  loopHead?: "arrow" | "half";
   /** `curve: "drop"` only: `cot α`, `α` half the angle between a loop's legs, with which its centre is recovered from
    *  its two rim ends (`core/loop-drop.ts`). One value per layer (a uniform). Absent ⇒ `DROP_COT` (α = 20°). */
   loopCot?: number;
@@ -185,19 +186,9 @@ export interface InstancedLinesData {
    * setting, not per-instance; bent layers raise it, straight layers keep `2` to stay cheap at scale.
    */
   samples?: number;
-  /**
-   * Arrow size (#542): set ⇒ every line of the layer is drawn WITH its arrowhead, shaft + head as one shape
-   * (`core/arrowhead.ts`): the tip sits {@link radii} back from the target along the curve's end tangent, the head
-   * is `2·arrowSize` long and as wide as the half-arrow barb rule makes it. In the layer's size units, like the
-   * widths. A draw setting like `samples`: turning the head on or off recreates the layer; absent ⇒ today's line.
-   * On a `curve: "drop"` layer it only sets the loop's head length (see {@link curve}); {@link loopHead} picks the end.
-   */
+  /** `curve: "drop"` only: the line style's arrow size, which lays the loop's path out (see {@link curve}); a line
+   *  draws no head. In the layer's size units. */
   arrowSize?: number;
-  /**
-   * Headed lines only (#542): the target node's radius per line (per edge with `index`), in size units. Absent ⇒ 0
-   * (the tip on the target point) with no buffer and no upload. Uploaded only when the array is a new object.
-   */
-  radii?: Float32Array;
   /** Per-instance highlight group (#162): the link's **source** node id, matched against `u_hoverGroup`
    *  / used to index the selected set so the vertex shader recolours a highlighted node's links. Length `count`. */
   groups?: Float32Array;
@@ -231,51 +222,20 @@ export interface InstancedLinesData {
   count: number;
 }
 
-/** SoA for a batch of instanced triangle arrowheads (directed-link tips). */
-export interface InstancedArrowsData {
-  /** [x, y] source centre per arrow (for orientation), length `2 * count`. */
-  sources: Float32Array;
-  /** [x, y] target *centre* per arrow, length `2 * count`; the tip is set back by `radii` in-shader. */
-  targets: Float32Array;
-  /** Target node radius per arrow (active sizeMode units), length `count` — the boundary setback. */
+/**
+ * SoA for a batch of instanced **whole arrows** (#542, directed links): every field of {@link InstancedLinesData},
+ * each arrow drawn as ONE shape, the shaft trimmed at the head's base plus the head (`core/arrowhead.ts`), so a
+ * translucent link does not double-blend where they meet. The tip sits {@link radii} back from the target along the
+ * curve's own end tangent (a bent link's head follows its curve); the head is `2·arrowSize` long and reaches half
+ * the line width plus `2·√width` out on each side. With `curve: "drop"`, a self-link loop with its head on the rim.
+ */
+export interface InstancedArrowsData extends InstancedLinesData {
+  /** Arrow size, in the layer's size units like the widths: the head is `2·arrowSize` long. One value per layer
+   *  (a uniform). */
+  arrowSize: number;
+  /** The target node's radius per arrow (per edge with `index`), in size units: the tip's setback from the
+   *  target. Uploaded only when the array is a new object. Unused by a `curve: "drop"` loop (its tip is on the rim). */
   radii: Float32Array;
-  /** arrow size (active sizeMode units) per arrow, length `count`. */
-  sizes: Float32Array;
-  /** RGBA bytes per arrow, length `4 * count`. */
-  colors: Uint8Array;
-  /** Optional per-arrow bend (#104 N6c), matching the link's, so the head aligns with the bent end tangent. */
-  bends?: Float32Array;
-  /** Draw a one-sided **half** arrowhead (#104 N6c) — for bent map links, so reciprocal heads don't collide. */
-  half?: boolean;
-  /** Per-instance highlight group (#162): the arrow's **source** node id. Length `count`. */
-  groups?: Float32Array;
-  /** The other endpoint (target) id for undirected hover (#162); `-1`/absent when unused. Length `count`. */
-  groups2?: Float32Array;
-  /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
-  selected?: Uint8Array;
-  /**
-   * **Indexed draw** (#447): with `index`, the style arrays above (everything but `sources`/`targets`,
-   * `groups`/`groups2`/`selected` included) are instead per-**edge** tables of `tableCount` entries, kept
-   * resident on the GPU and re-uploaded only when an array reference changes; `index` lists the edges to
-   * draw — `count` of them, one instance each, whose pick id is its edge id — and `sources`/`targets` stay
-   * per instance (the listed edges' ends, which move with the layout). Edge ids must be below 2^24 (float-exact).
-   */
-  index?: Float32Array;
-  tableCount?: number;
-  /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
-  fade?: Float32Array;
-  /**
-   * Optional per-instance offsets of the two ends (#509), in the layer's size units: an end is drawn at
-   * `project(P) + offset` px in `screen` mode and at `P + offset` in `world` mode; the bend and the setbacks follow
-   * the offset ends. Length `2 * count` each; absent ⇒ no offset, with no buffer and no upload. Uploaded only when
-   * the array is a new object. Plain draws only: an indexed draw (`index`) takes no offsets.
-   */
-  sourceOffsets?: Float32Array;
-  targetOffsets?: Float32Array;
-  /** The instances whose end offsets were rewritten in place since the last emit (#509), as flat `[start, end)`
-   *  ranges, uploaded alone while the arrays are the ones the layer holds (see `InstancedCirclesData.offsetsChanged`). */
-  endOffsetsChanged?: Uint32Array;
-  count: number;
 }
 
 /**
@@ -284,6 +244,16 @@ export interface InstancedArrowsData {
  * the target boundary, bowed around a shared centre curve (see network/half-link.ts). All world units.
  */
 export interface InstancedHalfArrowsData {
+  /**
+   * `"drop"`: half-arrow self-link loops (#542), drawn like an `arrows` loop (see {@link InstancedLinesData.curve})
+   * but ending in the half-arrow band (one link width on the outside) and its one-sided head, `10·∛width` long.
+   * The columns are then read per loop as a line's are: `sources` = `targets` the node centre plus the rim ends in
+   * `sourceOffsets` / `targetOffsets`, ONE width per loop (length `count`), `bends` the leg `L` in node radii;
+   * `radii` is unused. Plain draws only (no `index`). Absent = a link.
+   */
+  curve?: "drop";
+  /** `curve: "drop"` only: as {@link InstancedLinesData.loopCot}. */
+  loopCot?: number;
   /** [x, y] world source centre per link, length `2 * count`. */
   sources: Float32Array;
   /** [x, y] world target centre per link, length `2 * count`. */
@@ -365,6 +335,9 @@ export interface InstancedPieData {
 
 /**
  * A named GPU-instanced primitive layer — the network rendering lane (#100).
+ *
+ * The link primitives (#542): `lines` are headless lines, `arrows` whole arrows (shaft + head as one shape), and
+ * `half-arrows` one-sided arrows; each draws self-link loops with `curve: "drop"`.
  *
  * `pickable` (#141) opts a link layer into the GPU-readback pick pass: the backend also builds an
  * id-encoded pick model (one extra Model, no extra instance buffers — the id is `gl_InstanceID`) and

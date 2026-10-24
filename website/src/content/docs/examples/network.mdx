@@ -1,6 +1,6 @@
 ---
 title: Network
-description: Render large directed networks with the network() engine — instanced points, lines, and arrowheads, in-library force layout, and an adaptive level-of-detail cut.
+description: Render large directed networks with the network() engine — instanced points, lines and arrows, in-library force layout, and an adaptive level-of-detail cut.
 ---
 
 import ExampleCard from "../../../components/ExampleCard.astro";
@@ -13,8 +13,11 @@ import StateNetwork from "../../../examples/state-network/StateNetwork.tsx";
 import SelfLinks from "../../../examples/self-links/SelfLinks.tsx";
 
 The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
-lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
-arrowheads. It is built for large graphs — the same lane scales toward millions of elements, with an
+lane: nodes are instanced points, links are instanced lines, and directed edges draw as **whole
+arrows**: the shaft and its head are one shape, so a translucent link blends once and never darkens
+where they meet. The head is `2·arrowSize` long and `w/2 + 2√w` wide on each side of its axis (half the
+line width `w` plus `2√w`); its tip sits on the target node's rim, and on a bent link it follows the
+curve's own end tangent. It is built for large graphs — the same lane scales toward millions of elements, with an
 adaptive **level-of-detail** cut that keeps per-frame work proportional to what's actually on screen.
 It also renders **maps of networks** (a provided module hierarchy drives the cut), and **[state
 (memory) networks](#state-networks-physical--state-views)** — toggling a state view against the derived
@@ -245,7 +248,7 @@ uses both (its **Fill** control).
 The half-arrow renders fully instanced on the WebGL lane (the vertex shader places the foot, the
 shared centre curve and the barbed head per instance) and traces the identical reference path for
 SVG/Canvas export, so publication output matches the screen. The plain `linkStyle: "line"` (the
-default, see the large-scale example) keeps stroked lines + separate arrowheads for graphs with many
+default, see the large-scale example) draws plain lines, or whole arrows when `directed`, for graphs with many
 edges, and `linkStyle: "none"` drops the links entirely (see [Nodes only](#nodes-only-turning-links-off)).
 
 The **Sizing** toggle switches `sizeMode`. In **screen** mode the link decorations (width, arrow tip,
@@ -267,7 +270,7 @@ like an ordinary link it starts and ends at the node's centre, the node's fill h
 runs out along one leg and back along the other to a round far end, about 2.3 node radii out with the default shape. It is placed
 opposite the mean direction of the node's neighbours, so it points into the free space beside the node,
 and a directed loop's arrowhead sits on the rim pointing into the node, like an ordinary link's head at its
-target. A node with several self-link edges draws
+target. Each loop is one shape with its head, like a directed link. A node with several self-link edges draws
 **one** loop: their weights are summed, and the loop's width, colour and flow come from that sum. The
 placement is a fixed rule, not a style option, but the shape is tunable: `selfLinkSpread` sets the angle
 between the loop's two legs (degrees, default 40) and `selfLinkLength` its leg length (node radii, default
