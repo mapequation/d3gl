@@ -130,7 +130,10 @@ re-run the file alone and check the load (`uptime`).
   `process.env` — a define is the only way in. **`PERF_REAL_GPU=1`** (unset on CI; for the hardware-GPU tier
   #392) marks a run on a hardware GPU (`perfRealGpu`, with `softwareRenderer()` to check it): a wall-clock
   comparison between a GPU path and a CPU-worker path asserts only then — under SwiftShader, GL competes with
-  the page's workers for the runner's cores — and the guard asserts its deterministic counts everywhere.
+  the page's workers for the runner's cores — and the guard asserts its deterministic counts everywhere. The flag
+  also makes `packages/d3gl/vitest.config.ts` launch Chromium on the GPU (`--enable-gpu --ignore-gpu-blocklist`,
+  plus `--use-angle=metal` on macOS): headless Chromium otherwise falls back to SwiftShader there, and the
+  `softwareRenderer()` check fails.
 
 
 ## Scaling a guard and writing an at-scale leg
