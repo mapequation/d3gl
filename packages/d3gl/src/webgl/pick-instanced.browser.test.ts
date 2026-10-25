@@ -60,7 +60,10 @@ describe("GPU-readback link picking", () => {
     async function hoverSettle(x: number, y: number, expected: number): Promise<number> {
       let id = -1;
       for (let i = 0; i < 60; i++) {
-        id = backend.pickInstanced(x, y, false) ?? -1;
+        const picked = backend.pickInstanced(x, y, false);
+        // undefined = no pickable instanced layer, the pick skipped: never the background (-1), or that check is vacuous.
+        if (picked === undefined) throw new Error("pickInstanced skipped: no pickable instanced layer");
+        id = picked;
         if (id === expected) return id;
         await new Promise((r) => setTimeout(r, 50));
       }
