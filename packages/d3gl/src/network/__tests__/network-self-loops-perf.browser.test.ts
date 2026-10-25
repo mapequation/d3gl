@@ -2,13 +2,13 @@ import { describe, it, expect, afterAll } from "vitest";
 import { network, type Network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import { keptLoopStats, selfLoopStats } from "../self-loops.js";
-import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
+import { perfBudget, perfN, perfRealGpu } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost, zoomSteps } from "../../__tests__/engine-sweep.js";
 import { loopCenterStats } from "../../webgl/instanced.js";
 
 /**
- * Self-link loops (#505) at ≈1M nodes (docs/agents/performance.md), LOD off and on, on WebGL, through the real
- * triggers: a `setTransform` zoom sweep and position frames (`layout({ backend: "positions" })`).
+ * Self-link loops (#505), LOD off and on, on WebGL, through the real triggers: a `setTransform` zoom sweep and position
+ * frames (`layout({ backend: "positions" })`).
  *
  * Asserted (counts, never scaled):
  * - a graph WITHOUT self-links pays nothing for them: no loop update, no loop instance written, no LOD loop
@@ -17,21 +17,43 @@ import { loopCenterStats } from "../../webgl/instanced.js";
  *   loops' columns stay resident), a position frame rewrites exactly the S loops, in place;
  * - LOD on, with S self-links: each frame lists its kept leaves' loops in at most min(S, frontier) reads and
  *   writes at most that many loop instances: O(visible), never O(S) when the frontier is smaller.
- * - LOD on, a looped hub of degree HUB_DEGREE (never scaled): a zoom frame reads none of its neighbours — its loop's
- *   angle is solved at most once per position change, then copied (the Σ degree term is off the zoom path).
+ * - LOD on, a looped hub of degree HUB_DEGREE: a zoom frame reads none of its neighbours — its loop's angle is solved
+ *   at most once per position change, then copied (the Σ degree term is off the zoom path).
  * - LOD off, at a fixed small N (never scaled): what the loops add to a position frame — draw calls, vertices
  *   drawn, loop instances written — is the same per loop at N and 2N, so a superlinear step (a per-loop draw or
- *   upload, an O(S²) vertex count) shows at 5k–10k without a 100k run. Counts, so the machine's load cannot move it.
- * The full-detail zoom frame also keeps the static ceiling of `network-selection-sweep-1m-perf`.
+ *   upload, an O(S²) vertex count) shows at 1k–2k without a 100k run. Counts, so the machine's load cannot move it.
+ * The full-detail zoom frame also keeps the static ceiling of `network-selection-sweep-1m-perf`, scaled to N.
+ *
+ * Sizes (#557). Every assertion above is a count, true at any N, so each case runs at the smallest size that keeps it
+ * non-vacuous, and the file takes seconds (it took 885 s at 1M: headless Chromium draws through SwiftShader, where each
+ * node and link instance costs ≈10 µs of vertex work per frame, ≈23 s per 1M-node LOD-off frame over 16 frames a leg).
+ * LOD off at N_OFF = 2,000; LOD on at N_LOD = 50,000 (S above every frontier of the sweep, asserted); the hub at degree
+ * 1,000; the linear case at 1k vs 2k. CI's `PERF_BROWSER_N=100000` does not resize them under software GL.
+ *
+ * At scale (1M nodes, S = 100k, the hub at degree 10⁵), on a hardware GPU:
+ *   PERF_REAL_GPU=1 PERF_BROWSER_N=1000000 pnpm --filter @mapequation/d3gl test:browser \
+ *     src/network/__tests__/network-self-loops-perf.browser.test.ts
  */
 
-const N = perfN(1_000_000, { max: 1_000_000 });
+/**
+ * The at-scale cap: `PERF_BROWSER_N` resizes the fixtures only on a hardware GPU (`PERF_REAL_GPU=1`). Under SwiftShader
+ * (headless Chromium, CI) every drawn instance costs ≈10 µs per frame, so the tier's 100k would turn seconds into
+ * minutes and its counts would prove nothing the default sizes do not (#557).
+ */
+const SCALE_MAX = perfRealGpu ? 1_000_000 : 0;
+/** LOD off draws every node and link each frame: the counts are scale-free, so the smallest graph with loops on it. */
+const N_OFF = perfN(2_000, { max: Math.max(2_000, SCALE_MAX) });
+/** LOD on: the smallest N whose S (5,000) exceeds even the fit view's frontier (≈4,100 glyphs at 640×400), so every
+ *  frame of the sweep bounds the reads by its frontier, never by S (asserted below). */
+const N_LOD = perfN(50_000, { max: Math.max(50_000, SCALE_MAX) });
 /** One node in LOOP_EVERY has a self-link. */
 const LOOP_EVERY = 10;
-const S = Math.ceil(N / LOOP_EVERY);
+const loopsOf = (n: number): number => Math.ceil(n / LOOP_EVERY);
+const S_OFF = loopsOf(N_OFF);
+const S_LOD = loopsOf(N_LOD);
 const W = 640;
 const H = 400;
-const FRAME_MS_STATIC = perfBudget(4 + (4 * N) / 50_000);
+const FRAME_MS_STATIC = perfBudget(4 + (4 * N_OFF) / 50_000);
 const POSITION_FRAMES = 3;
 
 /**
@@ -83,13 +105,13 @@ interface Leg {
   registered: number;
 }
 
-async function runLeg(loops: boolean, lod: boolean): Promise<Leg> {
+async function runLeg(n: number, loops: boolean, lod: boolean): Promise<Leg> {
   const host = perfHost(W, H);
   const net: Network = network(host, { width: W, height: H, backend: "webgl" });
   const spy = new GlBufferSpy();
   try {
     await net.whenReady();
-    const { graph, positions } = fixture(N, loops);
+    const { graph, positions } = fixture(n, loops);
     const atStart = spy.mark();
     net
       .data(graph)
@@ -111,7 +133,7 @@ async function runLeg(loops: boolean, lod: boolean): Promise<Leg> {
       const t0 = performance.now();
       net.setTransform(t);
       worstZoomMs = Math.max(worstZoomMs, performance.now() - t0);
-      perFrame.push({ reads: keptLoopStats.reads - r, instances: selfLoopStats.instances - inst, glyphs: net.declutterStats?.glyphs ?? N });
+      perFrame.push({ reads: keptLoopStats.reads - r, instances: selfLoopStats.instances - inst, glyphs: net.declutterStats?.glyphs ?? n });
     }
     const used = spy.since(before);
     const zoomLoopUpdates = selfLoopStats.updates - u0;
@@ -149,10 +171,13 @@ async function runLeg(loops: boolean, lod: boolean): Promise<Leg> {
   }
 }
 
-const TIMEOUT = perfBudget(180_000 + N / 2);
+const timeout = (n: number): number => perfBudget(180_000 + n / 2);
 
-/** The looped hub's degree: a star whose centre has a self-link (fixed, ≥ 10⁵: the degree is what is guarded). */
-const HUB_DEGREE = 100_000;
+/** The looped hub's degree: a star whose centre has a self-link. Solving its loop's angle reads its whole CSR row, so a
+ *  zoom frame that re-solved it would read the row again: the sweep's total exceeds one row at any degree, as long as
+ *  ≥ 2 frames draw the loop (asserted). 1,000 keeps it a hub (the main fixture's nodes have degree ≤ 3) at a size whose
+ *  sweep takes about a second; the at-scale run restores the 10⁵ hub with the fixtures. */
+const HUB_DEGREE = perfN(1_000, { max: SCALE_MAX > 0 ? 100_000 : 1_000 });
 
 /** Per zoom frame of an LOD-on sweep over the looped hub: the loop instances written, the neighbours read, the loop
  *  centre bytes uploaded. */
@@ -162,15 +187,16 @@ async function hubLeg(): Promise<{ perFrame: { instances: number; neighbours: nu
   try {
     await net.whenReady();
     // The hub at the zoom centre (the sweep zooms about the viewport's middle), between the grid points its leaves
-    // sit on (8 apart, as the main fixture's), so the deepest zooms keep it as a leaf.
+    // sit on (8 apart, as the main fixture's, on a grid centred there with an even column count), so the deepest
+    // zooms keep it as a leaf.
     const n = HUB_DEGREE + 1;
-    const cols = Math.ceil(Math.sqrt(HUB_DEGREE));
+    const cols = 2 * Math.ceil(Math.sqrt(HUB_DEGREE) / 2);
     const positions = new Float32Array(2 * n);
     positions[0] = W / 2 + 4;
     positions[1] = H / 2 + 4;
     for (let i = 1; i < n; i++) {
-      positions[2 * i] = ((i - 1) % cols) * 8;
-      positions[2 * i + 1] = Math.floor((i - 1) / cols) * 8;
+      positions[2 * i] = W / 2 + ((i - 1) % cols) * 8 - cols * 4;
+      positions[2 * i + 1] = H / 2 + Math.floor((i - 1) / cols) * 8 - cols * 4;
     }
     const source = new Int32Array(n);
     const target = new Int32Array(n);
@@ -292,45 +318,46 @@ async function loopFrameWork(n: number): Promise<FrameWork> {
   return { calls: withLoops.calls - without.calls, vertices: withLoops.vertices - without.vertices, instances: withLoops.instances - without.instances };
 }
 
-describe(`self-link loops per frame (#505) at N=${N.toLocaleString()}, S=${S.toLocaleString()}`, () => {
+describe(`self-link loops per frame (#505): LOD off at N=${N_OFF.toLocaleString()}, LOD on at N=${N_LOD.toLocaleString()}`, () => {
   afterAll(() => document.body.replaceChildren());
 
   it(
     "LOD off, no self-links: no loop work on a zoom or a position frame",
     async () => {
-      const leg = await runLeg(false, false);
+      const leg = await runLeg(N_OFF, false, false);
       expect(leg.registered, "registration uploaded nothing — the spy is not observing the live context").toBeGreaterThan(0);
       expect(leg.zoomLoopUpdates + leg.zoomLoopInstances + leg.listedFrames).toBe(0);
       expect(leg.positionUpdates + leg.positionInstances).toBe(0);
       console.log(`  LOD off, no self-links: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms`);
     },
-    TIMEOUT,
+    timeout(N_OFF),
   );
 
   it(
     "LOD off, S self-links: a zoom frame does no loop work and churns no buffer; a position frame rewrites the S loops",
     async () => {
-      const leg = await runLeg(true, false);
+      const leg = await runLeg(N_OFF, true, false);
+      expect(leg.registered, "registration uploaded nothing — the spy is not observing the live context").toBeGreaterThan(0);
       expect(leg.zoomLoopUpdates, "a zoom frame updated the loops").toBe(0);
       expect(leg.zoomLoopInstances, "a zoom frame wrote loop instances").toBe(0);
       expect(leg.zoomCreated, "GPU buffers created during the sweep").toBe(0);
       expect(leg.zoomDeleted, "GPU buffers destroyed during the sweep").toBe(0);
       expect(leg.positionUpdates, "the position frames never reached the loops (non-vacuity)").toBeGreaterThan(0);
       expect(leg.positionUpdates, "more than one loop update per position frame").toBeLessThanOrEqual(POSITION_FRAMES);
-      expect(leg.positionInstances, "a loop update wrote other than the S loops").toBe(leg.positionUpdates * S);
+      expect(leg.positionInstances, "a loop update wrote other than the S loops").toBe(leg.positionUpdates * S_OFF);
       expect(leg.worstZoomMs, `worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms`).toBeLessThan(FRAME_MS_STATIC);
-      console.log(`  LOD off, S=${S}: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms, ${leg.positionUpdates} loop updates over ${POSITION_FRAMES} position frames`);
+      console.log(`  LOD off, S=${S_OFF}: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms, ${leg.positionUpdates} loop updates over ${POSITION_FRAMES} position frames`);
     },
-    TIMEOUT,
+    timeout(N_OFF),
   );
 
   it(
-    "LOD off: what S loops add to a position frame is linear in S (5k vs 10k nodes, never scaled)",
+    "LOD off: what S loops add to a position frame is linear in S (1k vs 2k nodes, never scaled)",
     async () => {
-      const small = await loopFrameWork(5_000);
-      const large = await loopFrameWork(10_000);
-      const sSmall = Math.ceil(5_000 / LOOP_EVERY);
-      const sLarge = Math.ceil(10_000 / LOOP_EVERY);
+      const small = await loopFrameWork(1_000);
+      const large = await loopFrameWork(2_000);
+      const sSmall = loopsOf(1_000);
+      const sLarge = loopsOf(2_000);
       expect(small.instances, "the position frames never reached the loops (non-vacuity)").toBe(sSmall);
       expect(large.instances).toBe(sLarge);
       expect(small.vertices, "the loops drew nothing (non-vacuity)").toBeGreaterThan(0);
@@ -344,29 +371,31 @@ describe(`self-link loops per frame (#505) at N=${N.toLocaleString()}, S=${S.toL
   it(
     "LOD on, no self-links: no LOD frame lists or writes a loop",
     async () => {
-      const leg = await runLeg(false, true);
+      const leg = await runLeg(N_LOD, false, true);
       expect(leg.listedFrames, "an LOD frame listed loops of a graph without self-links").toBe(0);
       expect(leg.zoomLoopInstances + leg.positionInstances).toBe(0);
       console.log(`  LOD on, no self-links: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms`);
     },
-    TIMEOUT,
+    timeout(N_LOD),
   );
 
   it(
     "LOD on, S self-links: each frame reads at most min(S, frontier) entries and writes at most that many loops",
     async () => {
-      const leg = await runLeg(true, true);
+      const leg = await runLeg(N_LOD, true, true);
       expect(leg.listedFrames, "no LOD frame listed the kept leaves' loops (non-vacuity)").toBeGreaterThan(0);
       expect(leg.perFrame.some((f) => f.instances > 0), "no frame drew a loop: the sweep never reached the leaves").toBe(true);
+      const widest = Math.max(...leg.perFrame.map((f) => f.glyphs));
+      expect(widest, `a frontier of ${widest} glyphs reached S = ${S_LOD}: that frame bounds the reads by S, not O(visible) (grow N_LOD)`).toBeLessThan(S_LOD);
       for (const [k, f] of leg.perFrame.entries()) {
-        const bound = Math.min(S, f.glyphs);
-        expect(f.reads, `frame ${k}: ${f.reads} reads, frontier ${f.glyphs}, S ${S}`).toBeLessThanOrEqual(bound);
+        const bound = Math.min(S_LOD, f.glyphs);
+        expect(f.reads, `frame ${k}: ${f.reads} reads, frontier ${f.glyphs}, S ${S_LOD}`).toBeLessThanOrEqual(bound);
         expect(f.instances, `frame ${k}: ${f.instances} loops written`).toBeLessThanOrEqual(f.reads);
       }
       const worst = Math.max(...leg.perFrame.map((f) => f.reads));
-      console.log(`  LOD on, S=${S}: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms, at most ${worst} loop entries read per frame, frontiers ${leg.perFrame.map((f) => f.glyphs).join("/")}`);
+      console.log(`  LOD on, S=${S_LOD}: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms, at most ${worst} loop entries read per frame, frontiers ${leg.perFrame.map((f) => f.glyphs).join("/")}`);
     },
-    TIMEOUT,
+    timeout(N_LOD),
   );
 
   it(
