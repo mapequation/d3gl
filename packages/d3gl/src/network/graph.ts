@@ -207,10 +207,10 @@ export function buildGraph(input: BuildGraphInput): NetworkGraph {
     const w = weight[e]!;
     const s = source[e]!;
     const t = target[e]!;
-    degree[s] = degree[s]! + 1;
+    degree[s] = (degree[s] ?? 0) + 1;
     strength[s] = strength[s]! + w;
     if (t === s) continue;
-    degree[t] = degree[t]! + 1;
+    degree[t] = (degree[t] ?? 0) + 1;
     strength[t] = strength[t]! + w;
   }
 
