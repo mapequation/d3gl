@@ -24,11 +24,13 @@ import { loopCenterStats } from "../../webgl/instanced.js";
  *   upload, an O(S²) vertex count) shows at 1k–2k without a 100k run. Counts, so the machine's load cannot move it.
  * The full-detail zoom frame also keeps the static ceiling of `network-selection-sweep-1m-perf`, scaled to N.
  *
- * Sizes (#557). Every assertion above is a count, true at any N, so each case runs at the smallest size that keeps it
- * non-vacuous, and the file takes seconds (it took 885 s at 1M: headless Chromium draws through SwiftShader, where each
+ * Sizes (#557). Every assertion above but the static ceiling is a count, true at any N, so each case runs at the
+ * smallest size that keeps it non-vacuous. At N_OFF the ceiling is almost all its constant term, so it bounds a fixed
+ * per-frame cost, not scaling: a zoom frame's loop work is held by counts instead (no loop update, no instance written,
+ * no buffer created or destroyed, zero buffer bytes uploaded), and the file takes seconds (it took 885 s at 1M: headless Chromium draws through SwiftShader, where each
  * node and link instance costs ≈10 µs of vertex work per frame, ≈23 s per 1M-node LOD-off frame over 16 frames a leg).
  * LOD off at N_OFF = 2,000; LOD on at N_LOD = 50,000 (S above every frontier of the sweep, asserted); the hub at degree
- * 1,000; the linear case at 1k vs 2k. CI's `PERF_BROWSER_N=100000` does not resize them under software GL.
+ * 1,000; the linear case at 1k vs 2k. Under software GL no `PERF_BROWSER_N` resizes them (CI's 100k included).
  *
  * At scale (1M nodes, S = 100k, the hub at degree 10⁵), on a hardware GPU:
  *   PERF_REAL_GPU=1 PERF_BROWSER_N=1000000 pnpm --filter @mapequation/d3gl test:browser \
@@ -42,10 +44,10 @@ import { loopCenterStats } from "../../webgl/instanced.js";
  */
 const SCALE_MAX = perfRealGpu ? 1_000_000 : 0;
 /** LOD off draws every node and link each frame: the counts are scale-free, so the smallest graph with loops on it. */
-const N_OFF = perfN(2_000, { max: Math.max(2_000, SCALE_MAX) });
-/** LOD on: the smallest N whose S (5,000) exceeds even the fit view's frontier (≈4,100 glyphs at 640×400), so every
- *  frame of the sweep bounds the reads by its frontier, never by S (asserted below). */
-const N_LOD = perfN(50_000, { max: Math.max(50_000, SCALE_MAX) });
+const N_OFF = Math.max(2_000, perfN(2_000, { max: Math.max(2_000, SCALE_MAX) }));
+/** LOD on: the smallest N whose S (5,000) exceeds every frontier of the sweep (the widest, ≈4,100 glyphs, at k = 1 over
+ *  640×400), so every frame bounds the reads by its frontier, never by S (asserted below). */
+const N_LOD = Math.max(50_000, perfN(50_000, { max: Math.max(50_000, SCALE_MAX) }));
 /** One node in LOOP_EVERY has a self-link. */
 const LOOP_EVERY = 10;
 const loopsOf = (n: number): number => Math.ceil(n / LOOP_EVERY);
@@ -97,6 +99,8 @@ interface Leg {
   zoomLoopInstances: number;
   zoomCreated: number;
   zoomDeleted: number;
+  /** GL buffer bytes uploaded over the zoom sweep (a static zoom re-uploads nothing; #557). */
+  zoomUploaded: number;
   /** Per zoom frame (LOD on): loop entries read, loop instances written, and the frontier the cut thinned. */
   perFrame: { reads: number; instances: number; glyphs: number }[];
   listedFrames: number;
@@ -139,12 +143,12 @@ async function runLeg(n: number, loops: boolean, lod: boolean): Promise<Leg> {
     const zoomLoopUpdates = selfLoopStats.updates - u0;
     const zoomLoopInstances = selfLoopStats.instances - i0;
     const listedFrames = keptLoopStats.frames - f0;
-    // Position frames: the layout moves every node a little, at the fit view.
+    // Position frames: the layout moves every node a little, at k = 1.
     net.setTransform({ k: 1, x: 0, y: 0 });
     const pu = selfLoopStats.updates;
     const pi = selfLoopStats.instances;
     const moved = new Float32Array(positions.length);
-    // LOD legs skip them: the guard asserts LOD's zoom frames, and each LOD position frame rebuilds a 1M-leaf tree.
+    // LOD legs skip them: the guard asserts LOD's zoom frames, and each LOD position frame rebuilds the whole leaf tree.
     for (let f = 1; f <= (lod ? 0 : POSITION_FRAMES); f++) {
       for (let i = 0; i < positions.length; i++) moved[i] = (positions[i] ?? 0) + f;
       net.layout({ backend: "positions", positions: moved.slice() });
@@ -156,6 +160,7 @@ async function runLeg(n: number, loops: boolean, lod: boolean): Promise<Leg> {
       zoomLoopUpdates,
       zoomLoopInstances,
       zoomCreated: used.created,
+      zoomUploaded: used.uploadedBytes,
       zoomDeleted: used.deleted,
       perFrame,
       listedFrames,
@@ -327,6 +332,7 @@ describe(`self-link loops per frame (#505): LOD off at N=${N_OFF.toLocaleString(
       const leg = await runLeg(N_OFF, false, false);
       expect(leg.registered, "registration uploaded nothing — the spy is not observing the live context").toBeGreaterThan(0);
       expect(leg.zoomLoopUpdates + leg.zoomLoopInstances + leg.listedFrames).toBe(0);
+      expect(leg.zoomUploaded, "a static zoom frame uploaded buffer bytes").toBe(0);
       expect(leg.positionUpdates + leg.positionInstances).toBe(0);
       console.log(`  LOD off, no self-links: worst zoom frame ${leg.worstZoomMs.toFixed(2)} ms`);
     },
@@ -342,6 +348,8 @@ describe(`self-link loops per frame (#505): LOD off at N=${N_OFF.toLocaleString(
       expect(leg.zoomLoopInstances, "a zoom frame wrote loop instances").toBe(0);
       expect(leg.zoomCreated, "GPU buffers created during the sweep").toBe(0);
       expect(leg.zoomDeleted, "GPU buffers destroyed during the sweep").toBe(0);
+      // Any in-place re-upload of the loop columns on a zoom frame shows here, whatever its wall time (#557).
+      expect(leg.zoomUploaded, "a static zoom frame uploaded buffer bytes").toBe(0);
       expect(leg.positionUpdates, "the position frames never reached the loops (non-vacuity)").toBeGreaterThan(0);
       expect(leg.positionUpdates, "more than one loop update per position frame").toBeLessThanOrEqual(POSITION_FRAMES);
       expect(leg.positionInstances, "a loop update wrote other than the S loops").toBe(leg.positionUpdates * S_OFF);
