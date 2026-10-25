@@ -137,7 +137,7 @@ function frame(
   s: { cut: ReturnType<typeof makeCutScratch>; dc: ReturnType<typeof makeDeclutterFrontierScratch>; lazy: LazySuperEdgesScratch },
   inc: ReturnType<typeof buildLeafIncidence>,
   opts: { expandPx?: number; declutter: boolean; rows?: SpatialRows; sourceEdges?: Uint32Array },
-): { drawn: number; kept: number; edges: number; ids: number[]; flows: number[] } {
+): { drawn: number; kept: number; edges: number; ids: ArrayLike<number>; flows: ArrayLike<number> } {
   const drawn = cut(f.tree, t, W, H, { expandPx: opts.expandPx, screenSized: true, maxAggregateRadius: MAX_AGG, recordCulled: true }, s.cut);
   const kept = opts.declutter ? declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, s.dc) : drawn;
   const covers = { drawn, kept, culled: s.cut.culled.subarray(0, s.cut.culledCount), split: s.cut.split.subarray(0, s.cut.splitCount) };
@@ -243,7 +243,7 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
   const lazyFit = frame(f, fit, s, inc, { declutter: true });
   s.lazy.memoTree = null;
   const rowsFit = frame(f, fit, s, inc, { declutter: true, rows: fitRows.rows });
-  const byId = (ids: number[], flows: number[]): Map<number, number> => new Map(ids.map((id, i) => [id, flows[i] ?? NaN]));
+  const byId = (ids: ArrayLike<number>, flows: ArrayLike<number>): Map<number, number> => new Map(Array.from(ids, (id, i) => [id, flows[i] ?? NaN]));
   expect(byId(rowsFit.ids, rowsFit.flows), "the rows gather draws the lazy gather's super-edges").toEqual(byId(lazyFit.ids, lazyFit.flows));
   const buildMs: number[] = [];
   let buildBytes = 0;
@@ -287,7 +287,7 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
   };
   const gestureCut = makeCutScratch();
   const gestureDeclutter = makeDeclutterFrontierScratch();
-  const lazyAt = (t: LODTransform): { visits: number; ids: number[]; flows: number[] } => {
+  const lazyAt = (t: LODTransform): { visits: number; ids: ArrayLike<number>; flows: ArrayLike<number> } => {
     const drawn = cut(f.tree, t, W, H, { screenSized: true, maxAggregateRadius: MAX_AGG, recordCulled: true }, gestureCut);
     const kept = declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, gestureDeclutter);
     const out = lazySuperEdges({ ...f.tree }, { drawn, kept, culled: gestureCut.culled.subarray(0, gestureCut.culledCount), split: gestureCut.split.subarray(0, gestureCut.splitCount) }, STYLE, visibleWorldRect(t, W, H), f.graph.csr, inc, lazyCheck);

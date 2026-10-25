@@ -72,7 +72,7 @@ function listed(g: NetworkGraph, kept: Uint32Array): { m: number; sc: LeafLinksS
 /** Pair → summed flow, the pair unordered for an undirected style. */
 function pairs(tree: LODTree, out: SuperEdgesData, directed: boolean): Map<number, number> {
   const m = new Map<number, number>();
-  out.ids.forEach((id, i) => {
+  Array.from(out.ids).forEach((id, i) => {
     const a = Math.floor(id / tree.size);
     const b = id % tree.size;
     const key = directed ? id : Math.min(a, b) * tree.size + Math.max(a, b);
@@ -107,7 +107,7 @@ describe("leaf links (#447): the gathers leave kept-leaf pairs to the full-detai
         const view = visibleWorldRect(t, W, H);
         const before = lazySuperEdges(spatial, c, styleOf(directed, false), view, g.csr, inc);
         const gathered = lazySuperEdges(spatial, c, styleOf(directed, true), view, g.csr, inc);
-        for (const id of gathered.ids) {
+        for (const id of Array.from(gathered.ids)) {
           const a = Math.floor(id / spatial.size);
           const b = id % spatial.size;
           const leafPair = a < spatial.leafCount && b < spatial.leafCount && c.kept.includes(a) && c.kept.includes(b);

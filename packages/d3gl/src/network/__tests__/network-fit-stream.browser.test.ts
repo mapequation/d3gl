@@ -65,7 +65,7 @@ afterEach(() => {
   hosts.length = 0;
 });
 
-/** Counts the gesture-boundary hooks, and exposes the view, without reaching into privates. */
+/** Counts the gesture-boundary hooks, and exposes the view (as `camera`: `view()` is the state/physical toggle), without reaching into privates. */
 class ProbeNetwork extends Network {
   interactingCalls = 0;
   screenSyncs = 0;
@@ -80,7 +80,7 @@ class ProbeNetwork extends Network {
     this.screenSyncs++;
     return super.syncScreenGeometry();
   }
-  get view(): ViewTransform {
+  get camera(): ViewTransform {
     return { ...this.transform };
   }
 }
@@ -185,7 +185,7 @@ async function sampleUntil(net: ProbeNetwork, done: Promise<void>): Promise<numb
   const ks: number[] = [];
   while (!settled) {
     await nextFrame();
-    const k = net.view.k;
+    const k = net.camera.k;
     if (ks.length === 0 || Math.abs(k - (ks[ks.length - 1] ?? 0)) > 1e-9) ks.push(k);
   }
   return ks;
@@ -193,11 +193,11 @@ async function sampleUntil(net: ProbeNetwork, done: Promise<void>): Promise<numb
 
 /** Wait until the view has changed `times` times (the stream is running and the fit is following it). */
 async function framesStreamed(net: ProbeNetwork, times: number): Promise<void> {
-  let prev = net.view.k;
+  let prev = net.camera.k;
   let changes = 0;
   for (let f = 0; f < 600 && changes < times; f++) {
     await nextFrame();
-    const k = net.view.k;
+    const k = net.camera.k;
     if (Math.abs(k - prev) > 1e-9) changes++;
     prev = k;
   }
@@ -320,12 +320,12 @@ describe("streaming fit with zoom enabled (#327)", () => {
 
       // …and the settle framed the final leaves tightly: their box fills the fit's 85% (less the glyph
       // pad), centred — not the median-extent box that framed the layout 1.6-4.3× too loose.
-      const f = framing(graph, net.view);
+      const f = framing(graph, net.camera);
       expect(f.fill).toBeGreaterThan(0.8);
       expect(f.fill).toBeLessThan(0.86);
       expect(Math.abs(f.cx - W / 2)).toBeLessThan(1);
       expect(Math.abs(f.cy - H / 2)).toBeLessThan(1);
-      expect(zoomTransform(host)).toMatchObject(net.view); // d3-zoom seeded to the final frame
+      expect(zoomTransform(host)).toMatchObject(net.camera); // d3-zoom seeded to the final frame
       net.destroy();
     }, STREAM_TIMEOUT_MS);
   }
@@ -343,10 +343,10 @@ describe("streaming fit with zoom enabled (#327)", () => {
     wheel(host, -240);
     await until(() => net.interactingCalls === 2); // the wheel gesture ends once it goes idle
     expect(net.interactingCalls, "the wheel gesture never ended").toBe(2);
-    const user = net.view;
+    const user = net.camera;
     await settled;
     await nextFrame();
-    expect(net.view).toEqual(user);
+    expect(net.camera).toEqual(user);
     expect(zoomTransform(host)).toMatchObject(user);
     net.destroy();
   }, STREAM_TIMEOUT_MS);
@@ -367,7 +367,7 @@ describe("streaming fit with zoom enabled (#327)", () => {
     expect(net.interactingCalls).toBe(0);
     await settled;
     await nextFrame();
-    expect(net.view).toEqual(target);
+    expect(net.camera).toEqual(target);
     expect(zoomTransform(host)).toMatchObject(target);
     net.destroy();
   }, STREAM_TIMEOUT_MS);
@@ -401,7 +401,7 @@ describe("streaming fit with zoom enabled (#327)", () => {
     await nextFrame();
     await nextFrame();
 
-    const grabbed = net.view;
+    const grabbed = net.camera;
     const r = host.getBoundingClientRect();
     const pointer = (type: string, sx: number, sy: number): void => {
       host.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, bubbles: true, button: 0, pointerId: 1 }));
@@ -417,12 +417,12 @@ describe("streaming fit with zoom enabled (#327)", () => {
     await until(() => frames >= f0 + 2);
     expect(frames, "the stream stopped while the node was held").toBeGreaterThanOrEqual(f0 + 2);
     await nextFrame();
-    expect(net.view, "a streamed frame reframed the camera under the held node").toEqual(grabbed);
+    expect(net.camera, "a streamed frame reframed the camera under the held node").toEqual(grabbed);
 
     pointer("pointerup", x - 20, y + 10);
     await settled;
     await nextFrame();
-    expect(net.view, "the settle reframed the camera after a grab").toEqual(grabbed);
+    expect(net.camera, "the settle reframed the camera after a grab").toEqual(grabbed);
     expect(zoomTransform(host)).toMatchObject(grabbed);
     net.destroy();
   }, STREAM_TIMEOUT_MS);
@@ -446,14 +446,14 @@ describe("streaming fit with zoom enabled (#327)", () => {
     net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 10_000 });
     net.streamFrame();
     await nextFrame();
-    const framed = net.view;
+    const framed = net.camera;
     expect(framingOf(disc, framed).fill, "non-vacuity: the stream was not framed").toBeGreaterThan(0.8);
 
     net.stopLayout();
     fixture = disc.map((v) => 3 * v); // a layout 3× larger: a fit still armed would zoom out to it
     net.streamFrame();
     await nextFrame();
-    expect(net.view, "a repaint after stopLayout() reframed the camera").toEqual(framed);
+    expect(net.camera, "a repaint after stopLayout() reframed the camera").toEqual(framed);
     expect(zoomTransform(host)).toMatchObject(framed);
     net.destroy();
   }, STREAM_TIMEOUT_MS);
@@ -498,13 +498,13 @@ describe("stragglers are trimmed only while the layout streams; the settled fit 
     }
     net.streamFrame();
     await nextFrame();
-    const streaming = net.view;
+    const streaming = net.camera;
 
     net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 10 });
     await net.whenSettled();
     await nextFrame();
     expect(graph.positions, "the settling frame was not laid out as the fixture").toEqual(positions);
-    return { streaming, settled: net.view };
+    return { streaming, settled: net.camera };
   }
 
   async function makeNet(): Promise<{ net: FixtureNetwork; graph: NetworkGraph }> {

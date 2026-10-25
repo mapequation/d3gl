@@ -32,8 +32,11 @@ describe("resolveNodeFill (#445)", () => {
   it("{ by, scale } fills each node with scale(metric) and carries the aggregate rule", () => {
     const r = resolveNodeFill(g, { by: "flow", scale: redOf }, "#000");
     expect([0, 1, 2, 3].map((i) => r.nodeColors![i * 4])).toEqual([25, 50, 75, 13]);
-    expect(Array.from(r.fillAggregate!.leafValue)).toEqual([1, 2, 3, 0.5]);
-    expect(r.fillAggregate!.rgbaOf(4)).toEqual([100, 0, 0, 255]);
+    const agg = r.fillAggregate;
+    expect(agg && "leafValue" in agg).toBe(true); // a metric fill, not a module's own colours
+    if (!agg || !("leafValue" in agg)) return;
+    expect(Array.from(agg.leafValue)).toEqual([1, 2, 3, 0.5]);
+    expect(agg.rgbaOf(4)).toEqual([100, 0, 0, 255]);
   });
 
   it("{ by } takes any NodeMetric, and a custom accessor", () => {

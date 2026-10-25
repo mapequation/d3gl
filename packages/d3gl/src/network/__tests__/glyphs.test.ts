@@ -400,6 +400,12 @@ describe("networkLayersFromCache (#179 position-only frame)", () => {
     return l.primitive === "lines" ? l.lines : l.primitive === "arrows" ? l.arrows : l.primitive === "half-arrows" ? l.halfArrows : null;
   }
 
+  /** The links layer's half-arrow batch, or `undefined` when the links are drawn as another primitive. */
+  function halfArrowsOf(layers: ReturnType<typeof networkLayers>) {
+    const l = layers.find((x) => x.name === "links");
+    return l?.primitive === "half-arrows" ? l.halfArrows : undefined;
+  }
+
   it("undirected lines: cached path reuses style bytes, rebuilds endpoints from new positions", () => {
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], weight: [3, 7] });
     g.positions.set([0, 0, 10, 10, 20, 20]);
@@ -432,12 +438,15 @@ describe("networkLayersFromCache (#179 position-only frame)", () => {
     const cached = networkLayersFromCache(g, s, cache);
     const full = networkLayers(g, s);
 
-    const ch = linkOf(cached)!;
-    const fh = linkOf(full)!;
+    const ch = halfArrowsOf(cached);
+    const fh = halfArrowsOf(full);
+    expect(ch).toBeDefined();
+    expect(fh).toBeDefined();
+    if (!ch || !fh) return;
     expect(Array.from(ch.sources)).toEqual(Array.from(fh.sources));
     expect(Array.from(ch.targets)).toEqual(Array.from(fh.targets));
-    expect(Array.from((ch as { widths: Float32Array }).widths)).toEqual(Array.from((fh as { widths: Float32Array }).widths));
-    expect(Array.from((ch as { radii: Float32Array }).radii)).toEqual(Array.from((fh as { radii: Float32Array }).radii));
+    expect(Array.from(ch.widths)).toEqual(Array.from(fh.widths));
+    expect(Array.from(ch.radii)).toEqual(Array.from(fh.radii));
     expect(Array.from(ch.colors)).toEqual(Array.from(fh.colors));
   });
 });

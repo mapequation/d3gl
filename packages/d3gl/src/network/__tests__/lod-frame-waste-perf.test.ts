@@ -422,7 +422,7 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
       const frontier = cut(tree, t, W, H, { expandPx: 6, screenSized: true, maxAggregateRadius: 26 }, cutSc).slice();
       const before = calls;
       const out = superEdges(tree, frontier, style, visibleWorldRect(t, W, H), seSc);
-      return { calls: calls - before, flows: (out.flows ?? []).slice(), colors: out.halfArrows?.colors.slice() ?? new Uint8Array(0) };
+      return { calls: calls - before, flows: Array.from(out.flows ?? []), colors: out.halfArrows?.colors.slice() ?? new Uint8Array(0) };
     };
     const k0 = 0.9 * Math.min(W / (maxX - minX), H / (maxY - minY));
     const first = frame(k0);
