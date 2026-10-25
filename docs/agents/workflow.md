@@ -39,7 +39,9 @@ eventual root cause. None of it survives in a merged PR, so capture it where a f
    / `vitest` / build: it has its own empty `node_modules`, so they fail or run against stale deps until
    you do. Drive everything by the worktree path (see Worktrees below). Open the PR with `Fixes #N`.
 5. **Performance.** Add the `## Performance` section to the PR body, and a per-frame regression test if
-   the change touches a per-frame path, as `docs/agents/performance.md` describes. Both come before step 6.
+   the change touches a per-frame path, as `docs/agents/performance.md` describes. Run the independent
+   audit and the serial guard re-run of CLAUDE.md "Enforcing efficient rendering" (rule 4) and put their
+   results in that section. All of this comes before step 6.
 6. **Human verification.** Summarize what you have done (point to the Performance section for any
    per-frame or memory impact), give a runnable example to check it in, and ask for approval. **Never
    merge without it.**
