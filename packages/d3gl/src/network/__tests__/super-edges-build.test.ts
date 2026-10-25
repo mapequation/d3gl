@@ -33,16 +33,6 @@ interface SuperEdgeCSR {
   superEdgeInFlow: Float32Array;
 }
 
-/** `buildSuperEdges` always hands out every CSR field and the depth; its `LODTopology` slots are typed
- *  optional, so narrow them here, failing loudly should one go missing. */
-function built(out: ReturnType<typeof buildSuperEdges>): SuperEdgeCSR & { depth: Int32Array } {
-  const { superEdgeOffset, superEdgeTarget, superEdgeFlow, superEdgeInOffset, superEdgeInSource, superEdgeInFlow, depth } = out;
-  if (!superEdgeOffset || !superEdgeTarget || !superEdgeFlow || !superEdgeInOffset || !superEdgeInSource || !superEdgeInFlow || !depth) {
-    throw new Error("buildSuperEdges left out a CSR field or the depth");
-  }
-  return { superEdgeOffset, superEdgeTarget, superEdgeFlow, superEdgeInOffset, superEdgeInSource, superEdgeInFlow, depth };
-}
-
 function referenceSuperEdges(size: number, parent: Int32Array, edges: SuperEdgeInput): SuperEdgeCSR {
   const depth = new Int32Array(size);
   for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
@@ -257,7 +247,7 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
     it(`matches the reference: ${label}`, () => {
       const { size, parent } = randomTree(leafCount, fanout);
       const edges = randomEdges(leafCount, m, seed);
-      expectSameCSR(built(buildSuperEdges(size, parent, edges)), referenceSuperEdges(size, parent, edges), size);
+      expectSameCSR(buildSuperEdges(size, parent, edges), referenceSuperEdges(size, parent, edges), size);
     });
   }
 
@@ -271,7 +261,7 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
     it(`matches the reference with lift pairs (#325): ${label}`, () => {
       const { size, parent, leafCount } = raggedTree(leafTarget, maxDepth, seed);
       const edges = concatEdges(randomEdges(leafCount, m, seed), randomTreeNodeEdges(size, m / 4, seed + 1));
-      const got = built(buildSuperEdges(size, parent, edges));
+      const got = buildSuperEdges(size, parent, edges);
       expectSameCSR(got, referenceSuperEdges(size, parent, edges), size);
       // The build hands out the depth it used, which the gather reads to tell a lift pair.
       const depth = new Int32Array(size);
@@ -299,7 +289,7 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
       target: Uint32Array.from([v, u, up(u, 2)]), // u→v, v→u, and u → its own module 1:3
       weight: Float32Array.from([1, 2, 4]),
     };
-    const got = built(buildSuperEdges(tree.size, parent, edges));
+    const got = buildSuperEdges(tree.size, parent, edges);
     const pairs = csrPairs(got.superEdgeOffset, got.superEdgeTarget, got.superEdgeFlow, tree.size);
     expect(new Map([...pairs].sort())).toEqual(
       new Map(
@@ -320,14 +310,14 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
   it("handles degenerate inputs identically: no edges, all self-loops, single leaf", () => {
     const { size, parent } = randomTree(32, 2);
     const empty: SuperEdgeInput = { source: new Uint32Array(0), target: new Uint32Array(0), weight: new Float32Array(0) };
-    expectSameCSR(built(buildSuperEdges(size, parent, empty)), referenceSuperEdges(size, parent, empty), size);
+    expectSameCSR(buildSuperEdges(size, parent, empty), referenceSuperEdges(size, parent, empty), size);
 
     const loops: SuperEdgeInput = {
       source: Uint32Array.from([0, 5, 31, 12]),
       target: Uint32Array.from([0, 5, 31, 12]),
       weight: Float32Array.from([1, 2, 3, 4]),
     };
-    expectSameCSR(built(buildSuperEdges(size, parent, loops)), referenceSuperEdges(size, parent, loops), size);
+    expectSameCSR(buildSuperEdges(size, parent, loops), referenceSuperEdges(size, parent, loops), size);
 
     const one = randomTree(1, 2);
     const none: SuperEdgeInput = { source: new Uint32Array(0), target: new Uint32Array(0), weight: new Float32Array(0) };
@@ -341,7 +331,7 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
       target: Uint32Array.from([1, 1, 0]),
       weight: Float32Array.from([1.5, 2.5, 10]),
     };
-    const got = built(buildSuperEdges(size, parent, edges));
+    const got = buildSuperEdges(size, parent, edges);
     expectSameCSR(got, referenceSuperEdges(size, parent, edges), size);
     // 0→1 summed to 4, 1→0 held separately at 10.
     const pairs = csrPairs(got.superEdgeOffset, got.superEdgeTarget, got.superEdgeFlow, size);
@@ -395,7 +385,7 @@ describe("buildSuperEdges — beyond V8's Map ceiling (#177)", () => {
       const t0 = performance.now();
       const raw = buildSuperEdges(size, parent, edges);
       const ms = performance.now() - t0;
-      const got = built(raw);
+      const got = raw;
       // eslint-disable-next-line no-console
       console.log(`[super-edges-build] ${distinctPairs} distinct pairs in ${ms.toFixed(0)}ms`);
 
