@@ -8,6 +8,7 @@ describe("Backend interface", () => {
       setLayers: (l: RenderLayer[]) => calls.push(`setLayers:${l.length}`),
       updateLayer: (n) => calls.push(`updateLayer:${n}`),
       setTransform: (t: ViewTransform) => calls.push(`t:${t.k}`),
+      resize: (w, h) => calls.push(`resize:${w}x${h}`),
       render: () => calls.push("render"),
       toPNG: () => "data:image/png;base64,",
       toSVG: () => "<svg></svg>",

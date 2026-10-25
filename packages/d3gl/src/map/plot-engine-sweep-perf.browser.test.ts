@@ -84,8 +84,8 @@ beforeAll(async () => {
   const spy = new GlBufferSpy();
   try {
     const data = makePoints(N);
-    const points: Counts = { x: 0, y: 0, radius: 0, fill: 0 };
-    const layer: Counts = { draw: 0, stroke: 0, lineWidth: 0 };
+    const points = { x: 0, y: 0, radius: 0, fill: 0 };
+    const layer = { draw: 0, stroke: 0, lineWidth: 0 };
 
     const chart = plot(perfHost(W, H), { width: W, height: H, backend: "webgl" });
     await chart.whenReady();

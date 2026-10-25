@@ -52,7 +52,8 @@ interface RendererTextures {
 }
 
 interface EngineInternals {
-  handle: { backend: WebGLBackend & { renderers: Map<string, RendererTextures> } };
+  // Pick the public seam: intersecting the class itself with its private `renderers` collapses to `never`.
+  handle: { backend: Pick<WebGLBackend, "updateLayerStyles" | "updateLayerFlags" | "render"> & { renderers: Map<string, RendererTextures> } };
   scene: Scene;
 }
 

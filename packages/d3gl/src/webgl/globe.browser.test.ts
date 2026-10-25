@@ -51,7 +51,7 @@ describe("globe spike", () => {
 
     const center = dev.readPixelsToArrayWebGL(fb, { sourceX: W / 2, sourceY: H / 2, sourceWidth: 1, sourceHeight: 1 });
     expect(center[3]).toBeGreaterThan(200);                 // opaque: sphere is here
-    expect(center[0] + center[2]).toBeGreaterThan(150);     // red or blue, not black/clear
+    expect((center[0] ?? NaN) + (center[2] ?? NaN)).toBeGreaterThan(150);     // red or blue, not black/clear
     const corner = dev.readPixelsToArrayWebGL(fb, { sourceX: 2, sourceY: 2, sourceWidth: 1, sourceHeight: 1 });
     expect(corner[3]).toBeLessThan(40);                     // outside the disc: clear
     dev.destroy();

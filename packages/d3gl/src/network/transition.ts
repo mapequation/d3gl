@@ -39,6 +39,9 @@ export function lerpPositions(out: Float32Array, from: Float32Array, to: Float32
   }
 }
 
+/** A scheduled frame's id: `requestAnimationFrame`'s number, or the 16 ms timeout fallback's handle (a `Timeout` under Node). */
+type FrameHandle = number | ReturnType<typeof setTimeout>;
+
 export interface PositionTransitionOptions {
   /** Length in milliseconds. A non-positive or non-finite value jumps to the target on the first frame. */
   duration: number;
@@ -115,13 +118,15 @@ export interface PositionTransition {
 export function positionTransition(positions: Float32Array, opts: PositionTransitionOptions): PositionTransition {
   const ease = opts.ease ?? easeCubicInOut;
   const now = opts.now ?? (() => performance.now());
-  const requestFrame =
+  const requestFrame: (cb: () => void) => FrameHandle =
     opts.requestFrame ??
     (typeof requestAnimationFrame === "function"
       ? (cb: () => void) => requestAnimationFrame(cb)
       : (cb: () => void) => setTimeout(cb, 16));
-  const cancelFrame =
+  const cancelNumber =
     opts.cancelFrame ?? (typeof cancelAnimationFrame === "function" ? (id: number) => cancelAnimationFrame(id) : (id: number) => clearTimeout(id));
+  // A non-number id is the timeout fallback's handle under Node: only `clearTimeout` takes it.
+  const cancelFrame = (id: FrameHandle): void => (typeof id === "number" ? cancelNumber(id) : clearTimeout(id));
   const duration = Number.isFinite(opts.duration) && opts.duration > 0 ? opts.duration : 0;
   let from = positions.slice();
 
@@ -131,7 +136,7 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
   });
   let target: Float32Array | null = null;
   let start = 0;
-  let raf = 0;
+  let raf: FrameHandle = 0;
   let ended = false;
   let kept: number[] = []; // node ids to keep in place once the target arrives ({@link PositionTransition.keep})
   let keptAll: number[] = []; // every kept id, re-applied to a retarget's target

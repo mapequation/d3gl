@@ -150,8 +150,8 @@ describe("WebGLBackend", () => {
     // At identity rotation the north pole projects to the top of the disc.
     const top = backend.readScreenPixel(64, 24);     // upper part of the disc
     const bottom = backend.readScreenPixel(64, 104);  // lower part of the disc
-    expect(top[0]).toBeGreaterThan(top[2]);     // top is red-dominant (north)
-    expect(bottom[2]).toBeGreaterThan(bottom[0]); // bottom is blue-dominant (south)
+    expect(top[0]).toBeGreaterThan(top[2] ?? NaN);     // top is red-dominant (north)
+    expect(bottom[2]).toBeGreaterThan(bottom[0] ?? NaN); // bottom is blue-dominant (south)
     backend.destroy();
   });
 

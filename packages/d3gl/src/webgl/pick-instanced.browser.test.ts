@@ -60,7 +60,7 @@ describe("GPU-readback link picking", () => {
     async function hoverSettle(x: number, y: number, expected: number): Promise<number> {
       let id = -1;
       for (let i = 0; i < 60; i++) {
-        id = backend.pickInstanced!(x, y, false);
+        id = backend.pickInstanced(x, y, false) ?? -1;
         if (id === expected) return id;
         await new Promise((r) => setTimeout(r, 50));
       }

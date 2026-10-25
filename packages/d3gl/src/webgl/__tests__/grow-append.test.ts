@@ -99,7 +99,13 @@ const fakeDevice = {
 
 // Import AFTER mocks are registered.
 import { GroupRenderer } from "../renderer.js";
-import type { GroupBuffers, GroupBufferDelta } from "../../core/index.js";
+import type { DrawableRange, GroupBuffers, GroupBufferDelta } from "../../core/index.js";
+
+/** Point drawables carry no fill/stroke geometry: one all-zero range each, as the Scene records them. */
+function pointRanges(n: number): DrawableRange[] {
+  const none = { vertexOffset: 0, vertexCount: 0, indexOffset: 0, indexCount: 0 };
+  return Array.from({ length: n }, () => ({ fill: { ...none }, stroke: { ...none } }));
+}
 
 /** A points-only group with `n` circles, ids 0..n-1, each at (i, i) radius 1. */
 function pointBuffers(n: number, from = 0): GroupBuffers {
@@ -124,6 +130,7 @@ function pointBuffers(n: number, from = 0): GroupBuffers {
     pointCount: n,
     fillAnchors: new Float32Array(0),
     strokeAnchors: new Float32Array(0),
+    ranges: pointRanges(total),
   };
 }
 
@@ -150,6 +157,7 @@ function pointDelta(n: number, from: number): GroupBufferDelta {
     strokeAnchors: new Float32Array(0),
     drawableCount: total,
     fromDrawable: from,
+    ranges: pointRanges(n),
   };
 }
 
@@ -317,7 +325,7 @@ describe("GrowBuffer / GroupRenderer.append — O(new) incremental upload", () =
       strokeVertices: new Float32Array(0), strokeIndices: new Uint32Array(0),
       fillColors: new Uint8Array(0), strokeColors: new Uint8Array(0), flags: new Uint8Array(0),
       drawableCount: 0, pointCenters: new Float32Array(0), pointCount: 0,
-      fillAnchors: new Float32Array(0), strokeAnchors: new Float32Array(0),
+      fillAnchors: new Float32Array(0), strokeAnchors: new Float32Array(0), ranges: [],
     };
     const r = new GroupRenderer(fakeDevice, empty, 100, 100);
     expect(r.append(pointDelta(3, 0))).toBe(false); // point pass null → can't grow

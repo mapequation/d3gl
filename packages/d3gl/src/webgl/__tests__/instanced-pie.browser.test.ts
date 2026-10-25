@@ -31,8 +31,8 @@ function px(device: Device, framebuffer: Framebuffer, x: number, y: number) {
   return device.readPixelsToArrayWebGL(framebuffer, { sourceX: x, sourceY: y, sourceWidth: 1, sourceHeight: 1 });
 }
 
-const isRed = (p: Uint8Array | Uint8ClampedArray) => p[0]! > 180 && p[2]! < 90;
-const isBlue = (p: Uint8Array | Uint8ClampedArray) => p[2]! > 180 && p[0]! < 90;
+const isRed = (p: ArrayLike<number>) => p[0]! > 180 && p[2]! < 90;
+const isBlue = (p: ArrayLike<number>) => p[2]! > 180 && p[0]! < 90;
 
 describe("InstancedPie", () => {
   it("splits a disc into two angular wedges of the given colours, transparent outside", async () => {

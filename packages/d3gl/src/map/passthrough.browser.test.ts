@@ -506,7 +506,7 @@ class GLPlot extends Plot {
     (this as unknown as { setInteracting(v: boolean): void }).setInteracting(v);
   }
   applyTransform(t: ViewTransform): void {
-    (this as unknown as { setTransform(t: ViewTransform): this }).setTransform(t);
+    this.setTransform(t);
   }
 }
 

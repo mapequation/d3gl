@@ -34,7 +34,9 @@ describe("InstancedLane (#108-A)", () => {
 
     const layers = lane.update({ k: 1, x: 0, y: 0 }, 25, 25); // x in [0,25] => points 0,1,2
     expect(Array.from(lane.visible)).toEqual([0, 1, 2]);
-    expect(layers[0]!.circles!.count).toBe(3);
+    const layer = layers[0];
+    expect(layer?.primitive).toBe("circles");
+    if (layer?.primitive === "circles") expect(layer.circles.count).toBe(3);
     expect(emitted).toHaveLength(1);
   });
 
