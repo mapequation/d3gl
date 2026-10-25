@@ -38,12 +38,12 @@ export const DROP_COT = 1 / Math.tan(DROP_HALF_SPREAD);
  *  from its `bends` column. */
 export const LOOP_LEG = 1;
 
-/** The narrowest and widest leg spread a loop is drawn at (degrees): at 0° or 360° its centre is at infinity
- *  (`cot α = ±∞`), so the outline would be NaN. */
+/** The narrowest and widest leg spread a loop is drawn at (degrees): at 0° its centre is at infinity (`cot α = ∞`), so
+ *  the outline would be NaN, and from 180° the legs no longer open away from the node. */
 const LOOP_SPREAD_MIN = 1;
-const LOOP_SPREAD_MAX = 359;
+const LOOP_SPREAD_MAX = 179;
 
-/** A style's `selfLinkSpread` (degrees) as drawn: clamped to [1°, 359°]; absent or NaN ⇒ {@link LOOP_SPREAD}. Once per
+/** A style's `selfLinkSpread` (degrees) as drawn: clamped to [1°, 179°]; absent or NaN ⇒ {@link LOOP_SPREAD}. Once per
  *  style resolution. */
 export function resolveLoopSpread(deg: number | undefined): number {
   if (deg === undefined || Number.isNaN(deg)) return LOOP_SPREAD;

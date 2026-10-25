@@ -325,7 +325,7 @@ export interface NetworkStyle {
   linkBend?: number;
   /**
    * Self-link loops (#542): the angle between a loop's two legs where they leave and re-enter the node, in degrees
-   * (default `25`, clamped to [1, 359]). Wider spreads a rounder loop. A provisional name: it may change before it is settled.
+   * (default `25`, clamped to [1, 179]). Wider spreads a rounder loop. A provisional name: it may change before it is settled.
    */
   selfLinkSpread?: number;
   /**

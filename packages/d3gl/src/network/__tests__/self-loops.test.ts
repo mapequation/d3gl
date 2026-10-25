@@ -548,13 +548,14 @@ describe("an LOD frame's loops on kept leaves", () => {
 });
 
 describe("selfLinkSpread / selfLinkLength resolution (#542)", () => {
-  it("clamps the spread into [1°, 359°] and the leg to ≥ 0, so a loop's centre and outline stay finite", () => {
+  it("clamps the spread into [1°, 179°] and the leg to ≥ 0, so a loop's centre and outline stay finite", () => {
     expect(resolveLoopSpread(undefined)).toBe(LOOP_SPREAD);
     expect(resolveLoopSpread(Number.NaN)).toBe(LOOP_SPREAD);
     expect(resolveLoopSpread(40)).toBe(40);
     expect(resolveLoopSpread(0)).toBe(1);
     expect(resolveLoopSpread(-30)).toBe(1);
-    expect(resolveLoopSpread(360)).toBe(359);
+    expect(resolveLoopSpread(180)).toBe(179);
+    expect(resolveLoopSpread(360)).toBe(179);
     expect(resolveLoopLength(undefined)).toBe(LOOP_LEG);
     expect(resolveLoopLength(Number.NaN)).toBe(LOOP_LEG);
     expect(resolveLoopLength(2.5)).toBe(2.5);
