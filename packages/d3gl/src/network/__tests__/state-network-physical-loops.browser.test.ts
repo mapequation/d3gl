@@ -1,15 +1,17 @@
 import { afterEach, describe, it, expect } from "vitest";
 import { network } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
-import { LOOP_REACH } from "../self-loops.js";
+import { LOOP_LEG, LOOP_SPREAD, loopPieceLength } from "../../core/loop-drop.js";
 
 /**
  * #535: a state link between two state nodes of ONE physical node is flow that stays in that physical node. The
  * physical graph keeps it as the node's self-link, and the physical view draws its loop, on WebGL, Canvas and SVG.
  *
  * Physical node A (0, at x = 60) holds state nodes 0 and 1; physical node B (1, at x = 140) holds state node 2.
- * State links 0 → 2 and 1 → 2 cross from A to B; 0 → 1 stays in A. A's loop points away from B, towards −x: its
- * apex sits `r·(1 + LOOP_REACH)` left of A's centre, outside the node.
+ * State links 0 → 2 and 1 → 2 cross from A to B; 0 → 1 stays in A. A's loop points away from B, towards −x. On
+ * main's loop geometry (`core/loop-drop.ts`) its two ends run straight from the centre out to `ρ = r + h` along the
+ * legs at ±α (α = LOOP_SPREAD / 2), with `h = loopPieceLength(arrowSize, width)`, and the cubic between them has legs
+ * `ℓ = LOOP_LEG·r`; its far end lies on the axis, `(4ρ + 3ℓ)·cos α / 4` from the centre: left of A, outside the node.
  */
 
 const W = 200;
@@ -17,7 +19,11 @@ const BACKENDS = ["webgl", "canvas", "svg"] as const;
 const R = 10;
 const CX = 60;
 const CY = 100;
-const APEX_X = CX - R * (1 + LOOP_REACH);
+const LINK_WIDTH = 3;
+const ARROW_SIZE = 4;
+const HALF_SPREAD = (LOOP_SPREAD * Math.PI) / 360;
+const RHO = R + loopPieceLength(ARROW_SIZE, LINK_WIDTH);
+const APEX_X = CX - ((4 * RHO + 3 * LOOP_LEG * R) * Math.cos(HALF_SPREAD)) / 4;
 const POSITIONS = new Float32Array([CX, CY, 140, CY]);
 
 function host(): HTMLElement {
@@ -64,7 +70,7 @@ async function draw(backend: (typeof BACKENDS)[number], inside: boolean) {
     directed: true,
   });
   net
-    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: 3, arrowSize: 4, directed: true, sizeMode: "screen" })
+    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: LINK_WIDTH, arrowSize: ARROW_SIZE, directed: true, sizeMode: "screen" })
     .stateNetwork(graph, { view: "physical" });
   net.layout({ backend: "positions", positions: POSITIONS });
   net.setTransform({ k: 1, x: 0, y: 0 });
@@ -81,10 +87,15 @@ describe("state network: the physical view draws a loop for flow that stays in a
     it(`${backend}: a state link inside one physical node draws that node's loop; none without it`, async () => {
       const withLink = await draw(backend, true);
       const loop = await loopRed(withLink);
+      // The far end sits where the geometry puts it: red on the axis at the apex, none past it.
+      const atApex = await redPixels(withLink, APEX_X - 3, CY - 3, APEX_X + 3, CY + 3);
+      const pastApex = await redPixels(withLink, APEX_X - 14, CY - 14, APEX_X - 4, CY + 14);
       // Nothing red beyond B (B has no self-link).
       const atB = await redPixels(withLink, 152, CY - 14, 180, CY + 14);
       const without = await loopRed(await draw(backend, false));
       expect(loop).toBeGreaterThan(20);
+      expect(atApex).toBeGreaterThan(0);
+      expect(pastApex).toBe(0);
       expect(atB).toBe(0);
       expect(without).toBe(0);
     });
