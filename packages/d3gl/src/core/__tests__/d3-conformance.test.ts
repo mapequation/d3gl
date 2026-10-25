@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { geoPath, geoEquirectangular } from "d3-geo";
 import { arc as d3arc } from "d3-shape";
 import { PathRecorder } from "../path-recorder.js";
+import { asD3Context } from "../path-context.js";
 import { tessellateFill } from "../tessellate.js";
 
 describe("d3 conformance", () => {
@@ -38,7 +39,7 @@ describe("d3 conformance", () => {
     const recorder = new PathRecorder();
     const generator = d3arc().innerRadius(0).outerRadius(100);
     recorder.beginPath();
-    generator.context(recorder)({
+    generator.context(asD3Context(recorder))({
       startAngle: 0,
       endAngle: Math.PI / 2,
       innerRadius: 0,

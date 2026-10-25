@@ -55,6 +55,16 @@ export interface PathContext {
   closePath(): void;
 }
 
+/**
+ * A {@link PathContext} typed as the `CanvasRenderingContext2D` that d3's typings ask for (`line().context`,
+ * `arc().context`, `geoPath(projection, context)`, …). d3's generators call only the path methods a PathContext
+ * implements, but `@types/d3-*` declare the full 2D context, so the widening is a deliberate third-party-boundary
+ * cast (#221), made here once for the engine and the tests alike.
+ */
+export function asD3Context(ctx: PathContext): CanvasRenderingContext2D {
+  return ctx as unknown as CanvasRenderingContext2D;
+}
+
 /** A flattened subpath: a polyline plus whether it was closed. */
 export interface Subpath {
   /** Interleaved x,y coordinates: [x0, y0, x1, y1, ...]. */
