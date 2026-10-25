@@ -156,13 +156,13 @@ function collector(ids: number[], discs?: BoundaryDiscs): CutBoundaries {
 }
 
 /** The drawn directed pairs (`"a:b"` → flow), failing on a pair drawn twice. */
-function drawnPairs(out: { ids: number[]; flows?: number[] }, size: number): Map<string, number> {
+function drawnPairs(out: { ids: ArrayLike<number>; flows?: ArrayLike<number> }, size: number): Map<string, number> {
   const m = new Map<string, number>();
-  out.ids.forEach((id, e) => {
+  Array.from(out.ids).forEach((id, e) => {
     const a = Math.floor(id / size);
     const key = `${a}:${id - a * size}`;
     expect(m.has(key), `pair ${key} drawn twice`).toBe(false);
-    m.set(key, out.flows![e]!);
+    m.set(key, out.flows?.[e] ?? NaN);
   });
   return m;
 }
@@ -368,7 +368,7 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
     const got = drawnPairs(out, tree.size);
     expect(got.get(`${m1}:${m2}`)).toBe(5);
     expect(got.get(`${m2}:${m1}`)).toBe(3);
-    const e = out.ids.indexOf(m1 * tree.size + m2);
+    const e = Array.from(out.ids).indexOf(m1 * tree.size + m2);
     expect(Array.from(out.lines!.sources.slice(e * 2, e * 2 + 2))).toEqual([tree.cx[m1], tree.cy[m1]]);
     expect(Array.from(out.lines!.targets.slice(e * 2, e * 2 + 2))).toEqual([tree.cx[m2], tree.cy[m2]]);
     // A present glyph inside an anchored module's circle: module 1 open, module 2 collapsed within its ring.
@@ -387,18 +387,18 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
     const anchor = collector([m1], discs);
     tree.radius.fill(2); // glyph radii, so a boundary end's 0 is told apart from a glyph end's
     const lines = superEdges(tree, frontier, { ...STYLE, anchor }, ALL);
-    const e = lines.ids.indexOf(m1 * tree.size + id("2"));
+    const e = Array.from(lines.ids).indexOf(m1 * tree.size + id("2"));
     expect(e).toBeGreaterThanOrEqual(0);
     const sx = lines.lines!.sources[e * 2]!;
     const sy = lines.lines!.sources[e * 2 + 1]!;
     expect(Math.hypot(sx - cx, sy - cy)).toBeCloseTo(R, 3);
     // The other end stays at module 2's centre; the arrowhead's tip sits there at 2's glyph radius.
     expect(lines.lines!.targets[e * 2]).toBeCloseTo(tree.cx[id("2")]!, 3);
-    const back = lines.ids.indexOf(id("2") * tree.size + m1);
+    const back = Array.from(lines.ids).indexOf(id("2") * tree.size + m1);
     expect(Math.hypot(lines.lines!.targets[back * 2]! - cx, lines.lines!.targets[back * 2 + 1]! - cy)).toBeCloseTo(R, 3);
     expect(lines.lines!.radii?.[back]).toBe(0); // tip on the ring
     const half = superEdges(tree, frontier, { ...STYLE, linkStyle: "half-arrow", anchor }, ALL);
-    const h = half.ids.indexOf(m1 * tree.size + id("2"));
+    const h = Array.from(half.ids).indexOf(m1 * tree.size + id("2"));
     expect(half.halfArrows!.radii[h * 2]).toBe(0); // the boundary end
     expect(half.halfArrows!.radii[h * 2 + 1]).toBe(tree.radius[id("2")]); // the glyph end
   });
@@ -543,7 +543,7 @@ describe("cut collects the expanded modules in view (#329)", () => {
   const views: LODTransform[] = [];
   const rootR = tree.extent[tree.size - 1]!;
   for (const k of [0.4, 1, 2.5, 6, 14]) {
-    for (const [fx, fy] of [[0, 0], [0.5, 0.2], [-0.7, 0.6], [1.05, 0], [0.2, -1.1], [3, 3]]) {
+    for (const [fx, fy] of [[0, 0], [0.5, 0.2], [-0.7, 0.6], [1.05, 0], [0.2, -1.1], [3, 3]] satisfies [number, number][]) {
       const x = tree.cx[tree.size - 1]! + fx * rootR;
       const y = tree.cy[tree.size - 1]! + fy * rootR;
       views.push({ k, x: W / 2 - x * k, y: H / 2 - y * k });

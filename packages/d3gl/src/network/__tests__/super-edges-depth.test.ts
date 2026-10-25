@@ -183,11 +183,11 @@ function cutsOf(tree: LODTree, g: number): number[][] {
 function drawnPairs(tree: LODTree, frontier: number[], crossLevelEdges: boolean): Map<string, number> {
   const { ids, flows } = superEdges(tree, Uint32Array.from(frontier), { ...STYLE, crossLevelEdges }, ALL);
   const out = new Map<string, number>();
-  ids.forEach((id, e) => {
+  Array.from(ids).forEach((id, e) => {
     const a = Math.floor(id / tree.size);
     const key = `${a}:${id - a * tree.size}`;
     expect(out.has(key), `pair ${key} drawn twice`).toBe(false);
-    out.set(key, flows[e]!);
+    out.set(key, flows?.[e] ?? NaN);
   });
   return out;
 }
@@ -300,7 +300,7 @@ describe("super-edges between tree nodes at different depths (#325)", () => {
     const view = { minX: -10, maxX: 10, minY: -10, maxY: 10 };
     for (const crossLevelEdges of [false, true]) {
       const { ids, flows } = superEdges(tree, Uint32Array.from([0]), { ...STYLE, crossLevelEdges }, view);
-      expect(ids.map((id, e) => [id, flows[e]])).toEqual([
+      expect(Array.from(ids, (id, e) => [id, flows?.[e]])).toEqual([
         [0 * tree.size + m1, 2], // out: u → module 1
         [m1 * tree.size + 0, 3], // in: module 1 → u
       ]);
@@ -317,7 +317,7 @@ describe("super-edges between tree nodes at different depths (#325)", () => {
 describe("super-edges toward an off-screen expanded module draw each edge once (#325, #329)", () => {
   const drawn = (tree: LODTree, frontier: number[], view: typeof ALL, crossLevelEdges: boolean, anchor?: CutBoundaries): string[] => {
     const { ids, flows } = superEdges(tree, Uint32Array.from(frontier), { ...STYLE, crossLevelEdges, anchor }, view);
-    return ids.map((id, e) => `${Math.floor(id / tree.size)}->${id % tree.size} (${flows[e]})`).sort();
+    return Array.from(ids, (id, e) => `${Math.floor(id / tree.size)}->${id % tree.size} (${flows?.[e]})`).sort();
   };
   const view = { minX: -50, maxX: 50, minY: -50, maxY: 50 };
 
@@ -438,11 +438,11 @@ describe("super-edges toward an off-screen expanded module draw each edge once (
                 const w = all.weight[e]!;
                 const { ids, flows } = superEdges(single[e]!, Uint32Array.from(present), { ...STYLE, crossLevelEdges, anchor }, view, scratch);
                 let sum = 0;
-                ids.forEach((id, k) => {
+                Array.from(ids).forEach((id, k) => {
                   const a = Math.floor(id / tree.size);
                   const b = id - a * tree.size;
                   expect(within(u, a) && within(v, b), `edge ${u}→${v} drawn as ${a}→${b}`).toBe(true);
-                  sum += flows[k]!;
+                  sum += flows?.[k] ?? NaN;
                 });
                 const where = `edge ${u}→${v} (${w}), present [${present.join(",")}], view ${JSON.stringify(view)}, crossLevelEdges=${crossLevelEdges}`;
                 expect(sum === 0 || sum === w, `${where}: drew ${sum}`).toBe(true);

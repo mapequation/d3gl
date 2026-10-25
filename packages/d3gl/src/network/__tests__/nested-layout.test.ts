@@ -19,7 +19,7 @@ import { layoutBox, type FitBox } from "../fit.js";
 
 describe("nestedLayout (#324)", () => {
   const { tree, nodeCount } = twoLevel();
-  const out = nestedLayout(tree);
+  const out = nestedLayout(topo(tree));
   const root = rootOf(tree);
   const [m1, m2, m3, m4] = kids(tree, root).sort((a, b) => a - b);
   const dist = (a: number, b: number): number => Math.hypot(out.cx[a]! - out.cx[b]!, out.cy[a]! - out.cy[b]!);
@@ -65,20 +65,20 @@ describe("nestedLayout (#324)", () => {
   });
 
   it("is deterministic", () => {
-    expect(Array.from(nestedLayout(tree).positions)).toEqual(Array.from(out.positions));
+    expect(Array.from(nestedLayout(topo(tree)).positions)).toEqual(Array.from(out.positions));
   });
 
   it("sizes discs by the size metric", () => {
     const size = new Float32Array(nodeCount).fill(1);
     for (let j = 0; j < 6; j++) size[j] = 10; // module 1 gets 10× the metric of each other module
-    const sized = nestedLayout(tree, { size });
+    const sized = nestedLayout(topo(tree), { size });
     expect(sized.r[m1!]! / sized.r[m2!]!).toBeCloseTo(Math.sqrt(10), 1);
   });
 
   it("streams depths top-down, leaves collapsed to their placed ancestor", () => {
     const depths: number[] = [];
     let firstFrame: Float32Array | null = null;
-    nestedLayout(tree, {
+    nestedLayout(topo(tree), {
       onDepth: (depth, positions) => {
         depths.push(depth);
         firstFrame ??= positions.slice();
@@ -110,7 +110,7 @@ describe("nestedLayout Barnes-Hut repulsion (modules above the exact-sum size)",
     const tree = buildModuleLODTree(2 * k, records, { source, target, weight }, []);
     const walks = vi.spyOn(BarnesHutTree.prototype, "applyForces");
     const traversals = vi.spyOn(BarnesHutTree.prototype, "applyForce");
-    const out = nestedLayout(tree);
+    const out = nestedLayout(topo(tree));
     const steps = walks.mock.calls.length;
     const visits = traversals.mock.calls.length;
     walks.mockRestore();
