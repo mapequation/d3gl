@@ -1,0 +1,11 @@
+{
+  // Typechecks the test files (#556), which tsconfig.json excludes: Node types for the node tests and runners, and
+  // ES2022 for what Node 22 and Chromium provide (Array.prototype.at). Run: pnpm --filter @mapequation/d3gl typecheck:test
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["geojson", "node"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "include": ["src/**/*", "tsdown.config.ts", "package.json"],
+  "exclude": ["src/**/__screenshots__/**"]
+}
