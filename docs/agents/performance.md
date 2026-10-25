@@ -150,6 +150,15 @@ the tier's first real run, and the "fix" someone then reaches for is loosening t
 Deterministic assertions (counts, identity, pixels) take N straight from the same `perfN` value and
 are never given slack by either knob.
 
+**A count-only guard may opt out of the tier's size under software GL.** When every deterministic
+assertion holds at any N and the wall time is SwiftShader executing draws (≈10 µs per drawn instance per
+frame, so a 1M-instance LOD-off frame takes ≈23 s), size each case at its smallest non-vacuous N and let
+`PERF_BROWSER_N` resize it only under `PERF_REAL_GPU=1` (cap `max` on `perfRealGpu`, and clamp from below
+with `Math.max(default, perfN(…))`). A wall-clock ceiling then shrinks to its constant term, so back it
+with a count (bytes uploaded, buffers created, instances written) for the work it used to bound. Say so
+in the file header and the coverage-map row. `network-self-loops-perf.browser.test.ts` is the example
+(#557).
+
 **Writing an at-scale leg:** gate it `BENCH_<NAME>`, read its size from `BENCH_<NAME>_N` (the tier
 sets it to `$PERF_N` — do **not** hard-code, two benches used to and silently ignored the tier),
 assert the deterministic signature *unconditionally*, and put the wall-clock ceiling behind
