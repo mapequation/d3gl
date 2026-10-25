@@ -12,7 +12,11 @@ export interface CSR {
   offsets: Uint32Array;
   /** Flattened neighbor ids; node `i`'s neighbors are `neighbors[offsets[i]..offsets[i+1]]`. */
   neighbors: Uint32Array;
-  /** Per-node neighbor count; length `nodeCount`. */
+  /**
+   * Per-node row length in `neighbors` (`offsets[i+1] − offsets[i]`); length `nodeCount`. Structural: a
+   * self-link puts two entries in its node's row, so it counts twice here. For the degree METRIC (a
+   * self-link counted once, as Infomap counts it) read {@link NetworkGraph.degree}.
+   */
   degree: Uint32Array;
   /**
    * Per-entry weight parallel to `neighbors` (the weight of the edge each entry came from), present
@@ -146,9 +150,16 @@ export interface NetworkGraph {
   /** Undirected adjacency for layout/traversal. */
   csr: CSR;
   /**
-   * Per-node strength: the sum of incident edge weights (weighted degree), length `nodeCount`.
+   * Per-node degree: the number of incident edges, length `nodeCount`. A self-link counts ONCE (#535), as
+   * Infomap counts it, so a node with one self-link and one other link has degree 2. (The adjacency row
+   * length, where a self-link takes two entries, is {@link CSR.degree}.)
+   */
+  degree: Uint32Array;
+  /**
+   * Per-node strength: the sum of incident edge weights (weighted degree), length `nodeCount`. A self-link
+   * of weight w adds w ONCE (#535), as Infomap's weighted degree does (`2 · Σw − Σw_self` over the network).
    * A purely structural metric derived from the edge list — a sizing input alongside
-   * {@link CSR.degree}. (Not flow in the map-equation sense; that is {@link NetworkGraph.flow}.)
+   * {@link NetworkGraph.degree}. (Not flow in the map-equation sense; that is {@link NetworkGraph.flow}.)
    */
   strength: Float32Array;
   /**
@@ -188,13 +199,18 @@ export function buildGraph(input: BuildGraphInput): NetworkGraph {
   const positions = new Float32Array(nodeCount * 2);
   const csr = buildCSR(nodeCount, source, target);
 
-  // Weighted degree: each edge adds its weight to both endpoints (undirected, mirroring CSR.degree).
+  // Degree and weighted degree: each edge adds to both endpoints (undirected), a self-link once (#535,
+  // Infomap's convention). The CSR rows stay structural: a self-link keeps its two entries there.
+  const degree = new Uint32Array(nodeCount);
   const strength = new Float32Array(nodeCount);
   for (let e = 0; e < edgeCount; e++) {
     const w = weight[e]!;
     const s = source[e]!;
     const t = target[e]!;
+    degree[s] = (degree[s] ?? 0) + 1;
     strength[s] = strength[s]! + w;
+    if (t === s) continue;
+    degree[t] = (degree[t] ?? 0) + 1;
     strength[t] = strength[t]! + w;
   }
 
@@ -214,6 +230,7 @@ export function buildGraph(input: BuildGraphInput): NetworkGraph {
     weight,
     positions,
     csr,
+    degree,
     strength,
     flow,
     directed: input.directed ?? false,

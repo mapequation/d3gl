@@ -88,7 +88,28 @@ describe("buildGraph", () => {
 
     // unweighted strength equals degree (every edge contributes 1 to both ends).
     const plain = buildGraph({ nodeCount: 4, source: [0, 1, 1], target: [1, 2, 3] });
-    expect(Array.from(plain.strength)).toEqual(Array.from(plain.csr.degree));
+    expect(Array.from(plain.strength)).toEqual(Array.from(plain.degree));
+    expect(Array.from(plain.degree)).toEqual(Array.from(plain.csr.degree)); // equal without self-links
+  });
+
+  it("counts a self-link once in degree and strength (#535, Infomap's convention)", () => {
+    // Node 0: a self-link of weight w = 2 and a link of weight v = 3 to node 1.
+    const g = buildGraph({ nodeCount: 2, source: [0, 0], target: [0, 1], weight: [2, 3] });
+    expect(Array.from(g.degree)).toEqual([2, 1]);
+    expect(Array.from(g.strength)).toEqual([5, 3]); // w + v, not 2w + v
+    // Duplicate self-links each count once.
+    const dup = buildGraph({ nodeCount: 1, source: [0, 0], target: [0, 0], weight: [1, 4] });
+    expect(Array.from(dup.degree)).toEqual([2]);
+    expect(Array.from(dup.strength)).toEqual([5]);
+  });
+
+  it("keeps the CSR adjacency structural with a self-link: the layouts' neighbour rows are unchanged", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0, 0], target: [0, 1], weight: [2, 3] });
+    // The self-link keeps its two entries in node 0's row, exactly as buildCSR lays out any edge.
+    expect(neighborsOf(g.csr, 0)).toEqual([0, 0, 1]);
+    expect(neighborsOf(g.csr, 1)).toEqual([0]);
+    expect(Array.from(g.csr.degree)).toEqual([3, 1]); // row lengths, not the degree metric
+    expect(g.csr).toEqual(buildCSR(2, [0, 0], [0, 1]));
   });
 
   it("keeps flow null unless supplied, copies provided flow, and validates its length", () => {

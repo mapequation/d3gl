@@ -13,7 +13,7 @@ const SIZES = [10, 100, 1_000, 10_000, 100_000, 1_000_000];
 function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
   let lo = Infinity;
   let hi = 0;
-  for (const d of graph.csr.degree) {
+  for (const d of graph.degree) {
     if (d < lo) lo = d;
     if (d > hi) hi = d;
   }

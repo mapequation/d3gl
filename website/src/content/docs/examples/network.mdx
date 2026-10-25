@@ -140,12 +140,14 @@ net.style({ nodeRadius: { by: "strength", scale: scaleSqrt().range([2, 20]) } })
 - a **`number`** — one constant radius for every node (the default is 4);
 - a **function** `(degree, index, graph) => radius` — the node's degree is the first argument, so a
   bare d3 scale works; `index`/`graph` are there for anything custom;
-- **`{ by, scale }`** — feed a metric through any scale, where `by` is `"degree"` (neighbour count),
-  `"strength"` (weighted degree — summed incident edge weights), `"flow"` (an app-provided per-node
-  value, see below), or your own `(index, graph) => value` accessor;
+- **`{ by, scale }`** — feed a metric through any scale, where `by` is `"degree"` (the number of
+  incident edges), `"strength"` (weighted degree — summed incident edge weights), `"flow"` (an
+  app-provided per-node value, see below), or your own `(index, graph) => value` accessor;
 - a **`Float32Array`** of per-node radii you computed yourself.
 
-`degree` and `strength` are derived from the edge list automatically. **Flow** is a model quantity
+`degree` and `strength` are derived from the edge list automatically (`graph.degree`, `graph.strength`).
+A self-link counts **once**, as in Infomap: a node with a self-link of weight `w` and one other link of
+weight `v` has degree 2 and strength `w + v`. **Flow** is a model quantity
 (e.g. an Infomap visit rate) that d3gl does not invent — supply it as `buildGraph({ …, nodeFlow })`
 to make `{ by: "flow", scale }` available.
 
@@ -279,8 +281,11 @@ when `directed`, or `half-arrow`) and the `sizeMode`, on WebGL, Canvas and SVG a
 
 Hovering or clicking a loop reports the node's first self-link edge with the summed weight, and the
 selection and hover highlight include it. With LOD on, a drawn leaf node keeps its loop; an aggregate
-draws none. In a [state network](#state-networks-physical--state-views) the state view and the both view draw loops; the
-physical view does not.
+draws none. In a [state network](#state-networks-physical--state-views) every view draws loops: the state view and the
+both view for the state graph's self-links, and the physical view for flow that stays inside a physical node
+— the state links between state nodes of one physical node, summed into that physical node's self-link. With lumped
+state nodes, the links between the state nodes of one lump likewise sum into that lump's self-link, drawn as a loop in
+the lumped state and both views.
 
 A graph without self-links pays one scan of its edges, once per graph, and nothing per frame. With
 self-links, each frame that moves the nodes updates the loops in place, in time linear in the loops and
@@ -1012,7 +1017,8 @@ module palette a collapsed module takes its own colour from it.
 **Lumped state nodes.** The map equation codes the state nodes of one physical node in one leaf module with one
 codeword: within that module they are one node. `stateNetwork(graph, { modules, lump: true })`, or `net.lump(on)`
 at any time, draws the state and both views that way, one node per (leaf module, physical node), its flow and links
-the sums of its state nodes' (`lumpStateGraph` gives the same network on its own). Without `modules` every state
+the sums of its state nodes' (`lumpStateGraph` gives the same network on its own); links between the state nodes of
+one lump sum into its self-link, drawn as a loop. Without `modules` every state
 node is in the root module, so each physical node's state nodes are one node. The physical view is the same
 either way, and keeps its layout across the toggle. The state view keeps its picture: the other form starts where the
 current one's nodes are (each lump at its state nodes' centroid, or a lump's state nodes around it), and a warm
