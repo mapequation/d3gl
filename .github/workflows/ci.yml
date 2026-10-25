@@ -29,6 +29,9 @@ jobs:
       - name: Build
         run: pnpm -r build
 
+      - name: Typecheck (library and test files)
+        run: pnpm --filter @mapequation/d3gl typecheck && pnpm --filter @mapequation/d3gl typecheck:test
+
       - name: Node unit tests
         run: pnpm test
 

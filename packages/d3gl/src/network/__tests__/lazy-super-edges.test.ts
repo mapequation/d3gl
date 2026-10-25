@@ -86,9 +86,9 @@ function reference(tree: LODTree, g: NetworkGraph, c: LazyCut, t: LODTransform, 
   return out;
 }
 
-function asMap(ids: number[], flows: number[] | undefined): Map<number, number> {
+function asMap(ids: ArrayLike<number>, flows: ArrayLike<number> | undefined): Map<number, number> {
   const m = new Map<number, number>();
-  ids.forEach((id, i) => {
+  Array.from(ids).forEach((id, i) => {
     expect(m.has(id)).toBe(false); // each pair drawn once
     m.set(id, flows?.[i] ?? 0);
   });
@@ -163,7 +163,7 @@ describe("lazySuperEdges (#343)", () => {
     expect(ha.count).toBe(res.ids.length);
     const flow = asMap(res.ids, res.flows);
     let reciprocal = 0;
-    res.ids.forEach((id, i) => {
+    Array.from(res.ids).forEach((id, i) => {
       const a = Math.floor(id / tree.size);
       const b = id - a * tree.size;
       const back = flow.get(b * tree.size + a);
@@ -240,7 +240,7 @@ describe("lazySuperEdges (#343)", () => {
       const warm = lazySuperEdges(tree, c, { ...style, fadeAlpha: new Float32Array(tree.size).fill(1) }, visibleWorldRect(t, W, H), g.csr, inc, sc);
       const cold = lazySuperEdges(tree, c, { ...style, fadeAlpha: new Float32Array(tree.size).fill(1) }, visibleWorldRect(t, W, H), g.csr, inc);
       expect(warm.ids).toEqual(cold.ids);
-      for (const id of warm.ids) {
+      for (const id of Array.from(warm.ids)) {
         const a = Math.floor(id / tree.size);
         const b = id - a * tree.size;
         const nested = tree.leafStart![a]! < tree.leafEnd![b]! && tree.leafStart![b]! < tree.leafEnd![a]!;

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { Plot, plot } from "./plot.js";
+import type { BackendHandle } from "./backend-factory.js";
 
 /** Brute-force reference declutter: keep a glyph unless its projected anchor lands within
  *  `radius` px of an already-kept one; ties break by input order (earlier wins). */
@@ -36,7 +37,7 @@ const upgradeOf = (chart: unknown): Promise<void> | null =>
 const liveBackend = (chart: unknown): string =>
   (chart as { currentBackend: string }).currentBackend;
 // Access baseProto for spy (same approach as auto-backend.browser.test.ts).
-const baseProto = Object.getPrototypeOf(Plot.prototype) as Record<string, unknown>;
+const baseProto: { createWebGLBackend(): Promise<BackendHandle> } = Object.getPrototypeOf(Plot.prototype);
 
 describe("plot.points() lane lifecycle across backend swaps", () => {
   it("canvas→WebGL (backend:\"auto\"): points() with declutter upgrades to instanced lane after upgrade", async () => {

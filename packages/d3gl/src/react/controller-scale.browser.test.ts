@@ -40,8 +40,8 @@ describe("MapController at example scale", () => {
     const topRight = controller.readPixel(248, 8);
     const bottomLeft = controller.readPixel(8, 248);
 
-    expect(topRight[0]).toBeGreaterThan(topLeft[0] + 100); // red ramps with column
-    expect(bottomLeft[2]).toBeGreaterThan(topLeft[2] + 100); // blue ramps with row
+    expect(topRight[0]).toBeGreaterThan((topLeft[0] ?? NaN) + 100); // red ramps with column
+    expect(bottomLeft[2]).toBeGreaterThan((topLeft[2] ?? NaN) + 100); // blue ramps with row
 
     controller.destroy();
   });

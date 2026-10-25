@@ -74,6 +74,8 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "typecheck": "tsc -b",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "test:browser": "node scripts/run-browser-tests.mjs",
     "prepublishOnly": "tsdown"
   },
@@ -82,11 +84,11 @@
     "@luma.gl/engine": "^9.3.3",
     "@luma.gl/shadertools": "^9.3.3",
     "@luma.gl/webgl": "^9.3.3",
-    "earcut": "^3.0.0",
     "d3-color": "^3.1.0",
     "d3-geo": "^3.1.1",
     "d3-selection": "^3.0.0",
-    "d3-zoom": "^3.0.0"
+    "d3-zoom": "^3.0.0",
+    "earcut": "^3.0.0"
   },
   "peerDependencies": {
     "react": "^19",
@@ -110,6 +112,7 @@
     "@types/d3-zoom": "^3.0.8",
     "@types/earcut": "^2.1.4",
     "@types/geojson": "^7946.0.14",
+    "@types/node": "^22.20.5",
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "d3-scale": "^4.0.2",

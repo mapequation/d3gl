@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll, beforeAll, vi } from "vitest";
+import { describe, it, expect, afterAll, beforeAll, vi, type MockInstance } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
@@ -87,7 +87,7 @@ describe(`network.labels() per-frame cost (n=${N})`, () => {
   let net: ReturnType<typeof network>;
   let steps: ReturnType<typeof zoomSteps>;
   let atRegistration = 0;
-  let spy: ReturnType<typeof vi.spyOn<CanvasRenderingContext2D, "measureText">>;
+  let spy: MockInstance<CanvasRenderingContext2D["measureText"]>;
 
   beforeAll(async () => {
     host = perfHost(W, H);

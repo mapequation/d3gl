@@ -3,8 +3,10 @@ import { resolveRingColors, ringCircles } from "../highlight-ring.js";
 
 const center = () => [0, 0] as [number, number];
 const radius = () => 5;
-const colorAt = (data: ReturnType<typeof ringCircles>, k: number): [number, number, number, number] =>
-  [data.borderColors[k * 4]!, data.borderColors[k * 4 + 1]!, data.borderColors[k * 4 + 2]!, data.borderColors[k * 4 + 3]!];
+const colorAt = (data: ReturnType<typeof ringCircles>, k: number): [number, number, number, number] => {
+  const c = data.borderColors ?? new Uint8Array(0); // ringCircles always sets them; a missing table fails every colour check
+  return [c[k * 4]!, c[k * 4 + 1]!, c[k * 4 + 2]!, c[k * 4 + 3]!];
+};
 
 describe("ringCircles colors (#105 / #140 / #162)", () => {
   it("colors selected vs hover vs will-remove rings distinctly", () => {

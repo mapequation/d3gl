@@ -55,6 +55,6 @@ describe("blitMatrix", () => {
   });
   it("maps a pure pan", () => {
     const m = Array.from(blitMatrix({ k: 1, x: 0, y: 0 }, { k: 1, x: 10, y: 20 }, 100, 100));
-    m.forEach((v, i) => expect(v).toBeCloseTo([1, 0, 0, 0, 1, 0, 0.2, -0.4, 1][i], 6));
+    m.forEach((v, i) => expect(v).toBeCloseTo([1, 0, 0, 0, 1, 0, 0.2, -0.4, 1][i] ?? NaN, 6));
   });
 });

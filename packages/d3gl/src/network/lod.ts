@@ -457,7 +457,7 @@ export function buildSuperEdges(
   size: number,
   parent: Int32Array,
   edges: SuperEdgeInput,
-): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow" | "superEdgeInOffset" | "superEdgeInSource" | "superEdgeInFlow" | "depth"> {
+): Required<Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow" | "superEdgeInOffset" | "superEdgeInSource" | "superEdgeInFlow" | "depth">> {
   // Depth from root. Parents have higher ids than children, so a single descending pass finalises each
   // parent before its children.
   const depth = new Int32Array(size);

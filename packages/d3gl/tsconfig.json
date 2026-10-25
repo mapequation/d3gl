@@ -3,7 +3,9 @@
   "compilerOptions": {
     "jsx": "react-jsx",
     "noEmit": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    // Global (ambient) types the library may use, listed so that @types/node (tests only) never leaks into it.
+    "types": ["geojson"]
   },
   "include": ["src/**/*", "tsdown.config.ts", "package.json"],
   "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/__screenshots__/**"]

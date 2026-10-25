@@ -1,4 +1,5 @@
 import { declutterMembers, type GroupBuilder, type PathContext, type LineJoin, type LineCap } from "../core/index.js";
+import { asD3Context } from "../core/path-context.js";
 import { InstancedLane } from "../core/instanced-lane.js";
 import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions, type LaneInteractive, type DataLabelOptions } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
@@ -370,7 +371,7 @@ export class Plot extends BaseEngine {
     const widthOf = typeof lw === "function" ? lw : (_d: D, _i: number) => lw as number;
     const anchorOf = opts.anchor;
     const { lineJoin, miterLimit, lineCap } = opts;
-    // DELIBERATE third-party-boundary cast (#221): d3gl's PathContext implements exactly the
+    // Third-party-boundary widening (#221, `asD3Context`): d3gl's PathContext implements exactly the
     // path-building subset d3-shape/d3-geo generators emit, but d3's typings demand the full
     // CanvasRenderingContext2D — so the widening happens ONCE here and every user `draw`
     // accepts `d3.line()`/`geoPath(proj, ctx)`/… uncast (the d3-compatibility core value).
@@ -379,7 +380,7 @@ export class Plot extends BaseEngine {
       items.forEach((d, j) =>
         g.drawable(
           ids[j]!,
-          (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, base + j),
+          (ctx: PathContext) => opts.draw(asD3Context(ctx), d, base + j),
           lw != null || anchorOf
             ? { lineWidth: lw != null ? widthOf(d, base + j) : 0, anchor: anchorOf?.(d, base + j), lineJoin, miterLimit, lineCap }
             : undefined,

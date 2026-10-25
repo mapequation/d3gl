@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { Scene } from "../core/scene.js";
-import type { RenderDelta, RenderLayer } from "../core/index.js";
+import type { RenderLayer } from "../core/index.js";
 import { CanvasBackend } from "./canvas-backend.js";
 
 const layerOf = (scene: Scene, name: string, clipTo?: string): RenderLayer => ({
@@ -29,12 +29,12 @@ describe("CanvasBackend clip on incremental append", () => {
     // First append: a red point INSIDE land — establishes the persistent clip.
     scene.group("d1", (b) => b.point("in", 100, 100, 6));
     scene.setFill("d1", "in", "rgb(255,0,0)");
-    backend.appendToLayer({ name: "pts", buffers: scene.buffers("d1"), drawables: scene.drawables("d1") } as RenderDelta);
+    backend.appendToLayer({ name: "pts", buffers: scene.appendedBuffers("d1", 0), drawables: scene.drawables("d1") });
 
     // Second append: a red point OUTSIDE land — must reuse the clip and be clipped away.
     scene.group("d2", (b) => b.point("out", 175, 175, 6));
     scene.setFill("d2", "out", "rgb(255,0,0)");
-    backend.appendToLayer({ name: "pts", buffers: scene.buffers("d2"), drawables: scene.drawables("d2") } as RenderDelta);
+    backend.appendToLayer({ name: "pts", buffers: scene.appendedBuffers("d2", 0), drawables: scene.drawables("d2") });
 
     expect(at(100, 100)[0]!).toBeGreaterThan(180); // red point painted inside land
     expect(at(175, 175)[0]!).toBeLessThan(180); // clipped: no red outside land

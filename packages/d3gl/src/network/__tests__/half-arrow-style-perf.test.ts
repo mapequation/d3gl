@@ -90,8 +90,10 @@ describe("half-arrow style pass at roadNet-CA scale (#449, #447)", () => {
     expect(cache.kind).toBe("half-arrows");
     expect(calls).toBeLessThan(graph.edgeCount / 1000);
     // Each edge carries [its width, its reciprocal's]: 0→1 weighs 1 and 1→0 weighs 2 (widthOf = 0.4 + w).
-    if (cache.kind !== "half-arrows") return;
-    expect(Array.from(cache.halfArrows.widths.subarray(0, 4))).toEqual([Math.fround(1.4), Math.fround(2.4), Math.fround(2.4), Math.fround(1.4)]);
+    const ha = cache.kind === "half-arrows" ? cache.halfArrows : undefined;
+    expect(ha).toBeDefined();
+    if (!ha) return;
+    expect(Array.from(ha.widths.subarray(0, 4))).toEqual([Math.fround(1.4), Math.fround(2.4), Math.fround(2.4), Math.fround(1.4)]);
   });
 
   it(`builds the whole half-arrow style in under ${MS} ms`, () => {

@@ -56,11 +56,14 @@ const UPLOAD_BYTES_PER_FRAME = 1024 * 1024;
 const SETUP_MS = perfBudget(120_000 + N / 2);
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
+/** A fixture's {@link ModuleNode}: its path is a plain array, which the hover sweep slices into prefixes. */
+type FixtureModule = ModuleNode & { path: number[] };
+
 /** An `.ftree`-shaped map: modules of 2-12 children down to 16-96-leaf bottom modules. */
-function fixture(n: number): { graph: ReturnType<typeof buildGraph>; modules: ModuleNode[]; links: ModuleLink[] } {
+function fixture(n: number): { graph: ReturnType<typeof buildGraph>; modules: FixtureModule[]; links: ModuleLink[] } {
   let s = 17 >>> 0;
   const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
-  const modules: ModuleNode[] = new Array<ModuleNode>(n);
+  const modules: FixtureModule[] = new Array<FixtureModule>(n);
   const source: number[] = [];
   const target: number[] = [];
   const links: ModuleLink[] = [];

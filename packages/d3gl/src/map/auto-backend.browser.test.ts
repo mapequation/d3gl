@@ -1,12 +1,14 @@
 import { describe, it, expect, vi } from "vitest";
 import { geoEquirectangular, geoOrthographic } from "d3-geo";
 import { geoMap, GeoMap } from "./geo-map.js";
+import type { BackendHandle } from "./backend-factory.js";
 
 // BaseEngine.prototype — owns the `createWebGLBackend` seam the auto-upgrade resolves through.
 // We spy here (not on a namespace import, which ESM live-bindings don't reliably intercept in the
 // browser provider, and not on the instance, which is too late: the upgrade is kicked off
 // synchronously inside the constructor).
-const baseProto = Object.getPrototypeOf(GeoMap.prototype) as Record<string, unknown>;
+// The engine base class's prototype, typed by the one (protected) method the tests spy on.
+const baseProto: { createWebGLBackend(): Promise<BackendHandle> } = Object.getPrototypeOf(GeoMap.prototype);
 
 const proj = () => geoEquirectangular().scale(50).translate([100, 100]);
 const sqPoly = (x: number, y: number, s: number): GeoJSON.Feature => ({

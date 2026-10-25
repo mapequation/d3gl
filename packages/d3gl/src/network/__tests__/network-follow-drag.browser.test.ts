@@ -118,7 +118,9 @@ async function nestedDrag(net: Network, h: HTMLElement, g: NetworkGraph, leaf: n
   for (let attempt = 0; attempt < 20 && hit === undefined; attempt++) {
     centreOn(net, g.positions[2 * leaf]!, g.positions[2 * leaf + 1]!);
     await frames(1);
-    hit = net.pick(c, c)?.id;
+    const id = net.pick(c, c)?.id;
+    if (typeof id === "string") throw new Error(`the cursor is over ${id}, not a node`);
+    hit = id;
   }
   if (hit === undefined) throw new Error("nothing under the cursor to grab");
   const grabbed = g.positions.slice();

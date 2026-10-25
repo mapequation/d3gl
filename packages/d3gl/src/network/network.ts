@@ -5182,10 +5182,12 @@ export class Network extends BaseEngine {
     move: (mx: number, my: number) => void;
   }): NodeDragSession {
     const { sim, frame, release, done, alive } = opts;
-    const rafFn: (cb: FrameRequestCallback) => number =
+    // A frame id is rAF's number, or the timeout fallback's handle (a `Timeout` under Node), which only `clearTimeout` takes.
+    const rafFn: (cb: FrameRequestCallback) => number | ReturnType<typeof setTimeout> =
       typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
-    const cafFn: (id: number) => void = typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : (id) => clearTimeout(id);
-    let raf = 0;
+    const cafNumber: (id: number) => void = typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : (id) => clearTimeout(id);
+    const cafFn = (id: number | ReturnType<typeof setTimeout>): void => (typeof id === "number" ? cafNumber(id) : clearTimeout(id));
+    let raf: number | ReturnType<typeof setTimeout> = 0;
     let cool = -1; // -1 while held; ≥0 counts down the re-cool tail after release
     const stop = (): void => {
       if (raf) cafFn(raf);

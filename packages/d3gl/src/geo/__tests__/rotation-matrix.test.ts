@@ -43,7 +43,7 @@ describe("rotationMatrix matches geoOrthographic.rotate", () => {
         ];
         const r = applyMat3(m, dir);
         if (r[2] <= 0) continue; // back hemisphere: not shown by orthographic
-        const gpu = [r[0] * S, -r[1] * S];
+        const gpu: [number, number] = [r[0] * S, -r[1] * S];
         const proj = p([lon, lat]);
         expect(proj, `point [${lon},${lat}] should be on the front`).toBeTruthy();
         expect(Math.abs(proj![0] - gpu[0])).toBeLessThan(EPS);

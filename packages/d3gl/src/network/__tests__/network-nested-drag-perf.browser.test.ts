@@ -252,7 +252,7 @@ beforeAll(async () => {
         heldTicks.push(tick.mock.calls.length - before);
         heldRenders.push(net.renders - renders0);
         const session = nested ? tick.mock.contexts[calls0] : undefined;
-        if (session) {
+        if (session instanceof NestedDrag) {
           maxLeafWrites = Math.max(maxLeafWrites, session.stats.leafWrites - writes);
           writes = session.stats.leafWrites;
         }
@@ -271,9 +271,11 @@ beforeAll(async () => {
       for (let f = 0; f < 10; f++) flush();
       const used = spy.since(mark);
       ts.sort((a, b) => a - b);
-      const drag = nested ? tick.mock.contexts[calls0] : undefined;
+      const ctx = nested ? tick.mock.contexts[calls0] : undefined;
+      const drag = ctx instanceof NestedDrag ? ctx : undefined;
       // The leaves under the held leaf's module (the deepest re-solve): all a tick inside it may write.
-      const leavesUnder = drag ? Array.from(drag.modules[0]!.cnt).reduce((a, b) => a + b, 0) : 0;
+      const deepest = drag?.modules[0];
+      const leavesUnder = deepest ? Array.from(deepest.cnt).reduce((a, b) => a + b, 0) : 0;
       return {
         drawn: !net.countOnly,
         heldTicks,

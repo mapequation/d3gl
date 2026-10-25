@@ -266,7 +266,7 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
       // The build hands out the depth it used, which the gather reads to tell a lift pair.
       const depth = new Int32Array(size);
       for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
-      expect(Array.from(got.depth!)).toEqual(Array.from(depth));
+      expect(Array.from(got.depth)).toEqual(Array.from(depth));
       // Non-vacuity: the tree is ragged and the CSR carries pairs between different depths.
       let lift = 0;
       for (let g = 0; g < size; g++) for (let p = got.superEdgeOffset[g]!; p < got.superEdgeOffset[g + 1]!; p++) if (depth[got.superEdgeTarget[p]!] !== depth[g]) lift++;
@@ -293,7 +293,7 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
     const pairs = csrPairs(got.superEdgeOffset, got.superEdgeTarget, got.superEdgeFlow, tree.size);
     expect(new Map([...pairs].sort())).toEqual(
       new Map(
-        [
+        ([
           [`${u}:${v}`, 1], // lift: u (depth 4) → v
           [`${up(u, 1)}:${v}`, 1], // 1:3:2 (depth 3) → v — the first same-depth pair
           [`${up(u, 2)}:${up(v, 1)}`, 1], // 1:3 → 2:1
@@ -302,7 +302,7 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
           [`${v}:${up(u, 1)}`, 2],
           [`${up(v, 1)}:${up(u, 2)}`, 2],
           [`${up(v, 2)}:${up(u, 3)}`, 2],
-        ].sort(),
+        ] satisfies [string, number][]).sort(),
       ),
     );
   });
@@ -383,8 +383,9 @@ describe("buildSuperEdges — beyond V8's Map ceiling (#177)", () => {
       expect(distinctPairs).toBeGreaterThan(2 ** 24); // otherwise this leg proves nothing
 
       const t0 = performance.now();
-      const got = buildSuperEdges(size, parent, edges);
+      const raw = buildSuperEdges(size, parent, edges);
       const ms = performance.now() - t0;
+      const got = raw;
       // eslint-disable-next-line no-console
       console.log(`[super-edges-build] ${distinctPairs} distinct pairs in ${ms.toFixed(0)}ms`);
 

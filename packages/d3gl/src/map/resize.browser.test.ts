@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { Polygon } from "geojson";
+import type { Feature, Polygon } from "geojson";
 import { geoMercator } from "d3-geo";
 import { plot } from "./plot.js";
 import { geoMap } from "./geo-map.js";
@@ -21,9 +21,9 @@ function engineWidth(svg: string): number {
 }
 
 /** A couple of small clockwise-wound cells, away from the antimeridian/poles. */
-const cells: { id: string; geometry: Polygon }[] = [
-  { id: "a", geometry: { type: "Polygon", coordinates: [[[-40, -20], [-40, 20], [0, 20], [0, -20], [-40, -20]]] } },
-  { id: "b", geometry: { type: "Polygon", coordinates: [[[10, -10], [10, 30], [50, 30], [50, -10], [10, -10]]] } },
+const cells: Feature<Polygon>[] = [
+  { type: "Feature", id: "a", properties: {}, geometry: { type: "Polygon", coordinates: [[[-40, -20], [-40, 20], [0, 20], [0, -20], [-40, -20]]] } },
+  { type: "Feature", id: "b", properties: {}, geometry: { type: "Polygon", coordinates: [[[10, -10], [10, 30], [50, 30], [50, -10], [10, -10]]] } },
 ];
 
 describe("in-place resize", () => {

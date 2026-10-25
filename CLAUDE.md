@@ -91,7 +91,8 @@ docs' code tabs. Put data generation, fixtures and math in a co-located `<exampl
 ## Build and test
 
 - Typecheck per package; the root `pnpm typecheck` is broken (no root `tsconfig.json`):
-  `pnpm --filter @mapequation/d3gl exec tsc -b` and `pnpm --filter @d3gl/website exec astro check`.
+  `pnpm --filter @mapequation/d3gl exec tsc -b` and `pnpm --filter @d3gl/website exec astro check`. `tsc -b` skips the
+  test files; `pnpm --filter @mapequation/d3gl typecheck:test` checks them (CI runs both).
 - Import specifiers use `.js` although the sources are `.ts` (NodeNext ESM). Don't change them to `.ts`.
 - Node tests: `pnpm test`. Browser tests (`*.browser.test.ts`, headless Chromium):
   `pnpm --filter @mapequation/d3gl test:browser [package-relative path]`. Both are part of TDD. CI runs

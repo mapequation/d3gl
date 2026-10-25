@@ -111,12 +111,12 @@ const SETUP_MS = perfBudget(120_000 + N / 2);
 const FRAME_MS_OFF = perfBudget(4 + (4 * N) / 50_000);
 const FRAME_MS_ON = perfBudget(400 + (100 * N) / 50_000);
 
-/** Exposes the view and the streamed-frame trigger to the test, without reaching into privates. */
+/** Exposes the view (as `camera`: `view()` is the state/physical toggle) and the streamed-frame trigger to the test, without reaching into privates. */
 class FitProbe extends Network {
   constructor(host: HTMLElement, opts: NetworkOptions) {
     super(host, opts);
   }
-  get view(): ViewTransform {
+  get camera(): ViewTransform {
     return { ...this.transform };
   }
   /** A worker message's repaint request — what the transport calls after copying the positions. */
@@ -266,19 +266,19 @@ beforeAll(async () => {
       const ks = new Set<number>();
       for (let i = 1; i <= FRAMES; i++) {
         streamFrame(i % 2 ? b : a);
-        ks.add(net.view.k);
+        ks.add(net.camera.k);
       }
       const reframeBoxCalls = box.calls - beforeReframe;
       // Take the view over mid-stream with a zoom sweep, as a zoom-to or a saved camera would.
       const beforeSweep = box.calls;
       for (const t of zoomSteps(W, H)) net.setTransform(t);
       const sweepBoxCalls = box.calls - beforeSweep;
-      const held = net.view;
+      const held = net.camera;
       const beforeAfter = box.calls;
       let afterReleaseMoved = false;
       for (let i = 1; i <= AFTER_RELEASE; i++) {
         streamFrame(i % 2 ? b : a);
-        const v = net.view;
+        const v = net.camera;
         if (v.k !== held.k || v.x !== held.x || v.y !== held.y) afterReleaseMoved = true;
       }
       const afterReleaseBoxCalls = box.calls - beforeAfter;

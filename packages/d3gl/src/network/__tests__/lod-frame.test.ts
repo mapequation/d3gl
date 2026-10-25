@@ -37,7 +37,12 @@ describe("lodFrameStep (#343): the one per-frame LOD step", () => {
     expect(got.size).toBe(want.size);
     expect(got.leafBranching).toBe(want.leafBranching);
     for (const k of ["levelOffset", "childOffset", "children", "parent", "leafOrder", "leafStart", "leafEnd", "cx", "cy", "extent", "count", "radius", "weight", "color"] as const) {
-      expect(Array.from(got[k]), k).toEqual(Array.from(want[k]));
+      const a = got[k];
+      const b = want[k];
+      expect(a, k).toBeDefined();
+      expect(b, k).toBeDefined();
+      if (!a || !b) continue;
+      expect(Array.from(a), k).toEqual(Array.from(b));
     }
     expect(Array.from(got.morton!.code)).toEqual(Array.from(want.morton!.code));
     expect(got.morton!.box).toEqual(want.morton!.box);

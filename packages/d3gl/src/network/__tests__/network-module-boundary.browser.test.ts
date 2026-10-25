@@ -230,15 +230,16 @@ describe("module boundaries export identically from WebGL and Canvas (#329, #271
   });
 });
 
-interface ExportedCircle { fill: number[]; stroke: number[]; strokeWidth: number; r: number }
+type RGBA = [number, number, number, number];
+interface ExportedCircle { fill: RGBA; stroke: RGBA; strokeWidth: number; r: number }
 
 /** Every exported `<circle>` — fill and stroke as `[r, g, b, a]` (a 0-1; none ⇒ a 0), its stroke width and
  *  radius — in document order. */
 function exportedCircles(svg: string): ExportedCircle[] {
   const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
-  const rgba = (s: string | null): number[] => {
-    const v = (s?.match(/[\d.]+/g) ?? []).map(Number);
-    return v.length >= 3 ? [v[0]!, v[1]!, v[2]!, v[3] ?? 1] : [0, 0, 0, 0];
+  const rgba = (s: string | null): RGBA => {
+    const [r, g, b, a = 1] = (s?.match(/[\d.]+/g) ?? []).map(Number);
+    return r !== undefined && g !== undefined && b !== undefined ? [r, g, b, a] : [0, 0, 0, 0];
   };
   return Array.from(doc.querySelectorAll("circle"), (c) => ({
     fill: rgba(c.getAttribute("fill")),

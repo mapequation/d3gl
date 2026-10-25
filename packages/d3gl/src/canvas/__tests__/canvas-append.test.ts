@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { Scene } from "../../core/scene.js";
-import type { RenderDelta, RenderLayer } from "../../core/index.js";
+import type { RenderLayer } from "../../core/index.js";
 
 // CanvasBackend builds clip silhouettes with `new Path2D()`, which doesn't exist in
 // Node. A minimal stand-in lets us drive the backend with a mock 2D context and
@@ -65,7 +65,7 @@ describe("CanvasBackend append cost (clip-once, O(new))", () => {
       scene.group(`d${s}`, (b) => {
         for (let i = 0; i < PER; i++) b.point(`p${s}_${i}`, 10 + i, 10, 2);
       });
-      backend.appendToLayer({ name: "pts", buffers: scene.buffers(`d${s}`), drawables: scene.drawables(`d${s}`) } as RenderDelta);
+      backend.appendToLayer({ name: "pts", buffers: scene.appendedBuffers(`d${s}`, 0), drawables: scene.drawables(`d${s}`) });
     }
 
     // The whole point: the clip is established ONCE (transform never changed), not per batch.
@@ -87,7 +87,7 @@ describe("CanvasBackend append cost (clip-once, O(new))", () => {
 
     const append = (s: string) => {
       scene.group(s, (b) => b.point(s, 10, 10, 2));
-      backend.appendToLayer({ name: "pts", buffers: scene.buffers(s), drawables: scene.drawables(s) } as RenderDelta);
+      backend.appendToLayer({ name: "pts", buffers: scene.appendedBuffers(s, 0), drawables: scene.drawables(s) });
     };
     append("a");            // clip #1
     append("b");            // reuse

@@ -71,7 +71,7 @@ describe("buildModuleTopologyOffThread (#428)", () => {
     expect(buildModuleTopologyOffThread(8, () => ({ records, links }), g)).not.toBeNull();
     const [post] = FakeWorker.last?.posted ?? [];
     expect(post?.message).toMatchObject({ type: "build-module-tree", nodeCount: 8, source: g.source, target: g.target, weight: g.weight });
-    const transfer = new Set(post?.transfer);
+    const transfer = new Set<ArrayBufferLike>(post?.transfer);
     for (const view of [records.id, records.offset, records.entries, links.sourceOffset, links.source, links.targetOffset, links.target, links.flow]) {
       expect(transfer.has(view.buffer)).toBe(true);
     }
