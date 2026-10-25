@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
-import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
+import { perfBudget, perfN, perfRealGpu, softwareRenderer } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost, sweepFrames, zoomSteps } from "../../__tests__/engine-sweep.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import type { InstancedLayer } from "../../core/index.js";
@@ -43,7 +43,7 @@ import type { InstancedLayer } from "../../core/index.js";
  *      column (widths, colours, group/selected flags) goes out as the SAME array as the frame before,
  *      so the GPU layers' identity skip drops its upload — the bytes moved equal exactly the columns
  *      that are always written (link endpoints; node centres, radii, colours). Held for each link
- *      primitive the LOD lane emits: lines, directed lines with arrowheads, and half-arrows.
+ *      primitive the LOD lane emits: lines, whole arrows (directed lines), and half-arrows.
  *   5. **The declutter's cost signature through the real trigger** — `net.declutterStats` after every
  *      `setTransform`: distance tests and grid cells per frontier glyph stay O(1), and the reused grid
  *      scratch stays within ~2 cells per frontier glyph. Asserted on the LOD sweep above and on a dense
@@ -139,11 +139,12 @@ class LayerSpy {
   }
 }
 
-/** Instances in a frame's link layers (half-arrows / lines) — the super-edges drawn. */
+/** Instances in a frame's link layers (half-arrows / lines / arrows) — the super-edges drawn. */
 function drawnLinks(layers: readonly InstancedLayer[]): number {
   let n = 0;
   for (const l of layers) {
     if (l.primitive === "lines") n += l.lines.count;
+    else if (l.primitive === "arrows") n += l.arrows.count;
     else if (l.primitive === "half-arrows") n += l.halfArrows.count;
   }
   return n;
@@ -167,13 +168,13 @@ function faintRings(frames: readonly (readonly InstancedLayer[])[]): number {
   return n;
 }
 
-/** Instances in the gathered layers alone (`links` / `arrows`): the links that touch an aggregate (#447). */
+/** Instances in the gathered `links` layer alone: the links that touch an aggregate (#447). */
 function gatheredLinks(layers: readonly InstancedLayer[]): number {
   let n = 0;
   for (const l of layers) {
     if (l.primitive === "lines" && l.name === "links") n += l.lines.count;
+    else if (l.primitive === "arrows" && l.name === "links") n += l.arrows.count;
     else if (l.primitive === "half-arrows" && l.name === "links") n += l.halfArrows.count;
-    else if (l.primitive === "arrows" && l.name === "arrows") n += l.arrows.count;
   }
   return n;
 }
@@ -207,6 +208,14 @@ function styleColumns(layers: readonly InstancedLayer[]): Map<string, ArrayBuffe
       put("lines.groups", l.lines.groups);
       put("lines.groups2", l.lines.groups2);
       put("lines.selected", l.lines.selected);
+    } else if (l.primitive === "arrows") {
+      put("arrows.widths", l.arrows.widths);
+      put("arrows.colors", l.arrows.colors);
+      put("arrows.bends", l.arrows.bends);
+      put("arrows.radii", l.arrows.radii);
+      put("arrows.groups", l.arrows.groups);
+      put("arrows.groups2", l.arrows.groups2);
+      put("arrows.selected", l.arrows.selected);
     } else if (l.primitive === "half-arrows") {
       put("half-arrows.radii", l.halfArrows.radii);
       put("half-arrows.widths", l.halfArrows.widths);
@@ -215,14 +224,6 @@ function styleColumns(layers: readonly InstancedLayer[]): Map<string, ArrayBuffe
       put("half-arrows.groups", l.halfArrows.groups);
       put("half-arrows.groups2", l.halfArrows.groups2);
       put("half-arrows.selected", l.halfArrows.selected);
-    } else if (l.primitive === "arrows") {
-      put("arrows.radii", l.arrows.radii);
-      put("arrows.sizes", l.arrows.sizes);
-      put("arrows.colors", l.arrows.colors);
-      put("arrows.bends", l.arrows.bends);
-      put("arrows.groups", l.arrows.groups);
-      put("arrows.groups2", l.arrows.groups2);
-      put("arrows.selected", l.arrows.selected);
     } else if (l.primitive === "circles" && l.name === "nodes") {
       put("nodes.groups", l.circles.groups);
       put("nodes.selected", l.circles.selected);
@@ -430,8 +431,9 @@ beforeAll(async () => {
       return { frames: HOLD, uploadedBytes: holdBytes, alwaysWrittenBytes: floor, freshColumns: fresh, checkedColumns: checked, linkStrokeCalls: linkStrokeCalls - holdStroke, primitives: [...primitives].sort() };
     };
     lodHold = runHold(); // undirected lines
-    // The same engine restyled (a second engine would stall whenReady, #287): directed lines add the
-    // arrowhead layer, and half-arrows replace the lines — the Network Navigator's default link style.
+    // The same engine restyled (a second engine would stall whenReady, #287): directed lines draw each link as ONE
+    // arrow, its head part of the line lane's strip (#542), and half-arrows replace the lines — the Network
+    // Navigator's default link style.
     net.style({ directed: true });
     lodHoldArrows = runHold();
     net.style({ linkStyle: "half-arrow" });
@@ -462,8 +464,8 @@ beforeAll(async () => {
     lodSpatialHold = runHold();
     // A view that gathers no link, same engine: pan off the graph and back. The gathered link layers hold only the
     // links that touch an aggregate (#447), so they empty there, and must keep their GPU buffers through it rather
-    // than be dropped and rebuilt on the next frame that gathers one. Directed lines draw lines + arrowheads,
-    // half-arrows the third primitive; each restyle is a registration event, settled before the leg.
+    // than be dropped and rebuilt on the next frame that gathers one. Directed lines draw whole arrows (one
+    // layer, #542), half-arrows the third primitive; each restyle is a registration event, settled before the leg.
     const away = { ...held, x: held.x - 100 * W };
     const pan = [held, away, held, away, held];
     for (const [name, restyle] of [
@@ -625,7 +627,7 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
 
   const holdLegs = (): [string, HoldLeg, string[]][] => [
     ["lines", lodHold, ["lines"]],
-    ["directed lines + arrowheads", lodHoldArrows, ["arrows", "lines"]],
+    ["directed lines (whole arrows, #542)", lodHoldArrows, ["arrows"]],
     ["half-arrows", lodHoldHalfArrows, ["half-arrows"]],
   ];
 
@@ -730,4 +732,173 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
       `LOD off, ${SELECTED.length.toLocaleString()} nodes selected: worst frame ${lodOffSelected.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`,
     ).toBeLessThan(FRAME_MS_STATIC);
   });
+});
+
+// ---- directed-link GPU draw cost (#542, PR #552 audit S1) ----------------------------------------------------
+//
+// Hardware GPU only: run it by hand with
+//   PERF_REAL_GPU=1 pnpm --filter @mapequation/d3gl test:browser src/network/__tests__/network-sweep-perf.browser.test.ts -t "directed-link lane"
+// CI and the default tiers leave `PERF_REAL_GPU` unset, so the case is skipped there: SwiftShader has no
+// usable GPU timer, and a 1M-link draw under software GL would take the tier's whole file budget. The `-t`
+// filter skips the file's beforeAll legs above (a vitest suite whose tests are all filtered out runs no hooks); the
+// case builds its own engine, so an unfiltered real-GPU run of the file also pays the second-engine stall (#287).
+//
+// A directed link draws as ONE instanced draw (shaft + head, 51 vertices per instance) where an undirected link
+// draws 48. The guard times each link-lane draw on the GPU (EXT_disjoint_timer_query_webgl2), LOD off at 1M links,
+// and asserts directed / undirected per lane. A ratio of GPU timer results on the same viewport, width and view is
+// robust to CPU load; frame wall time is not.
+const ARROW_LINKS = 1_000_000;
+const ARROW_COLS = 1000;
+const ARROW_W = 1600;
+const ARROW_H = 1200;
+const ARROW_FRAMES = 60;
+const ARROW_WARMUP = 15;
+// Directed / undirected lane GPU ms per frame, measured on an Apple M1 Max (ANGLE Metal, headless), 1600×1200, LOD
+// off, fit view, three runs at load average 17-20: width 1 1.12-1.15×, width 4 1.21× (≈77 vs 68 ms and ≈87 vs 72 ms);
+// a 100-frame headed run measured 1.09× and 1.25×. The ceiling is 1.2× over the worst of those (1.25), and a second
+// full-lane draw (≈2×) trips it. A ratio of GPU times is not machine speed, so it never goes through `perfBudget`.
+const ARROW_GPU_RATIO_MAX = 1.5;
+const TIME_ELAPSED_EXT = 0x88bf; // EXT_disjoint_timer_query_webgl2 (untyped in lib.dom)
+const GPU_DISJOINT_EXT = 0x8fbb;
+
+type LinkLane = "arrows" | "lines";
+type DrawArraysInstanced = WebGL2RenderingContext["drawArraysInstanced"];
+type DrawElementsInstanced = WebGL2RenderingContext["drawElementsInstanced"];
+
+/** Wraps every instanced draw of a link lane in a GPU timer query, per frame; the lane is told by its program. */
+class LinkDrawTimer {
+  frame = -1;
+  private readonly recs: { gl: WebGL2RenderingContext; q: WebGLQuery; lane: LinkLane; frame: number; instances: number }[] = [];
+  private readonly lanes = new Map<WebGLProgram, LinkLane | null>();
+  private readonly origArrays: DrawArraysInstanced;
+  private readonly origElements: DrawElementsInstanced;
+
+  constructor() {
+    const proto = WebGL2RenderingContext.prototype;
+    this.origArrays = proto.drawArraysInstanced;
+    this.origElements = proto.drawElementsInstanced;
+    const timer = this;
+    proto.drawArraysInstanced = function (this: WebGL2RenderingContext, mode, first, count, instances) {
+      timer.timed(this, instances, () => timer.origArrays.call(this, mode, first, count, instances));
+    };
+    proto.drawElementsInstanced = function (this: WebGL2RenderingContext, mode, count, type, offset, instances) {
+      timer.timed(this, instances, () => timer.origElements.call(this, mode, count, type, offset, instances));
+    };
+  }
+
+  restore(): void {
+    WebGL2RenderingContext.prototype.drawArraysInstanced = this.origArrays;
+    WebGL2RenderingContext.prototype.drawElementsInstanced = this.origElements;
+  }
+
+  private laneOf(gl: WebGL2RenderingContext): LinkLane | null {
+    const program: unknown = gl.getParameter(gl.CURRENT_PROGRAM);
+    if (!(program instanceof WebGLProgram)) return null;
+    const known = this.lanes.get(program);
+    if (known !== undefined) return known;
+    const vs = (gl.getAttachedShaders(program) ?? []).map((s) => gl.getShaderSource(s) ?? "").find((s) => s.includes("gl_Position")) ?? "";
+    // The head-line program (directed lines, #542) declares `u_arrowSize`; the plain line program bends by `a_bend`.
+    const lane: LinkLane | null = vs.includes("u_arrowSize") ? "arrows" : vs.includes("a_bend") && !vs.includes("u_loop") ? "lines" : null;
+    this.lanes.set(program, lane);
+    return lane;
+  }
+
+  private timed(gl: WebGL2RenderingContext, instances: number, draw: () => void): void {
+    const lane = this.frame < 0 ? null : this.laneOf(gl);
+    const q = lane ? gl.createQuery() : null;
+    if (!lane || !q) return draw();
+    gl.beginQuery(TIME_ELAPSED_EXT, q);
+    draw();
+    gl.endQuery(TIME_ELAPSED_EXT);
+    this.recs.push({ gl, q, lane, frame: this.frame, instances });
+  }
+
+  /** Waits for every query; the median per-frame GPU ms of one lane, and the most instances one draw drew. */
+  async collect(lane: LinkLane): Promise<{ medianMs: number; frames: number; instances: number; disjoint: boolean }> {
+    const last = this.recs[this.recs.length - 1];
+    for (let tries = 0; last && tries < 4000 && !last.gl.getQueryParameter(last.q, last.gl.QUERY_RESULT_AVAILABLE); tries++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const disjoint = last ? Boolean(last.gl.getParameter(GPU_DISJOINT_EXT)) : false;
+    const perFrame = new Map<number, number>();
+    let instances = 0;
+    for (const r of this.recs) {
+      const ns = Number(r.gl.getQueryParameter(r.q, r.gl.QUERY_RESULT));
+      r.gl.deleteQuery(r.q);
+      if (r.lane !== lane) continue;
+      perFrame.set(r.frame, (perFrame.get(r.frame) ?? 0) + ns / 1e6);
+      instances = Math.max(instances, r.instances);
+    }
+    this.recs.length = 0;
+    const ms = [...perFrame.values()].sort((a, b) => a - b);
+    return { medianMs: ms[Math.floor(ms.length / 2)] ?? Number.NaN, frames: ms.length, instances, disjoint };
+  }
+}
+
+/** ARROW_LINKS links on a grid, each to its left (or upper) neighbour: every link is 8 units long. */
+function arrowFixture(): { graph: ReturnType<typeof buildGraph>; positions: Float32Array } {
+  const n = ARROW_LINKS + 1;
+  const positions = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    positions[i * 2] = (i % ARROW_COLS) * 8;
+    positions[i * 2 + 1] = Math.floor(i / ARROW_COLS) * 8;
+  }
+  const source = new Int32Array(ARROW_LINKS);
+  const target = new Int32Array(ARROW_LINKS);
+  for (let i = 1; i < n; i++) {
+    source[i - 1] = i;
+    target[i - 1] = i % ARROW_COLS ? i - 1 : i - ARROW_COLS;
+  }
+  return { graph: buildGraph({ nodeCount: n, source, target, directed: true }), positions };
+}
+
+const nextFrame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
+
+describe("directed-link lane GPU cost, LOD off at 1M links (#542, hardware GPU only)", () => {
+  it.skipIf(!perfRealGpu)(
+    "the directed-link lane's GPU time stays within a budget of the undirected lane's",
+    async () => {
+      expect(softwareRenderer(), "PERF_REAL_GPU is set, but WebGL renders in software").toBe(false);
+      const timer = new LinkDrawTimer();
+      const host = perfHost(ARROW_W, ARROW_H);
+      const net = network(host, { width: ARROW_W, height: ARROW_H, backend: "webgl" });
+      try {
+        await net.whenReady();
+        const { graph, positions } = arrowFixture();
+        net.data(graph).layout({ backend: "positions", positions });
+        const k = (Math.min(ARROW_W, ARROW_H) / (ARROW_COLS * 8)) * 0.95;
+        const fit = { k, x: ARROW_W / 2 - 4000 * k, y: ARROW_H / 2 - 4000 * k };
+        for (const linkWidth of [1, 4]) {
+          const ms: Record<LinkLane, number> = { arrows: Number.NaN, lines: Number.NaN };
+          for (const [lane, directed] of [["arrows", true], ["lines", false]] as const) {
+            net.style({ directed, linkStyle: "line", linkBend: 0.25, sizeMode: "screen", nodeRadius: 2, nodeFill: "#1f77b4", linkWidth, arrowSize: 4, linkStroke: "#555" });
+            // A sub-pixel jitter makes every frame a real redraw without changing what is drawn.
+            for (let f = 0; f < ARROW_WARMUP; f++) {
+              net.setTransform({ ...fit, x: fit.x + (f % 2) * 0.01 });
+              await nextFrame();
+            }
+            for (let f = 0; f < ARROW_FRAMES; f++) {
+              timer.frame = f;
+              net.setTransform({ ...fit, x: fit.x + (f % 2) * 0.01 });
+              await nextFrame();
+            }
+            timer.frame = -1;
+            const r = await timer.collect(lane);
+            expect(r.disjoint, "the GPU timer reported a disjoint event; re-run on an idle machine").toBe(false);
+            expect(r.frames, `${lane}: no timed frame drew the lane`).toBeGreaterThan(ARROW_FRAMES / 2);
+            expect(r.instances, `${lane}: LOD off must draw every link in one lane`).toBe(ARROW_LINKS);
+            ms[lane] = r.medianMs;
+          }
+          const ratio = ms.arrows / ms.lines;
+          console.log(`ARROW_GPU w${linkWidth}: directed ${ms.arrows.toFixed(1)} ms vs undirected ${ms.lines.toFixed(1)} ms = ${ratio.toFixed(3)}x`);
+          expect(ratio, `width ${linkWidth}: directed ${ms.arrows.toFixed(1)} ms vs undirected ${ms.lines.toFixed(1)} ms GPU per frame`).toBeLessThan(ARROW_GPU_RATIO_MAX);
+        }
+      } finally {
+        timer.restore();
+        net.destroy();
+        host.remove();
+      }
+    },
+    300_000,
+  );
 });

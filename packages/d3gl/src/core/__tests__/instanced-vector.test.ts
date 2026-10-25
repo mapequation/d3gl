@@ -88,24 +88,42 @@ describe("instancedVectorLayers (#200)", () => {
     expect(bent?.drawables[1]?.subpaths[0]?.points).toEqual([0, 0, 10, 0]); // bend 0 stays straight
   });
 
-  it("arrows: a filled triangle set back to the target boundary, baked in screen sizeMode", () => {
+  it("arrows (#542): ONE filled outline per whole arrow, shaft to the head's base then barb, tip, barb", () => {
     const arrows = {
       sources: Float32Array.from([0, 0]),
       targets: Float32Array.from([100, 0]),
-      radii: Float32Array.from([10]), // node radius: the tip stops here
-      sizes: Float32Array.from([4]),
-      colors: Uint8Array.from([0, 0, 0, 255]),
+      widths: Float32Array.from([4]),
+      colors: Uint8Array.from([0, 0, 0, 128]),
+      radii: Float32Array.from([10]),
+      arrowSize: 5, // head length 10; half-width 4/2 + 2·√4 = 6
       count: 1,
     };
-    const world = instancedVectorLayers([{ name: "arrows", primitive: "arrows", arrows }], 3)[0];
+    const close = (got: readonly number[] | undefined, want: number[]): void => {
+      expect(got?.length).toBeGreaterThanOrEqual(want.length);
+      want.forEach((v, i) => expect(got?.[i] ?? NaN).toBeCloseTo(v, 5));
+    };
+    const world = instancedVectorLayers([{ name: "links", primitive: "arrows", arrows }], 3)[0];
+    const d = world?.drawables[0];
     expect(world?.sizeMode).toBeUndefined();
-    expect(world?.drawables[0]?.subpaths[0]?.points.slice(0, 2)).toEqual([90, 0]); // tip = target − radius
+    expect(d?.fill).toEqual([0, 0, 0, 128]);
+    expect(d?.lineWidth ?? 0).toBe(0); // filled, not stroked: a translucent arrow blends once
+    expect(d?.subpaths).toHaveLength(1);
+    // shaft left edge (0,2)→(80,2) ends ON the base, inside the barb; left barb, tip = target − radius, right barb, back.
+    close(d?.subpaths[0]?.points, [0, 2, 80, 2, 80, 6, 90, 0, 80, -6, 80, -2, 0, -2]);
 
-    // Screen sizeMode: the constant-px setback/size are solved at k and emitted ÷k as world coords,
-    // so the view's ×k transform reproduces the GPU's constant-pixel head.
-    const screen = instancedVectorLayers([{ name: "arrows", primitive: "arrows", sizeMode: "screen", arrows }], 3)[0];
+    // Screen sizeMode: solved in px at k = 2 and emitted ÷k as world coordinates.
+    const screen = instancedVectorLayers([{ name: "links", primitive: "arrows", sizeMode: "screen", arrows }], 2)[0];
     expect(screen?.sizeMode).toBe("world");
-    expect(screen?.drawables[0]?.subpaths[0]?.points[0]).toBeCloseTo(100 - 10 / 3, 5);
+    close(screen?.drawables[0]?.subpaths[0]?.points, [0, 1, 90, 1, 90, 3, 95, 0, 90, -3, 90, -1, 0, -1]);
+
+    // Bent: still one outline whose tip sits `radius` from the target along the curve's end tangent. Each edge is ONE
+    // cubic the recorder flattens by its tolerance, so the point count follows the curve, not the lane's `samples`.
+    const bent = instancedVectorLayers([{ name: "links", primitive: "arrows", arrows: { ...arrows, bends: Float32Array.from([0.2]), samples: 8 } }], 1)[0];
+    const pts = bent?.drawables[0]?.subpaths[0]?.points ?? [];
+    expect(pts.length).toBeGreaterThan(2 * 7); // more than the straight outline's 7 points
+    let nearest = Infinity;
+    for (let i = 0; i < pts.length; i += 2) nearest = Math.min(nearest, Math.hypot((pts[i] ?? 0) - 100, pts[i + 1] ?? 0));
+    expect(nearest).toBeCloseTo(10, 5);
   });
 
   it("pie: a filled arc sector per wedge, anchored in screen sizeMode", () => {
@@ -152,5 +170,27 @@ describe("instancedVectorLayers (#200)", () => {
       1,
     );
     expect(out.map((l) => l.name)).toEqual(["links", "nodes"]);
+  });
+
+  it("loops: a degenerate loop (its two ends at one point) is skipped for every head, as the headed ones are (#542)", () => {
+    for (const head of ["none", "arrow", "half"] as const) {
+      const layer: InstancedLayer = {
+        name: "self-loops",
+        primitive: "loops",
+        loops: {
+          head,
+          arrowSize: 4,
+          // Loop 0 leaves and returns at the same rim point (a zero-radius node): nothing to trace. Loop 1 is a real loop.
+          centers: Float32Array.from([0, 0, 50, 50]),
+          startOffsets: Float32Array.from([0, 0, 6, 0]),
+          endOffsets: Float32Array.from([0, 0, 0, 6]),
+          widths: Float32Array.from([2, 2]),
+          colors: Uint8Array.from([1, 2, 3, 255, 4, 5, 6, 255]),
+          count: 2,
+        },
+      };
+      const [out] = instancedVectorLayers([layer], 1);
+      expect(out?.drawables.map((d) => d.subpaths.length > 0), head).toEqual([true]);
+    }
   });
 });

@@ -8,8 +8,8 @@
  * as that lane growing ({@link attributeCreates}).
  */
 import { expect } from "vitest";
-import { InstancedArrows, InstancedCircles, InstancedHalfArrows, InstancedLines, InstancedPie } from "../../../webgl/instanced.js";
-import { IndexedArrows, IndexedHalfArrows, IndexedLines } from "../../../webgl/indexed-links.js";
+import { InstancedCircles, InstancedHalfArrows, InstancedLines, InstancedLoops, InstancedPie } from "../../../webgl/instanced.js";
+import { IndexedHalfArrows, IndexedLines } from "../../../webgl/indexed-links.js";
 
 /** A GPU object created (`createBuffer` / `createTexture` / `createFramebuffer`). */
 export interface CreateEvent {
@@ -43,10 +43,9 @@ export function wrapLaneUpdates(log: { push(e: LaneEvent): unknown }): () => voi
   wrap(InstancedCircles.prototype);
   wrap(InstancedPie.prototype);
   wrap(InstancedLines.prototype);
-  wrap(InstancedArrows.prototype);
   wrap(InstancedHalfArrows.prototype);
+  wrap(InstancedLoops.prototype);
   wrap(IndexedLines.prototype);
-  wrap(IndexedArrows.prototype);
   wrap(IndexedHalfArrows.prototype);
   return () => {
     for (const r of restores) r();

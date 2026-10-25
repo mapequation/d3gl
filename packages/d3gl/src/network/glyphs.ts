@@ -5,8 +5,10 @@ import { reciprocalEdges, type NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
 import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
-import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
+import { traceArrowOutline } from "../core/arrowhead.js";
+import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, chordBend } from "../core/half-link.js";
 import { PairIndex } from "./pair-index.js";
+import { selfLoopCache, selfLoopLayers, updateSelfLoops, type SelfLoopCache } from "./self-loops.js";
 
 // Re-exported so the network's link-curve math keeps one import site for consumers/tests, even
 // though the formulas themselves now live in core (shared with the export-only vector view, #200).
@@ -2118,24 +2120,23 @@ export function superEdgeBatches(
     return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids, flows };
   }
 
-  // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
-  // boundary along the bent end-tangent. Same colour as the line.
+  // Line style: bent/straight lines ∝ flow; a directed one carries its arrowhead in the same instance (#542).
   const widths = new Float32Array(count);
   for (let e = 0; e < count; e++) widths[e] = style.widthOf(wS[e]!);
   const bends = new Float32Array(count).fill(style.bend);
-  const lines: InstancedLinesData = style.bend
+  const lines: LineBatch = style.bend
     ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
     : { sources, targets, widths, colors, count };
   if (!style.directed) return { lines, ids, flows };
 
-  // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
-  // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
-  // one-sided **half** head only for bent links (so reciprocal heads don't collide); straight links
-  // get the symmetric triangle — matching the non-LOD path (`half: bend !== 0`).
-  const aRadii = new Float32Array(count);
-  for (let e = 0; e < count; e++) putEndRadius(aRadii, e, e, bS[e]!);
-  const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
-  return { lines, arrows, ids, flows };
+  // The head orients + sets back in-shader (so screen sizeMode is honoured): the target centre (already in
+  // `targets`) plus its draw radius; the tip sits on the node boundary, a full head on the link's own end
+  // tangent — the shape the non-LOD path draws ({@link arrowOutline}).
+  const radii = new Float32Array(count);
+  for (let e = 0; e < count; e++) putEndRadius(radii, e, e, bS[e] ?? 0);
+  lines.radii = radii;
+  lines.arrowSize = style.arrowSize;
+  return { lines, ids, flows };
 }
 
 /** Reused working storage for {@link withLeafLinks}: a stamp per leaf and the frame's leaf-link edge list. */
@@ -2359,45 +2360,52 @@ export function withLeafLinks(
   const gl = gathered.lines;
   const { sources, targets } = ends(gl?.sources, gl?.targets);
   const lineColors = colorsOf(ln.colors, gl?.colors);
-  const lines: InstancedLinesData = { sources, targets, widths: column(ln.widths, gl?.widths, 1), colors: lineColors, count };
+  const lines: LineBatch = { sources, targets, widths: column(ln.widths, gl?.widths, 1), colors: lineColors, count };
   if (ln.bends) {
     lines.bends = column(ln.bends, gl?.bends, 1);
     lines.samples = ln.samples;
   }
-  const ar = cache.arrows;
-  if (!ar) return { lines, ids, flows, leafEdges };
-  const ga = gathered.arrows;
-  const arrows: InstancedArrowsData = {
-    sources,
-    targets,
-    radii: column(ar.radii, ga?.radii, 1),
-    sizes: column(ar.sizes, ga?.sizes, 1),
-    colors: lineColors,
-    count,
-  };
-  if (ar.bends) {
-    arrows.bends = column(ar.bends, ga?.bends, 1);
-    arrows.half = ar.half;
+  // A directed line carries its head (#542): the target radii gathered by edge, then the gathered pairs'.
+  if (ln.radii && ln.arrowSize !== undefined) {
+    lines.radii = column(ln.radii, gl?.radii, 1);
+    lines.arrowSize = ln.arrowSize;
   }
-  return { lines, arrows, ids, flows, leafEdges };
+  return { lines, ids, flows, leafEdges };
 }
 
 /**
  * {@link superEdges} output: the per-style instanced batches plus parallel per-super-edge metadata.
  * `ids[e] = sourceTreeNode * tree.size + targetTreeNode` (the stable directed pair) and `flows[e]` is
  * its summed flow — both indexed by the instance/`gl_InstanceID` order shared across half-arrows and
- * lines/arrows. The Scene path (#138) keys link drawables by `ids`; GPU-readback link picking (#141)
+ * lines. The Scene path (#138) keys link drawables by `ids`; GPU-readback link picking (#141)
  * maps a decoded instance index → `ids`/`flows` → a link HoverHit. (The WebGL fill draw ignores both.)
  */
 export interface SuperEdgesData {
   halfArrows?: InstancedHalfArrowsData;
-  lines?: InstancedLinesData;
-  arrows?: InstancedArrowsData;
+  /** The `line` style's batch: whole arrows (an `arrows` layer, {@link isArrowBatch}) when directed (#542). */
+  lines?: LineBatch;
   ids: ArrayLike<number>;
   flows?: ArrayLike<number>;
   /** {@link withLeafLinks}: the graph edge of each of the first `leafEdges.length` instances (the leaf links,
    *  #447). Two parallel edges share a pair id, so a Scene keys a leaf link by its edge instead. */
   leafEdges?: ArrayLike<number>;
+}
+
+/**
+ * A `line`-style link batch (#542): headless lines, or, with `radii` and `arrowSize` (a directed style), whole
+ * arrows. Built in one place per path and drawn as the layer {@link lineBatchLayer} picks.
+ */
+export type LineBatch = InstancedLinesData & { radii?: Float32Array; arrowSize?: number };
+
+/** Whether a `line`-style batch carries its heads (#542): then it is an `arrows` layer's data. */
+export function isArrowBatch(b: LineBatch): b is InstancedArrowsData {
+  return b.radii !== undefined && b.arrowSize !== undefined;
+}
+
+/** The instanced layer of a `line`-style batch (#542): `arrows` (whole arrows) when it carries its heads, else
+ *  `lines`. O(1): the batch is the layer's data as is. */
+export function lineBatchLayer(name: string, lines: LineBatch, sizeMode: "world" | "screen", pickable?: boolean, pickBase?: number): InstancedLayer {
+  return isArrowBatch(lines) ? { name, primitive: "arrows", sizeMode, pickable, pickBase, arrows: lines } : { name, primitive: "lines", sizeMode, pickable, pickBase, lines };
 }
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */
@@ -2437,6 +2445,21 @@ export interface LinkLinesStyleAttrs {
   colors: Uint8Array;
   bends?: Float32Array;
   samples?: number;
+  /** Directed `line` links (#542): the head size; set (with `radii`) ⇒ the links draw as whole arrows. */
+  arrowSize?: number;
+  /** Directed `line` links (#542): the target node's radius per edge (the tip sits on its rim). */
+  radii?: Float32Array;
+}
+
+/**
+ * The head of a directed `line` link (#542): `arrowSize` + the target node's radius per edge, so the line lane
+ * draws shaft and head as ONE shape. One O(edges) pass per style version (the same array every frame).
+ */
+export function linkHeads(graph: NetworkGraph, size: number, nodeRadii: Float32Array): { arrowSize: number; radii: Float32Array } {
+  const count = graph.edgeCount;
+  const radii = new Float32Array(count);
+  for (let e = 0; e < count; e++) radii[e] = nodeRadii[graph.target[e] ?? 0] ?? 0;
+  return { arrowSize: size, radii };
 }
 
 /** The style-derived (accessor-run) attributes of {@link linkLines}, extracted so a position-only frame can
@@ -2452,7 +2475,7 @@ export function linkLinesStyleAttrs(graph: NetworkGraph, style: LinkStyleResolve
 
 /** Rebuild only the position-derived endpoints (from the current node positions), reusing cached
  *  style attributes (#179) — the per-layout-frame fast path for the no-LOD lines layer. */
-export function linkLinesFromCache(graph: NetworkGraph, attrs: LinkLinesStyleAttrs): InstancedLinesData {
+export function linkLinesFromCache(graph: NetworkGraph, attrs: LinkLinesStyleAttrs): LineBatch {
   const count = graph.edgeCount;
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
@@ -2464,9 +2487,13 @@ export function linkLinesFromCache(graph: NetworkGraph, attrs: LinkLinesStyleAtt
     targets[e * 2] = graph.positions[t * 2]!;
     targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
   }
-  const { widths, colors, bends, samples } = attrs;
-  if (bends) return { sources, targets, widths, colors, bends, samples, count };
-  return { sources, targets, widths, colors, count };
+  const { widths, colors, bends, samples, arrowSize, radii } = attrs;
+  const lines: LineBatch = bends ? { sources, targets, widths, colors, bends, samples, count } : { sources, targets, widths, colors, count };
+  if (arrowSize !== undefined) {
+    lines.arrowSize = arrowSize;
+    if (radii) lines.radii = radii;
+  }
+  return lines;
 }
 
 /**
@@ -2552,90 +2579,6 @@ export interface HalfArrowStyleResolved {
   bend: number;
 }
 
-export interface ArrowStyleResolved {
-  size: number;
-  /** Per-node radii (world units) — the tip is set back by the *target* node's radius. */
-  nodeRadii: Float32Array;
-  /** Per-edge RGBA from weight — the arrowhead always matches its link's colour. */
-  colorOf: (weight: number) => RGBAValue;
-  /** Bend (#104 N6c), matching the link's — the head sits on the bezier end-tangent. */
-  bend?: number;
-  /** Draw a one-sided **half** arrowhead (#104 N6c). */
-  half?: boolean;
-}
-
-/**
- * Instanced arrowhead data for a directed graph's links. The tip sits the *target* node's radius
- * back from its centre (so it meets the node boundary even when nodes are degree/flow-sized),
- * oriented along the link's end-tangent — the chord for straight links, the bezier tangent when
- * `style.bend` is set (#104 N6c).
- */
-export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): InstancedArrowsData {
-  const count = graph.edgeCount;
-  const bend = style.bend ?? 0;
-  const sources = new Float32Array(count * 2);
-  const targets = new Float32Array(count * 2);
-  const radii = new Float32Array(count);
-  for (let e = 0; e < count; e++) {
-    const s = graph.source[e]!;
-    const t = graph.target[e]!;
-    sources[e * 2] = graph.positions[s * 2]!;
-    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
-    targets[e * 2] = graph.positions[t * 2]!;
-    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
-    // The tip is set back to the target node's boundary in-shader (oriented along the end tangent),
-    // so it follows flow/degree-sized nodes and honours screen sizeMode.
-    radii[e] = style.nodeRadii[t]!;
-  }
-  const sizes = new Float32Array(count).fill(style.size);
-  // The arrowhead always takes its link's colour (no separate arrow fill).
-  const colors = linkColorBytes(graph.weight, count, style.colorOf);
-  if (bend) {
-    return { sources, targets, radii, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
-  }
-  return { sources, targets, radii, sizes, colors, count };
-}
-
-/** Style-derived arrow attributes (per-edge radii/sizes/colours/bends) that don't change on a position frame (#179). */
-export interface LinkArrowsStyleAttrs {
-  radii: Float32Array;
-  sizes: Float32Array;
-  colors: Uint8Array;
-  bends?: Float32Array;
-  half?: boolean;
-}
-
-/** The style-derived attributes of {@link linkArrows}, extracted so a position frame can reuse them (#179). The
- *  target-node radius setback is style-derived (node radii come from the cached style, not per-frame positions). */
-export function linkArrowsStyleAttrs(graph: NetworkGraph, style: ArrowStyleResolved): LinkArrowsStyleAttrs {
-  const count = graph.edgeCount;
-  const bend = style.bend ?? 0;
-  const radii = new Float32Array(count);
-  for (let e = 0; e < count; e++) radii[e] = style.nodeRadii[graph.target[e]!]!;
-  const sizes = new Float32Array(count).fill(style.size);
-  const colors = linkColorBytes(graph.weight, count, style.colorOf);
-  if (bend) return { radii, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half };
-  return { radii, sizes, colors };
-}
-
-/** Rebuild only the arrow endpoints from the current node positions, reusing cached style attributes (#179). */
-export function linkArrowsFromCache(graph: NetworkGraph, attrs: LinkArrowsStyleAttrs): InstancedArrowsData {
-  const count = graph.edgeCount;
-  const sources = new Float32Array(count * 2);
-  const targets = new Float32Array(count * 2);
-  for (let e = 0; e < count; e++) {
-    const s = graph.source[e]!;
-    const t = graph.target[e]!;
-    sources[e * 2] = graph.positions[s * 2]!;
-    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
-    targets[e * 2] = graph.positions[t * 2]!;
-    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
-  }
-  const { radii, sizes, colors, bends, half } = attrs;
-  if (bends) return { sources, targets, radii, sizes, colors, bends, half, count };
-  return { sources, targets, radii, sizes, colors, count };
-}
-
 /** Fully-resolved network style (defaults applied) for assembling the render layers. */
 export interface ResolvedNetworkStyle {
   /** Per-node radii, length `nodeCount`; resolved via {@link resolveNodeRadii}. Units follow `sizeMode`. */
@@ -2688,6 +2631,10 @@ export interface ResolvedNetworkStyle {
    * for half-arrows the bow side is derived from the link direction so a reciprocal pair nests.
    */
   linkBend: number;
+  /** The angle between a self-link loop's two legs (degrees; `selfLinkSpread`, default 25). */
+  selfLinkSpread: number;
+  /** A self-link loop's leg length in node radii (`selfLinkLength`, default 1). */
+  selfLinkLength: number;
 }
 
 /**
@@ -2735,24 +2682,18 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
         sizeMode,
       });
     } else {
-      layers.push({
-        name: "links",
-        primitive: "lines",
-        lines: { ...linkLines(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }), ...ends },
-        sizeMode,
-      });
-      if (style.directed) {
-        layers.push({
-          name: "arrows",
-          primitive: "arrows",
-          // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
-          arrows: { ...linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }), ...ends },
-          // The arrowhead shader honours sizeMode in-shader (tip projected + set back in the working
-          // space), so screen mode keeps a constant pixel head on the node boundary.
-          sizeMode,
-        });
-      }
+      const lines = linkLines(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend });
+      // A directed link is a whole arrow (#542): one shape per link, the tip on the target's rim, a full head on a
+      // bent link's own end tangent; screen mode keeps it constant px in-shader.
+      if (style.directed) layers.push({ name: "links", primitive: "arrows", arrows: { ...lines, ...linkHeads(graph, style.arrowSize, style.nodeRadii), ...ends }, sizeMode });
+      else layers.push({ name: "links", primitive: "lines", lines: { ...lines, ...ends }, sizeMode });
     }
+  }
+  // #505: the self-link loops, between the links and the nodes (none — past a cached O(1) lookup — without self-links).
+  const loops = drawsLinks(graph, style) ? selfLoopCache(graph, style) : null;
+  if (loops) {
+    updateSelfLoops(graph, loops, style.nodeOffsets);
+    layers.push(...selfLoopLayers(loops));
   }
   layers.push({
     name: "nodes",
@@ -2791,11 +2732,10 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
 export interface NoLodStyleCache {
   /** Which layer shape the cache is for (must match the current style to be reusable). `"no-links"`
    *  is the nodes-only shape — {@link drawsLinks} is false, so no per-edge attrs exist at all. */
-  kind: "half-arrows" | "lines" | "lines+arrows" | "no-links";
+  kind: "half-arrows" | "lines" | "arrow-lines" | "no-links";
   sizeMode: "world" | "screen";
   halfArrows?: HalfArrowStyleAttrs;
   lines?: LinkLinesStyleAttrs;
-  arrows?: LinkArrowsStyleAttrs;
   /** Per-edge source node id (#162 `groups` of every link layer), length `edgeCount`; absent on `"no-links"`. */
   groupSource?: Float32Array;
   /** Per-edge target node id (#162 `groups2` — undirected incident hover); absent when directed or `"no-links"`. */
@@ -2805,6 +2745,9 @@ export interface NoLodStyleCache {
   /** Each link's end offsets (#509), from the style's {@link ResolvedNetworkStyle.nodeOffsets}: built once per
    *  style version, so the link layers hand the renderer the same arrays every frame. Absent without offsets. */
   ends?: EdgeOffsets;
+  /** The self-link loops (#505): their style columns, and position columns rewritten in place each frame.
+   *  Absent without self-links. */
+  loops?: SelfLoopCache;
   /** The `nodes` layer's flow-border or node-border columns (#513): built by the first {@link networkLayersFromCache}
    *  of a style version (not here, so an LOD view's leaf-link use of the cache never builds them), then the same
    *  arrays every position frame. */
@@ -2856,6 +2799,8 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   const groupTarget = style.directed ? undefined : Float32Array.from(graph.target);
   // The links' end offsets (#509): one O(edges) pass per style version, never per frame.
   const ends = style.nodeOffsets ? edgeOffsets(graph, style.nodeOffsets) : undefined;
+  // The self-link loops (#505): O(S) per style version; nothing without self-links (a cached O(E) scan per graph).
+  const loops = selfLoopCache(graph, style) ?? undefined;
   if (halfArrow) {
     return {
       kind: "half-arrows",
@@ -2865,14 +2810,16 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
       groupTarget,
       nodeGroups,
       ends,
+      loops,
     };
   }
   const lines = linkLinesStyleAttrs(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend });
   if (style.directed) {
-    const arrows = linkArrowsStyleAttrs(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 });
-    return { kind: "lines+arrows", sizeMode, lines, arrows, groupSource, groupTarget, nodeGroups, ends };
+    // #542: the head rides on the line instance; its radii are cached here, once per style version.
+    const heads = linkHeads(graph, style.arrowSize, style.nodeRadii);
+    return { kind: "arrow-lines", sizeMode, lines: { ...lines, ...heads }, groupSource, groupTarget, nodeGroups, ends, loops };
   }
-  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups, ends };
+  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups, ends, loops };
 }
 
 /**
@@ -2893,12 +2840,13 @@ export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetwo
       layers.push({ name: "links", primitive: "half-arrows", halfArrows: ends ? { ...halfArrows, ...ends } : halfArrows, sizeMode });
     } else if (cache.lines) {
       const lines = linkLinesFromCache(graph, cache.lines);
-      layers.push({ name: "links", primitive: "lines", lines: ends ? { ...lines, ...ends } : lines, sizeMode });
-      if (cache.arrows) {
-        const arrows = linkArrowsFromCache(graph, cache.arrows);
-        layers.push({ name: "arrows", primitive: "arrows", arrows: ends ? { ...arrows, ...ends } : arrows, sizeMode });
-      }
+      layers.push(lineBatchLayer("links", ends ? { ...lines, ...ends } : lines, sizeMode));
     }
+  }
+  // #505: the self-link loops, between the links and the nodes: the cached columns, rewritten in place (O(S)).
+  if (cache.loops) {
+    updateSelfLoops(graph, cache.loops, style.nodeOffsets);
+    layers.push(...selfLoopLayers(cache.loops));
   }
   layers.push({
     name: "nodes",
@@ -2960,6 +2908,7 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
+    if (s === t) continue; // #505: a self-link is a loop (emitSelfLoops), not a zero-length line
     const sx = graph.positions[s * 2]!;
     const sy = graph.positions[s * 2 + 1]!;
     const tx = graph.positions[t * 2]!;
@@ -2982,42 +2931,38 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
 }
 
 /**
- * Emit each directed link's arrowhead as a filled triangle, tip set back by the target node's radius
- * and oriented along the link's end-tangent (the bezier tangent when `bend` is set). With `half` the
- * triangle is one-sided (#104 N6c), matching the WebGL half-arrow.
- *
- * `bake` (default 1) is the **screen-sizeMode** bake (the same trick as {@link emitHalfLinks}): the
- * shape is solved in pixel space (positions × `bake`, with `size`/`nodeRadii` already in px) and scaled
- * back by `1/bake`, so the Scene's ×k view transform reproduces the WebGL constant-px arrowhead — tip
- * size *and* the node-boundary setback. Without it, the world-unit setback grows with zoom and the head
- * drifts off the node. The end-tangent direction is invariant under the uniform ×bake, so only the
- * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched.
+ * Emit each directed `line` link as ONE filled arrow (#542): the shaft up to the head's base, then the head, its
+ * tip on the target's rim (`nodeRadii[target]`), a full head on a bent link's own end tangent — the Canvas/SVG twin
+ * of the WebGL `arrows` lane ({@link traceArrowOutline}: each edge ONE cubic; `toSVG()` traces the same outline). Keyed by edge index; the
+ * layer sets the fill. `bake` is the screen-sizeMode bake of {@link emitHalfLinks}: solve in px (positions × `bake`,
+ * widths/size/radii already px) and emit ÷`bake`, so the ×k view transform reproduces the constant-px render.
  */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1): void {
+export function emitArrowLinks(
+  g: GroupBuilder,
+  graph: NetworkGraph,
+  widthOf: (weight: number) => number,
+  size: number,
+  nodeRadii: Float32Array,
+  bend = 0,
+  bake = 1,
+): void {
   const inv = 1 / bake;
   for (let e = 0; e < graph.edgeCount; e++) {
-    const s = graph.source[e]!;
-    const t = graph.target[e]!;
-    const sx = graph.positions[s * 2]! * bake;
-    const sy = graph.positions[s * 2 + 1]! * bake;
-    const tx = graph.positions[t * 2]! * bake;
-    const ty = graph.positions[t * 2 + 1]! * bake;
-    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
-    const px = -uy;
-    const py = ux;
-    const setback = nodeRadii[t]!;
-    const tipX = tx - ux * setback;
-    const tipY = ty - uy * setback;
-    const baseX = tipX - ux * 2 * size;
-    const baseY = tipY - uy * 2 * size;
-    g.drawable(e, (ctx) => {
-      // Solve in px×bake space, emit ÷bake so the ×k view restores the constant-px shape.
-      ctx.moveTo(tipX * inv, tipY * inv);
-      // Half-arrow: base on one side of the centreline only (tip → centre-base → +side).
-      ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
-      ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
-      ctx.closePath();
-    });
+    const s = graph.source[e] ?? 0;
+    const t = graph.target[e] ?? 0;
+    const p = {
+      sx: (graph.positions[s * 2] ?? 0) * bake,
+      sy: (graph.positions[s * 2 + 1] ?? 0) * bake,
+      tx: (graph.positions[t * 2] ?? 0) * bake,
+      ty: (graph.positions[t * 2 + 1] ?? 0) * bake,
+      radius: nodeRadii[t] ?? 0,
+      width: widthOf(graph.weight[e] ?? 0),
+      size,
+      bend,
+    };
+    if (p.sx === p.tx && p.sy === p.ty) continue; // zero length: no arrow
+    // Each edge is ONE cubic: the Scene's recorder flattens it by its tolerance.
+    g.drawable(e, (ctx) => traceArrowOutline(ctx, p, inv));
   }
 }
 
@@ -3045,6 +2990,7 @@ export function emitHalfLinks(
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
+    if (s === t) continue; // #505: a self-link is a loop (emitSelfLoopHalfArrows), not a zero-length glyph
     const o = opposite[e] ?? -1;
     // Solve in pixel space (positions × bake, px sizes); scale the result back by 1/bake to emit world
     // geometry the Scene's view transform restores to pixels. bake = 1 ⇒ plain world geometry.
@@ -3196,35 +3142,28 @@ export function traceSuperLines(g: GroupBuilder, lines: InstancedLinesData, ids:
 }
 
 /**
- * Trace LOD super-edges' directed **arrowheads** as filled triangles, keyed by super-edge pair id —
- * the Scene twin of {@link emitArrows}, reading the {@link superEdges} SoA (target centre + draw radius
- * for the boundary setback, size, bend, and `half` for one-sided heads on bent links). Same `bake` trick
- * for `screen` sizeMode: solve in pixel space (×bake) and emit ÷bake.
+ * Trace LOD directed `line` links (super-edges and leaf links) as ONE filled arrow each (#542), keyed by `ids` —
+ * the Scene twin of the WebGL `arrows` lane and of {@link emitArrowLinks}: {@link traceArrowOutline} from the
+ * line's ends, width, bend, `arrowSize` and target draw radius (`radii`). Same `bake` trick for `screen`
+ * sizeMode: solve in pixel space (×bake, widths/size/radii already px) and emit ÷bake.
  */
-export function traceSuperArrows(g: GroupBuilder, arrows: InstancedArrowsData, ids: ArrayLike<number>, bake = 1): void {
+export function traceSuperArrowLines(g: GroupBuilder, lines: InstancedArrowsData, ids: ArrayLike<number>, bake = 1): void {
+  const { sources, targets, widths, bends, radii } = lines;
+  const size = lines.arrowSize;
   const inv = 1 / bake;
-  const half = arrows.half === true;
-  for (let e = 0; e < arrows.count; e++) {
-    const sx = arrows.sources[e * 2]! * bake;
-    const sy = arrows.sources[e * 2 + 1]! * bake;
-    const tx = arrows.targets[e * 2]! * bake;
-    const ty = arrows.targets[e * 2 + 1]! * bake;
-    const bend = arrows.bends ? arrows.bends[e]! : 0;
-    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
-    const px = -uy;
-    const py = ux;
-    const setback = arrows.radii[e]!;
-    const size = arrows.sizes[e]!;
-    const tipX = tx - ux * setback;
-    const tipY = ty - uy * setback;
-    const baseX = tipX - ux * 2 * size;
-    const baseY = tipY - uy * 2 * size;
-    g.drawable(ids[e]!, (ctx) => {
-      ctx.moveTo(tipX * inv, tipY * inv);
-      ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
-      ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
-      ctx.closePath();
-    });
+  for (let e = 0; e < lines.count; e++) {
+    const p = {
+      sx: (sources[e * 2] ?? 0) * bake,
+      sy: (sources[e * 2 + 1] ?? 0) * bake,
+      tx: (targets[e * 2] ?? 0) * bake,
+      ty: (targets[e * 2 + 1] ?? 0) * bake,
+      radius: radii[e] ?? 0,
+      width: widths[e] ?? 0,
+      size,
+      bend: bends ? (bends[e] ?? 0) : 0,
+    };
+    if (p.sx === p.tx && p.sy === p.ty) continue; // zero length: no arrow
+    g.drawable(ids[e] ?? 0, (ctx) => traceArrowOutline(ctx, p, inv));
   }
 }
 

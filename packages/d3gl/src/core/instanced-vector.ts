@@ -6,12 +6,15 @@ import type {
   InstancedLinesData,
   InstancedArrowsData,
   InstancedHalfArrowsData,
+  InstancedLoopsData,
   VectorLayer,
 } from "./backend.js";
 import { PathRecorder } from "./path-recorder.js";
+import { headLength, traceArrowOutline } from "./arrowhead.js";
 import { DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
-import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
+import { LOOP_LEG, loopPieceLength, loopsSpreadCot, traceLoop, traceLoopArrowOutline, traceLoopHalfArrowOutline } from "./loop-drop.js";
+import { bezierControl, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
 
 /**
@@ -21,7 +24,7 @@ import type { Subpath } from "./path-context.js";
  * the GPU as SoA typed arrays — they have no retained {@link Scene}, so `toSVG()` on the WebGL
  * backend used to serialize an empty document. These converters turn one emit's SoA back into
  * {@link DrawableVector}s, reusing the *same* curve math the shaders and the Canvas/SVG Scene
- * emitters use ({@link bezierControl}/{@link bentEndTangent}/{@link halfLinkGeometry}), so an
+ * emitters use ({@link bezierControl}/{@link arrowOutline}/{@link halfLinkGeometry}), so an
  * export reproduces the drawn view on every backend.
  *
  * **Export-only, never per frame.** Nothing here runs on a `setTransform`/`render` path: the engine
@@ -196,11 +199,12 @@ export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): Drawab
     out.push(
       drawable(e, {
         subpaths: record((ctx) => {
-          ctx.moveTo(sx, sy);
           if (bend) {
+            ctx.moveTo(sx, sy);
             const [cx, cy] = bezierControl(sx, sy, tx, ty, bend);
             ctx.quadraticCurveTo(cx, cy, tx, ty);
           } else {
+            ctx.moveTo(sx, sy);
             ctx.lineTo(tx, ty);
           }
         }),
@@ -213,44 +217,67 @@ export function linesToDrawables(l: InstancedLinesData, offsetScale = 1): Drawab
 }
 
 /**
- * Instanced arrowheads → one filled triangle per arrow, tip set back to the target node's boundary.
- * `bake` mirrors the Scene twin's screen-sizeMode trick: solve in pixel space (×k) and emit ÷k, so
- * the world-coordinate output reproduces the constant-pixel GPU render under the view's ×k transform.
- * The end offsets (#509) are in size units, so they add unscaled in the solve space: px at `bake = k` (screen),
- * world units at `bake = 1` (world).
+ * Instanced whole arrows (#542) → one filled outline per arrow: shaft + head as ONE closed polygon
+ * ({@link traceArrowOutline}, the GPU strip's twin, each edge ONE cubic), so a translucent arrow blends once. `bake` mirrors the Scene twin's
+ * screen-sizeMode trick: solve in pixel space (×k) and emit ÷k, so the world-coordinate output reproduces the
+ * constant-pixel GPU render under the view's ×k transform. The end offsets (#509) are in size units, so they add
+ * unscaled in the solve space: px at `bake = k` (screen), world units at `bake = 1` (world).
  */
-export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVector[] {
+export function arrowsToDrawables(l: InstancedArrowsData, bake = 1): DrawableVector[] {
   const inv = 1 / bake;
-  const half = a.half === true;
-  const { sourceOffsets: so, targetOffsets: to } = a;
+  const { sourceOffsets: so, targetOffsets: to } = l;
   const out: DrawableVector[] = [];
-  for (let e = 0; e < a.count; e++) {
-    const sx = (a.sources[e * 2] ?? 0) * bake + offsetAt(so, e * 2, 1);
-    const sy = (a.sources[e * 2 + 1] ?? 0) * bake + offsetAt(so, e * 2 + 1, 1);
-    const tx = (a.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1);
-    const ty = (a.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1);
-    const r = styleRow(a, e);
-    const bend = a.bends ? (a.bends[r] ?? 0) : 0;
-    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
-    const px = -uy;
-    const py = ux;
-    const setback = a.radii[r] ?? 0;
-    const size = a.sizes[r] ?? 0;
-    const tipX = tx - ux * setback;
-    const tipY = ty - uy * setback;
-    const baseX = tipX - ux * 2 * size;
-    const baseY = tipY - uy * 2 * size;
-    out.push(
-      drawable(e, {
-        subpaths: record((ctx) => {
-          ctx.moveTo(tipX * inv, tipY * inv);
-          ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
-          ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
-          ctx.closePath();
-        }),
-        fill: linkColor(a, e),
-      }),
-    );
+  for (let e = 0; e < l.count; e++) {
+    const r = styleRow(l, e);
+    const p = {
+      sx: (l.sources[e * 2] ?? 0) * bake + offsetAt(so, e * 2, 1),
+      sy: (l.sources[e * 2 + 1] ?? 0) * bake + offsetAt(so, e * 2 + 1, 1),
+      tx: (l.targets[e * 2] ?? 0) * bake + offsetAt(to, e * 2, 1),
+      ty: (l.targets[e * 2 + 1] ?? 0) * bake + offsetAt(to, e * 2 + 1, 1),
+      radius: l.radii[r] ?? 0,
+      width: l.widths[r] ?? 0,
+      size: l.arrowSize,
+      bend: l.bends ? (l.bends[r] ?? 0) : 0,
+    };
+    if (p.sx === p.tx && p.sy === p.ty) continue; // zero length: no arrow
+    out.push(drawable(e, { subpaths: record((ctx) => traceArrowOutline(ctx, p, inv)), fill: linkColor(l, e) }));
+  }
+  return out;
+}
+
+/**
+ * Self-link loops (#505, #542) → one drawable per loop, the loop lane's twin, with its centre solve
+ * ({@link loopsSpreadCot}), leg length and piece length `h` ({@link loopPieceLength}) as the shader solves them. A headless loop is ONE
+ * stroked path ({@link traceLoop}) whose ends move by `offset / bake` world units, as {@link linesToDrawables}' do (the
+ * loop is linear in its ends and `h`, so the loop on the moved ends is the one the shader draws in px). A headed loop
+ * is ONE filled outline, {@link traceLoopArrowOutline} or {@link traceLoopHalfArrowOutline}, solved in px (×k) on a screen
+ * layer and emitted ÷k, as {@link arrowsToDrawables}.
+ */
+export function loopsToDrawables(l: InstancedLoopsData, bake = 1): DrawableVector[] {
+  const inv = 1 / bake;
+  const cot = loopsSpreadCot(l.spread);
+  const leg = l.legLength ?? LOOP_LEG;
+  const { startOffsets: so, endOffsets: to } = l;
+  const out: DrawableVector[] = [];
+  for (let e = 0; e < l.count; e++) {
+    const width = l.widths[e] ?? 0;
+    const color = rgbaAt(l.colors, e);
+    if (l.head === "none") {
+      const cx = l.centers[e * 2] ?? 0;
+      const cy = l.centers[e * 2 + 1] ?? 0;
+      const sx = cx + offsetAt(so, e * 2, inv), sy = cy + offsetAt(so, e * 2 + 1, inv);
+      const tx = cx + offsetAt(to, e * 2, inv), ty = cy + offsetAt(to, e * 2 + 1, inv);
+      const subpaths = record((ctx) => traceLoop(ctx, sx, sy, tx, ty, loopPieceLength(l.arrowSize, width) * inv, leg, cot));
+      if (subpaths.length > 0) out.push(drawable(e, { subpaths, stroke: color, lineWidth: width }));
+      continue;
+    }
+    const cx = (l.centers[e * 2] ?? 0) * bake;
+    const cy = (l.centers[e * 2 + 1] ?? 0) * bake;
+    const sx = cx + offsetAt(so, e * 2, 1), sy = cy + offsetAt(so, e * 2 + 1, 1);
+    const tx = cx + offsetAt(to, e * 2, 1), ty = cy + offsetAt(to, e * 2 + 1, 1);
+    const half = l.head === "half";
+    const subpaths = record((ctx) => (half ? traceLoopHalfArrowOutline(ctx, sx, sy, tx, ty, width, l.arrowSize, leg, cot, inv) : traceLoopArrowOutline(ctx, sx, sy, tx, ty, width, l.arrowSize, leg, cot, inv)));
+    if (subpaths.length > 0) out.push(drawable(e, { subpaths, fill: color }));
   }
   return out;
 }
@@ -318,6 +345,10 @@ export function instancedVectorLayers(
         break;
       case "half-arrows":
         out.push({ name: layer.name, sizeMode: bake !== 1 ? "world" : layer.sizeMode, drawables: halfArrowsToDrawables(layer.halfArrows, bake) });
+        break;
+      case "loops":
+        // A headless loop is stroked like a line (its layer's sizeMode); a headed one is a filled outline, baked.
+        out.push({ name: layer.name, sizeMode: layer.loops.head === "none" || bake === 1 ? layer.sizeMode : "world", drawables: loopsToDrawables(layer.loops, bake) });
         break;
     }
   }

@@ -24,7 +24,7 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
 /**
  * An **LFR benchmark network** (power-law degrees + power-law communities with a mixing parameter —
  * the standard community-detection benchmark) rendered with the `network()` engine: nodes as
- * GPU-instanced points, links as instanced lines, triangle arrowheads for directed edges. Node
+ * GPU-instanced points, links as instanced lines, whole arrows (shaft + head) for directed edges. Node
  * positions come from d3gl's in-library **force layout** (Barnes-Hut), seeded by **multilevel
  * coarsening** — no coordinates are supplied. `layout({ backend: "worker" })` runs the whole solve in
  * a Web Worker and streams positions back, so the layout **converges progressively on screen** while

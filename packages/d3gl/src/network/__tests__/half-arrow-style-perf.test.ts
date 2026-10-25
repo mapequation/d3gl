@@ -1,6 +1,7 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
+import { LOOP_LEG, LOOP_SPREAD } from "../../core/loop-drop.js";
 
 /**
  * Regression guard for the half-arrow style pass at road-network scale (#449, #447). `noLodStyleCache` builds
@@ -61,6 +62,8 @@ function halfArrowStyle(n: number): ResolvedNetworkStyle {
     flowBorder: null,
     constBorder: null,
     linkBend: 0.15,
+    selfLinkSpread: LOOP_SPREAD,
+    selfLinkLength: LOOP_LEG,
   };
 }
 

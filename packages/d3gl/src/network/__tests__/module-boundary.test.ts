@@ -396,7 +396,7 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
     expect(lines.lines!.targets[e * 2]).toBeCloseTo(tree.cx[id("2")]!, 3);
     const back = lines.ids.indexOf(id("2") * tree.size + m1);
     expect(Math.hypot(lines.lines!.targets[back * 2]! - cx, lines.lines!.targets[back * 2 + 1]! - cy)).toBeCloseTo(R, 3);
-    expect(lines.arrows!.radii[back]).toBe(0); // tip on the ring
+    expect(lines.lines!.radii?.[back]).toBe(0); // tip on the ring
     const half = superEdges(tree, frontier, { ...STYLE, linkStyle: "half-arrow", anchor }, ALL);
     const h = half.ids.indexOf(m1 * tree.size + id("2"));
     expect(half.halfArrows!.radii[h * 2]).toBe(0); // the boundary end

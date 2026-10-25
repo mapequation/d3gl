@@ -91,8 +91,10 @@ export class HitIndex {
 
   /** screenMode mirrors the layer's "screen" sizeMode: geometry is rendered at constant pixel
    *  size around a projected anchor rather than scaled by the view transform, so pick() must
-   *  account for the anchor per entry instead of inverting the transform globally. */
-  constructor(drawables: readonly DrawableVector[], private readonly tolerance = 1, private readonly screenMode = false) {
+   *  account for the anchor per entry instead of inverting the transform globally.
+   *  padFills gives fills the stroke's pick pad: a point within `tolerance` of a fill's outline hits it too
+   *  (a thin filled link, #542, keeps the hover band it had as a stroke). Other layers' fills hit inside only. */
+  constructor(drawables: readonly DrawableVector[], private readonly tolerance = 1, private readonly screenMode = false, private readonly padFills = false) {
     this.append(drawables);
   }
 
@@ -123,7 +125,8 @@ export class HitIndex {
         id: d.id, minX, minY, maxX, maxY,
         filled: closed.length > 0,
         rings: closed.length > 0 ? groupRings(closed) : [],
-        strokes: d.lineWidth > 0 ? d.subpaths : [],
+        // A padded fill (a filled link, see `padFills`) also hits within the tolerance of its outline.
+        strokes: d.lineWidth > 0 || (this.padFills && closed.length > 0) ? d.subpaths : [],
         halfWidth: d.lineWidth / 2 + this.tolerance,
         circles,
         tolerance: this.tolerance,

@@ -119,7 +119,7 @@ function layer(primitive: Primitive, mode: Mode, k: number, variant: Variant): I
     return { name: "glyphs", sizeMode: mode, primitive, lines: { sources: s.at, targets: t.at, widths: fill(n, size / 2), colors: colors(n), bends, samples: 16, count: n, ...offs } };
   }
   if (primitive === "arrows") {
-    return { name: "glyphs", sizeMode: mode, primitive, arrows: { sources: s.at, targets: t.at, radii: fill(n, size), sizes: fill(n, size), colors: colors(n), bends, count: n, ...offs } };
+    return { name: "glyphs", sizeMode: mode, primitive, arrows: { sources: s.at, targets: t.at, widths: fill(n, size / 2), radii: fill(n, size), arrowSize: size, colors: colors(n), bends, samples: 16, count: n, ...offs } };
   }
   const radii = fill(2 * n, size);
   const widths = new Float32Array(2 * n).fill(size / 2);

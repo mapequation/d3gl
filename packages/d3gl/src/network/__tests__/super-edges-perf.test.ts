@@ -115,13 +115,14 @@ function expectSameOutput(a: SuperEdgesData, b: SuperEdgesData): void {
   expect(a.flows).toEqual(b.flows);
   expect(!!a.lines).toBe(!!b.lines);
   expect(!!a.halfArrows).toBe(!!b.halfArrows);
-  expect(!!a.arrows).toBe(!!b.arrows);
   if (a.lines && b.lines) {
     expect(a.lines.count).toBe(b.lines.count);
     expect(a.lines.sources).toEqual(b.lines.sources);
     expect(a.lines.targets).toEqual(b.lines.targets);
     expect(a.lines.widths).toEqual(b.lines.widths);
     expect(a.lines.colors).toEqual(b.lines.colors);
+    expect(a.lines.radii).toEqual(b.lines.radii);
+    expect(a.lines.arrowSize).toBe(b.lines.arrowSize);
   }
   if (a.halfArrows && b.halfArrows) {
     expect(a.halfArrows.count).toBe(b.halfArrows.count);
@@ -130,11 +131,6 @@ function expectSameOutput(a: SuperEdgesData, b: SuperEdgesData): void {
     expect(a.halfArrows.radii).toEqual(b.halfArrows.radii);
     expect(a.halfArrows.widths).toEqual(b.halfArrows.widths);
     expect(a.halfArrows.colors).toEqual(b.halfArrows.colors);
-  }
-  if (a.arrows && b.arrows) {
-    expect(a.arrows.count).toBe(b.arrows.count);
-    expect(a.arrows.radii).toEqual(b.arrows.radii);
-    expect(a.arrows.colors).toEqual(b.arrows.colors);
   }
 }
 

@@ -1,6 +1,5 @@
-import type { InstancedLinesData, InstancedArrowsData } from "../../core/index.js";
 import { boundaryCircle, type LODTree } from "../lod.js";
-import type { SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
+import type { LineBatch, SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
 
 /**
  * The super-edge gather as it was before #364, when its per-call scratch was `Map`s and `Set`s keyed by
@@ -414,24 +413,19 @@ export function superEdgesMapReference(
     return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids, flows };
   }
 
-  // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
-  // boundary along the bent end-tangent. Same colour as the line.
+  // Line style: bent/straight lines ∝ flow; a directed one carries its head (#542): the target's (capped) draw radius.
   const widths = new Float32Array(count);
   for (let e = 0; e < count; e++) widths[e] = style.widthOf(wS[e]!);
   const bends = new Float32Array(count).fill(style.bend);
-  const lines: InstancedLinesData = style.bend
+  const lines: LineBatch = style.bend
     ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
     : { sources, targets, widths, colors, count };
   if (!style.directed) return { lines, ids, flows };
-
-  // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
-  // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
-  // one-sided **half** head only for bent links (so reciprocal heads don't collide); straight links
-  // get the symmetric triangle — matching the non-LOD path (`half: bend !== 0`).
-  const aRadii = new Float32Array(count);
-  for (let e = 0; e < count; e++) aRadii[e] = endRadius(e, bS[e]!);
-  const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
-  return { lines, arrows, ids, flows };
+  const radii = new Float32Array(count);
+  for (let e = 0; e < count; e++) radii[e] = endRadius(e, bS[e]!);
+  lines.radii = radii;
+  lines.arrowSize = style.arrowSize;
+  return { lines, ids, flows };
 }
 
 /** The first element-wise difference between two gather outputs (`Object.is`, so −0 and NaN count), or ""
@@ -444,7 +438,7 @@ export function firstDifference(a: SuperEdgesData, b: SuperEdgesData): string {
     return "";
   };
   const scalar = (name: string, x: number | boolean | undefined, y: number | boolean | undefined): string => (Object.is(x, y) ? "" : `${name}: ${x} vs ${y}`);
-  const parts = [arr("ids", a.ids, b.ids), arr("flows", a.flows, b.flows), scalar("halfArrows", !!a.halfArrows, !!b.halfArrows), scalar("lines", !!a.lines, !!b.lines), scalar("arrows", !!a.arrows, !!b.arrows)];
+  const parts = [arr("ids", a.ids, b.ids), arr("flows", a.flows, b.flows), scalar("halfArrows", !!a.halfArrows, !!b.halfArrows), scalar("lines", !!a.lines, !!b.lines)];
   const h = a.halfArrows;
   const hb = b.halfArrows;
   if (h && hb) {
@@ -456,12 +450,7 @@ export function firstDifference(a: SuperEdgesData, b: SuperEdgesData): string {
   if (l && lb) {
     parts.push(arr("lines.sources", l.sources, lb.sources), arr("lines.targets", l.targets, lb.targets), arr("lines.widths", l.widths, lb.widths));
     parts.push(arr("lines.colors", l.colors, lb.colors), arr("lines.bends", l.bends, lb.bends), scalar("lines.samples", l.samples, lb.samples), scalar("lines.count", l.count, lb.count));
-  }
-  const ar = a.arrows;
-  const arb = b.arrows;
-  if (ar && arb) {
-    parts.push(arr("arrows.sources", ar.sources, arb.sources), arr("arrows.targets", ar.targets, arb.targets), arr("arrows.radii", ar.radii, arb.radii), arr("arrows.sizes", ar.sizes, arb.sizes));
-    parts.push(arr("arrows.colors", ar.colors, arb.colors), arr("arrows.bends", ar.bends, arb.bends), scalar("arrows.half", ar.half, arb.half), scalar("arrows.count", ar.count, arb.count));
+    parts.push(arr("lines.radii", l.radii, lb.radii), scalar("lines.arrowSize", l.arrowSize, lb.arrowSize));
   }
   return parts.filter((p) => p !== "").join("; ");
 }

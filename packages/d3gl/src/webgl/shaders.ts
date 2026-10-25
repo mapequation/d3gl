@@ -310,7 +310,8 @@ void main() {
 // the chord length); `a_bend = 0` ⇒ the control sits on the chord ⇒ a straight line (so straight
 // links draw exactly as before, at M=2). The strip offsets each sample by the *tangent's*
 // perpendicular, so a continuous strip gets its joins for free. Pairs with FILL_FS.
-export const INSTANCED_LINE_VS = `#version 300 es
+function lineVS(curve: string): string {
+  return `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
@@ -341,11 +342,7 @@ void main() {
   // of the chord, so the bezier on the projected ends is the projection of the world bezier (a similarity).
   vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
   vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
-  vec2 d = tgt - src;
-  vec2 ctrl = 0.5 * (src + tgt) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
-  float u = 1.0 - t;
-  vec2 p = u * u * src + 2.0 * u * t * ctrl + t * t * tgt;  // B(t)
-  vec2 tang = 2.0 * u * (ctrl - src) + 2.0 * t * (tgt - ctrl); // B'(t)
+${curve}
   if (screen) {
     // Constant-pixel width: offset the px centreline point along the tangent's perpendicular, then px -> clip.
     vec2 dir = normalize(tang);
@@ -358,36 +355,186 @@ void main() {
     gl_Position = vec4((u_transform * vec3(p + perp * side * hw, 1.0)).xy, 0.0, 1.0);
   }
 }`;
+}
+const QUADRATIC_LINE_GLSL = `
+  vec2 d = tgt - src;
+  vec2 ctrl = 0.5 * (src + tgt) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
+  float u = 1.0 - t;
+  vec2 p = u * u * src + 2.0 * u * t * ctrl + t * t * tgt;  // B(t)
+  vec2 tang = 2.0 * u * (ctrl - src) + 2.0 * t * (tgt - ctrl); // B'(t)`;
+export const INSTANCED_LINE_VS = lineVS(QUADRATIC_LINE_GLSL);
 
-// INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
-// One triangle per instance: per-vertex a_tri = (back, across), tip (0,0); the symmetric template
-// has base (2,-1)/(2,1), the half template (2,0)/(2,1) (one-sided, for bent map links so reciprocal
-// arrows don't collide). a_target is the target node's *centre*; the tip is set back along the bezier's
-// *end* tangent by a_radius (the target's draw radius) so it lands on the node boundary even when nodes
-// are flow/degree-sized, then scaled by a_size. a_bend = 0 ⇒ oriented along the chord. Pairs with FILL_FS.
-//
-// sizeMode (mirrors the line + half-arrow shaders): in **world** mode the shape is built in world units,
-// then projected — so size/setback scale with zoom. In **screen** mode both endpoints are first projected
-// to px and the same scale-free math runs in px (a_size/a_radius are px), so the arrowhead stays a
-// constant pixel size and meets the node boundary. The end-tangent direction is identical in either space
-// (the view transform is an isotropic scale), so only the working space differs.
-export const INSTANCED_ARROW_VS = `#version 300 es
+// INSTANCED_HEAD_LINE_VS — the `arrows` primitive: a whole arrow, shaft + head, as one instance (#542): one strip.
+// The twin of `core/arrowhead.ts` `arrowOutline`: the tip sits `a_radius` back from the target along the
+// curve's end tangent; the head is `2·u_arrowSize` long and `a_width/2 + 2·sqrt(a_width)` wide each side
+// (the half-arrow barb rule, `barbOverhang`); the shaft is the settled cubic (`legCubic`) src → base, whose end
+// tangent is the head's axis, so it runs into the head along it, its last pair on the base with the head's normal. The template (`headLineTemplate`) is the line's `(t, side)`
+// samples, then (2, 1) left barb, (2, -1) right barb, (3, 0) tip: the two triangles that join the shaft's
+// last pair to the barbs are collinear (all on the base edge, zero area), so one strip draws shaft + head
+// with no overlap and a translucent arrow blends once. Units follow sizeMode like the line (px or world).
+const HEAD_LINE_DECL = `
+uniform float u_arrowSize;  // head length = 2·u_arrowSize (#542)
+in float a_radius;          // per-instance target radius: the tip sits this far back from the target`;
+const HEAD_LINE_BODY = `  float t = a_corner.x;
+  float side = a_corner.y;
+  float hw = a_width * 0.5;
+  bool screen = u_screen > 0.5;
+  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
+  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
+  vec2 d = tgt - src;
+  float len = 2.0 * u_arrowSize;                            // headLength
+  float back = a_radius + len;                              // ρ
+  // fadedBend (core/arrowhead.ts): a short link's bend fades towards the floor where an opposite pair's heads
+  // just clear, x = min(0.99, 1.2·H/ρ), floor = ½·x/√(1 − x²), over smoothstep(2ρ, 4ρ, D).
+  float dl = length(d);
+  float bend = a_bend;
+  float k = 1.0;                                            // √(1 + 4b²), b the faded bend
+  if (a_bend != 0.0) {
+    if (back > 0.0) {
+      float ab = abs(a_bend);
+      float hx = min(0.99, 1.2 * (hw + 2.0 * sqrt(a_width)) / back);
+      float floorBend = min(ab, 0.5 * hx / sqrt(1.0 - hx * hx));
+      float fade = smoothstep(2.0 * back, 4.0 * back, dl);
+      bend = sign(a_bend) * (ab - (ab - floorBend) * (1.0 - fade));
+    }
+    k = sqrt(1.0 + 4.0 * bend * bend);
+  }
+  // The legs (core/arrowhead.ts writeShaft): out of each centre towards the quadratic's control mid + ⟂d·bend.
+  vec2 bp = 2.0 * bend * vec2(-d.y, d.x);
+  // |±d + 2b·⟂d| = |d|·√(1 + 4b²) exactly (⟂d is perpendicular to d with its length): no third root.
+  float ll = dl * k;
+  // Coincident ends (a self-link's edge, or two nodes at one point): no direction, so no arrow, as the TS twin
+  // (writeShaft returns 0). Every vertex collapses onto src: a zero-area strip, never a NaN vertex.
+  if (!(ll > 0.0)) {
+    gl_Position = screen
+      ? vec4(src.x / u_viewport.x * 2.0 - 1.0, 1.0 - src.y / u_viewport.y * 2.0, 0.0, 1.0)
+      : vec4((u_transform * vec3(src, 1.0)).xy, 0.0, 1.0);
+    return;
+  }
+  vec2 u1 = (bp - d) / ll;                                  // out of the target: the head's axis is −u1
+  vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the head's normal
+  vec2 tip = tgt + u1 * a_radius;
+  vec2 base = tgt + u1 * back;                              // E1, the head's base centre
+  vec2 pos;
+  if (t > 2.5) {
+    pos = tip;
+  } else if (t > 1.5) {
+    pos = base + un * side * (hw + 2.0 * sqrt(a_width));    // headHalfWidth: the barbs
+  } else if (t >= 1.0) {
+    pos = base + un * side * hw;                            // the shaft's end, on the base
+  } else {
+    // legCubic: E0 = src, E0 + ℓ·u0, E1 + ℓ·u1, E1 = base, ℓ = |E1 − E0|·√(1 + 4b²)/3; when the base lies
+    // back past the control (a very short link) the shaft collapses to the straight src → base.
+    vec2 c = base - src;
+    float chord = length(c);
+    vec2 v = chord > 0.0 ? c / chord : -u1;
+    bool settled = back < 0.5 * ll;
+    vec2 l0 = settled ? (d + bp) / ll : v;
+    vec2 l1 = settled ? u1 : -v;
+    float leg = settled ? chord * k / 3.0 : chord / 3.0;
+    vec2 p1 = src + leg * l0;
+    vec2 p2 = base + leg * l1;
+    float u = 1.0 - t;
+    vec2 p = u * u * u * src + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * base;
+    vec2 g = u * u * (p1 - src) + 2.0 * u * t * (p2 - p1) + t * t * (base - p2); // B'(t)/3
+    float gl = length(g);
+    vec2 n = gl > 0.0 ? vec2(-g.y, g.x) / gl : un;
+    pos = p + n * side * hw;
+  }
+  gl_Position = screen
+    ? vec4(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0, 0.0, 1.0)
+    : vec4((u_transform * vec3(pos, 1.0)).xy, 0.0, 1.0);
+}`;
+
+function headLineVS(vs: string): string {
+  const at = vs.indexOf("  float t = a_corner.x;");
+  if (at < 0 || !vs.includes("\nin float a_bend;")) throw new Error("headLineVS: unexpected line shader");
+  return vs.slice(0, at).replace("\nin float a_bend;", `${HEAD_LINE_DECL}\nin float a_bend;`) + HEAD_LINE_BODY;
+}
+
+export const INSTANCED_HEAD_LINE_VS = headLineVS(INSTANCED_LINE_VS);
+
+// INSTANCED_LOOP_VS — the self-link loop (#505, #542), one instance of the loop lane (`InstancedLoops`): the GLSL
+// twin of `core/loop-drop.ts` (`traceLoop`, `traceLoopArrowOutline`, `traceLoopHalfArrowOutline`), every variant one strip.
+// A `loops` layer (`InstancedLoopsData`): `a_center` its node centre, and its two rim ends are that centre plus
+// `a_startOffset` / `a_endOffset` (size units, any #509 node offset in both); from their difference D, n = cot α·⟂(D)/2 gives S − c = n − D/2 = r·u0 and
+// T − c = n + D/2 = r·u1. The centre curve is c → E0, the cubic E0, E0 + ℓ·u0, E1 + ℓ·u1, E1 (E_k = c + (r + h)·u_k,
+// ℓ = L·r: `u_loopLeg` is the layer's `legLength`, L in node radii), then the variant's end. h = max(2·arrowSize, 10·∛w)
+// in every variant (`loopPieceLength`), so the path never changes with the head, which lies on the end piece: its
+// tip on the rim, T = c + r·u1, its base B = c + (r + hl)·u1, hl its length (2·arrowSize = u_loopHead, or the half
+// head's 10·∛w). The template (`loopTemplate`): (−1, ±1) the pair at c with the straight leg's normal ⟂(u0);
+// (t ∈ [0, 1], ±1) the cubic; then the end — undirected (4, ±1) the pair back at c; arrow (5, ±1) the shaft's pair
+// at B, (2, 1) left barb, (2, −1) right barb, (3, 0) tip (as `headLineTemplate`); half-arrow (3, 0) tip, (5, 1) the
+// outer edge at B, (2, 1) barb (off the last pair, the band down to B and the one-sided head). Each edge sits `off`
+// along ⟂(travel), the loop's outside: ±w/2 (line), 0 / +w (half-arrow).
+const LOOP_DECL = `
+uniform float u_loopHead;   // 2·arrowSize: the arrowhead's length; the straight pieces are max(this, 10·∛w) (#542)
+uniform float u_loopCot;    // cot α: recovers the loop's centre from its two rim ends
+uniform float u_loopHalf;   // 1 = the half-arrow band (edges 0 / +w, one-sided head), 0 = the line (±w/2)
+uniform float u_loopLeg;    // L: the cubic's arms in node radii (the layer's legLength)`;
+const LOOP_BODY = `  float t = a_corner.x;
+  float side = a_corner.y;
+  bool screen = u_screen > 0.5;
+  bool halfArrow = u_loopHalf > 0.5;
+  vec2 cp = screen ? worldToPx(a_center) : a_center;
+  vec2 src = cp + a_startOffset;
+  vec2 tgt = cp + a_endOffset;
+  vec2 hd = 0.5 * (a_endOffset - a_startOffset);           // D/2, exact: both ends share the centre
+  vec2 nd = vec2(-hd.y, hd.x) * u_loopCot;
+  vec2 a0 = nd - hd;                                        // S − c = r·u0
+  float r = length(a0);
+  float ir = r > 0.0 ? 1.0 / r : 0.0;                       // coincident ends: every point collapses onto c
+  vec2 u0 = a0 * ir;
+  vec2 u1 = (nd + hd) * ir;
+  vec2 c = 0.5 * (src - a0 + tgt - (nd + hd));              // = S − r·u0 = T − r·u1
+  float off = halfArrow ? (side + 1.0) * 0.5 * a_width : side * 0.5 * a_width;
+  float halfHead = 10.0 * pow(a_width, 1.0 / 3.0);         // the half-arrow's head length
+  float h = max(u_loopHead, halfHead);                      // the straight pieces, the same in every variant
+  vec2 e1 = c + (r + h) * u1;                               // E1, the end piece's far end
+  vec2 un = vec2(u1.y, -u1.x);                              // ⟂(−u1): the end's normal
+  vec2 pos;
+  if (t > 4.5) {
+    pos = c + (r + (halfArrow ? halfHead : u_loopHead)) * u1 + un * off; // an edge at the head's base B
+  } else if (t > 3.5) {
+    pos = c + un * off;                                     // the undirected loop's end, back at c
+  } else if (t > 2.5) {
+    pos = c + r * u1;                                       // the tip, on the rim
+  } else if (t > 1.5) {
+    vec2 b = c + (r + (halfArrow ? halfHead : u_loopHead)) * u1;
+    pos = b + un * (off + side * 2.0 * sqrt(a_width));      // a barb at B: barbOverhang past its edge
+  } else if (t < -0.5) {
+    pos = c + vec2(-u0.y, u0.x) * off;                      // the start, at c
+  } else {
+    vec2 e0 = c + (r + h) * u0;
+    float leg = u_loopLeg * r;
+    vec2 p1 = e0 + leg * u0;
+    vec2 p2 = e1 + leg * u1;
+    float u = 1.0 - t;
+    vec2 p = u * u * u * e0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * e1;
+    vec2 g = u * u * (p1 - e0) + 2.0 * u * t * (p2 - p1) + t * t * (e1 - p2); // B'(t)/3
+    float gl = length(g);
+    vec2 n = gl > 0.0 ? vec2(-g.y, g.x) / gl : un;
+    pos = p + n * off;
+  }
+  gl_Position = screen
+    ? vec4(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0, 0.0, 1.0)
+    : vec4((u_transform * vec3(pos, 1.0)).xy, 0.0, 1.0);
+}`;
+
+export const INSTANCED_LOOP_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
-uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
-uniform vec2 u_viewport;  // device px, for screen sizeMode
-layout(location = 0) in vec2 a_tri; // per-vertex (back, across); location 0 stays buffer-backed (OffsetColumn, instanced.ts)
-in vec2 a_source;     // per-instance source centre (orientation)
-in vec2 a_target;     // per-instance target centre (tip set back by a_radius)
-in vec2 a_sourceOffset; // per-instance offsets of the two ends in size units (#509); the constant (0, 0) without them
-in vec2 a_targetOffset;
-in float a_size;      // per-instance arrow size (world or px per sizeMode)
-in float a_radius;    // per-instance target node radius (setback to the boundary)
-in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
-in vec4 a_color;${HL_UNIFORMS}
-uniform float u_pickBase;   // added to the instance's pick id (#447): two pickable link layers decode apart
+uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
+uniform vec2 u_viewport;    // device px, for screen mode
+layout(location = 0) in vec2 a_corner; // per-vertex (t, side), see loopTemplate; location 0 stays buffer-backed (OffsetColumn, instanced.ts)
+in vec2 a_center;           // per-instance world centre of the loop's node
+in vec2 a_startOffset;      // per-instance rim ends as offsets from the centre, in size units (#509)
+in vec2 a_endOffset;
+in float a_width;           // per-instance line width
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
+uniform float u_pickBase;   // added to the instance's pick id (#447)${LOOP_DECL}
 out vec4 v_color;
-flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
+flat out float v_id;        // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 vec2 worldToPx(vec2 w) {
   vec2 clip = (u_transform * vec3(w, 1.0)).xy;
   return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
@@ -395,20 +542,7 @@ vec2 worldToPx(vec2 w) {
 void main() {
   v_color = a_color;${HL_APPLY}
   v_id = float(gl_InstanceID) + u_pickBase;
-  bool screen = u_screen > 0.5;
-  vec2 src = screen ? worldToPx(a_source) + a_sourceOffset : a_source + a_sourceOffset;
-  vec2 tgt = screen ? worldToPx(a_target) + a_targetOffset : a_target + a_targetOffset;
-  vec2 d = tgt - src;
-  // Quadratic-bezier end tangent (t=1): 2·(P1 − C), C = midpoint + ⟂(chord)·bend.
-  vec2 endTan = 0.5 * d - vec2(-d.y, d.x) * a_bend;
-  vec2 dir = normalize(endTan);
-  vec2 perp = vec2(-dir.y, dir.x);
-  // World-sized nodes under px-sized arrows (#494): the setback is the node's radius at this zoom, in px.
-  vec2 tip = tgt - dir * a_radius; // set back to the target node's boundary
-  vec2 pos = tip - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
-  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
-  gl_Position = vec4(clip, 0.0, 1.0);
-}`;
+${LOOP_BODY}`;
 
 // INSTANCED_HALF_ARROW_VS — the "map of networks" directed-link glyph (#104 N6): one filled shape
 // per link that pinches to the source centre, bows around a shared centre curve, and ends in a barbed
@@ -428,7 +562,8 @@ void main() {
 // constant pixel size while the endpoints still move with zoom. The geometry math is scale-free, so
 // only the input/output space differs: screen mode adds two world→px projections up front and a px→clip
 // convert at the end (a uniform branch — the world path is untouched).
-export const INSTANCED_HALF_ARROW_VS = `#version 300 es
+function halfArrowVS(geometry: string, inner: string, outer: string): string {
+  return `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
@@ -468,6 +603,26 @@ void main() {
   float width = a_widths.x;
   float oppositeWidth = a_widths.y;
 
+${geometry}
+
+  vec2 pos;
+  if (code < 0.5) pos = p0;
+  else if (code < 1.5) pos = x02;
+  else if (code < 2.5) pos = x03;
+  else if (code < 3.5) pos = x04;
+  else if (code < 4.5) pos = x11;
+  else if (code < 5.5) pos = x12;
+  else if (code < 6.5) pos = x13;
+  else if (code < 7.5) pos = x14;
+  else if (code < 8.5) pos = ${inner};
+  else pos = ${outer};
+
+  // World: project the world-space point. Screen: pos is already px, so convert px to clip.
+  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
+  gl_Position = vec4(clip, 0.0, 1.0);
+}`;
+}
+const QUADRATIC_HALF_ARROW_GLSL = `
   vec2 d = p1 - p0;
   float l = length(d);
   float lBetween = l - r0 - r1;
@@ -504,24 +659,8 @@ void main() {
   vec2 x12 = x11 + tipLength * dir1;
   vec2 left1 = vec2(dir1.y, -dir1.x);
   vec2 x13 = x12 + width * left1;
-  vec2 x14 = x13 + tipWidth * left1;
-
-  vec2 pos;
-  if (code < 0.5) pos = p0;
-  else if (code < 1.5) pos = x02;
-  else if (code < 2.5) pos = x03;
-  else if (code < 3.5) pos = x04;
-  else if (code < 4.5) pos = x11;
-  else if (code < 5.5) pos = x12;
-  else if (code < 6.5) pos = x13;
-  else if (code < 7.5) pos = x14;
-  else if (code < 8.5) pos = bez(x02, cp1, x12, t);
-  else pos = bez(x03, cp2, x13, t);
-
-  // World: project the world-space point. Screen: pos is already px, so convert px to clip.
-  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
-  gl_Position = vec4(clip, 0.0, 1.0);
-}`;
+  vec2 x14 = x13 + tipWidth * left1;`;
+export const INSTANCED_HALF_ARROW_VS = halfArrowVS(QUADRATIC_HALF_ARROW_GLSL, "bez(x02, cp1, x12, t)", "bez(x03, cp2, x13, t)");
 
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space
@@ -596,30 +735,23 @@ const SELECTED_FETCH = `
   a_selected = edgeFetch(u_edgeSelected).r > 0.0 ? 1.0 : 0.0;`;
 
 /** Lines by edge (the ends stay per-instance attributes); style0 (width, bend, group, group2); colour; selected. */
-export const INDEXED_LINE_VS = indexedVS(
-  INSTANCED_LINE_VS,
-  ["a_width", "a_color", "a_bend", ...HL_FIELDS],
-  ["u_edgeStyle0", "u_edgeColor", "u_edgeSelected"],
-  `
+const LINE_FETCH = `
   vec4 s = edgeFetch(u_edgeStyle0);
   a_width = s.x;
   a_bend = s.y;
   a_group = s.z;
-  a_group2 = s.w;${SELECTED_FETCH}`,
-);
+  a_group2 = s.w;${SELECTED_FETCH}`;
+const LINE_FIELDS = ["a_width", "a_color", "a_bend", ...HL_FIELDS];
+const LINE_SAMPLERS = ["u_edgeStyle0", "u_edgeColor", "u_edgeSelected"];
+export const INDEXED_LINE_VS = indexedVS(INSTANCED_LINE_VS, LINE_FIELDS, LINE_SAMPLERS, LINE_FETCH);
 
-/** Arrowheads by edge: style0 (size, radius, bend, group); style1 (group2); colour; selected. */
-export const INDEXED_ARROW_VS = indexedVS(
-  INSTANCED_ARROW_VS,
-  ["a_size", "a_radius", "a_bend", "a_color", ...HL_FIELDS],
-  ["u_edgeStyle0", "u_edgeStyle1", "u_edgeColor", "u_edgeSelected"],
-  `
-  vec4 s = edgeFetch(u_edgeStyle0);
-  a_size = s.x;
-  a_radius = s.y;
-  a_bend = s.z;
-  a_group = s.w;
-  a_group2 = edgeFetch(u_edgeStyle1).x;${SELECTED_FETCH}`,
+/** Whole arrows by edge (#542): the line's tables plus an r32float target-radius table. */
+export const INDEXED_HEAD_LINE_VS = indexedVS(
+  INSTANCED_HEAD_LINE_VS,
+  [...LINE_FIELDS, "a_radius"],
+  [...LINE_SAMPLERS, "u_edgeRadius"],
+  `${LINE_FETCH}
+  a_radius = edgeFetch(u_edgeRadius).r;`,
 );
 
 /** Half-arrows by edge: style0 (r0, r1, width, oppositeWidth); style1 (bend, group, group2); colour; selected. */

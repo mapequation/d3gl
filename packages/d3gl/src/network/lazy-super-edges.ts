@@ -67,6 +67,11 @@ export function buildLeafIncidence(graph: NetworkGraph, directed: boolean): Leaf
 const KEPT = 1;
 const DROPPED = 2;
 const CULLED = 3;
+/** Whether tree node `x` was a kept glyph of the last {@link lazySuperEdges} call on `sc` (#505: an LOD frame's
+ *  loops on kept leaves read the gather's stamp instead of stamping the frontier again). O(1). */
+export function keptByLastGather(sc: LazySuperEdgesScratch, x: number): boolean {
+  return sc.cover[x] === ((sc.gen << 3) | KEPT);
+}
 /** A kept leaf's row with nothing to gather (#447: every neighbour a kept leaf): no memo row, no pairs. */
 const EMPTY_ROW = -2;
 /** A CSR entry that is not its edge's source's entry (`incidenceSourceEdges` in spatial-rows.ts). */

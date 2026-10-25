@@ -11,6 +11,11 @@ import { playwright } from "@vitest/browser-playwright";
 const rawScale = Number(process.env.PERF_BUDGET_SCALE);
 const budgetScale = Number.isFinite(rawScale) && rawScale > 0 ? rawScale : 1;
 
+// A hardware-GPU run (`PERF_REAL_GPU=1`, #392) asks Chromium for the GPU: headless Chromium otherwise falls back to
+// SwiftShader on macOS, and `softwareRenderer()` fails the real-GPU guards. ANGLE's Metal backend on macOS (#542).
+const realGpu = !["", "0", "false"].includes(process.env.PERF_REAL_GPU ?? "");
+const realGpuArgs = ["--enable-gpu", "--ignore-gpu-blocklist", ...(process.platform === "darwin" ? ["--use-angle=metal"] : [])];
+
 export default defineConfig({
   oxc: { transform: { react: {} } },
   // Substituted into test sources at transform time (the __D3GL_VERSION__
@@ -40,7 +45,7 @@ export default defineConfig({
     teardownTimeout: 15_000 * budgetScale,
     browser: {
       enabled: true,
-      provider: playwright(),
+      provider: playwright(realGpu ? { launchOptions: { args: realGpuArgs } } : undefined),
       headless: true,
       // The recurring hang is the browser launching but never connecting back
       // (run sits at "Test Files 0 passed (N)" forever). Bound that phase so it

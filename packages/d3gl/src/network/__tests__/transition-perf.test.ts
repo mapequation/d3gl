@@ -5,6 +5,7 @@ import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 import { computeLODGeometry, computeLODPositions, type LODTree } from "../lod.js";
 import { networkLayersFromCache, noLodStyleCache, type ResolvedNetworkStyle } from "../glyphs.js";
 import { positionTransition, type PositionTransition } from "../transition.js";
+import { LOOP_LEG, LOOP_SPREAD } from "../../core/loop-drop.js";
 
 /**
  * Per-frame regression guard for position transitions (#328, docs/agents/performance.md). A transition is
@@ -105,6 +106,8 @@ function plainStyle(n: number): ResolvedNetworkStyle {
     flowBorder: null,
     constBorder: null,
     linkBend: 0,
+    selfLinkSpread: LOOP_SPREAD,
+    selfLinkLength: LOOP_LEG,
   };
 }
 

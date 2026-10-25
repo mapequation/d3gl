@@ -112,8 +112,7 @@ function byId(d: SuperEdgesData): Map<number, number[]> {
     if (ha) vals.push(...ha.sources.subarray(2 * e, 2 * e + 2), ...ha.targets.subarray(2 * e, 2 * e + 2), ...ha.radii.subarray(2 * e, 2 * e + 2), ...ha.widths.subarray(2 * e, 2 * e + 2), ...ha.colors.subarray(4 * e, 4 * e + 4));
     const l = d.lines;
     if (l) vals.push(...l.sources.subarray(2 * e, 2 * e + 2), ...l.targets.subarray(2 * e, 2 * e + 2), l.widths[e] ?? NaN, ...l.colors.subarray(4 * e, 4 * e + 4));
-    const a = d.arrows;
-    if (a) vals.push(a.radii[e] ?? NaN, a.sizes[e] ?? NaN);
+    if (l?.radii) vals.push(l.radii[e] ?? NaN, l.arrowSize ?? NaN);
     put(e, vals);
   }
   return m;

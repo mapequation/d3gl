@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { luma } from "@luma.gl/core";
 import type { Device, Framebuffer, RenderPass } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import { InstancedArrows, InstancedCircles, InstancedHalfArrows, InstancedLines, InstancedPie } from "../instanced.js";
+import { InstancedCircles, InstancedHalfArrows, InstancedLines, InstancedPie } from "../instanced.js";
 import { clipFromView } from "../index.js";
 
 /**
@@ -96,10 +96,12 @@ const LANES: { name: string; build: (device: Device, n: number) => Lane }[] = [
     build(device, n) {
       const data = (k: number, spot: boolean) => {
         const { pos, end, colors } = spotlight(k, spot);
-        return { sources: pos, targets: end, radii: new Float32Array(k), sizes: new Float32Array(k).fill(8), colors, count: k };
+        return { sources: pos, targets: end, widths: new Float32Array(k).fill(6), radii: new Float32Array(k), arrowSize: 4, colors, count: k };
       };
-      const lane = new InstancedArrows(device, data(n, false), W, H);
-      return { get capacity() { return lane.capacity; }, update: (d, k, s) => void lane.update(d, data(k, s)), render: (p) => lane.render(p), destroy: () => lane.destroy() };
+      // Whole arrows (#542) run the line lane with its head.
+      const lane = new InstancedLines(device, data(n, false), W, H, false, "arrow");
+      lane.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+      return { get capacity() { return lane.capacity; }, update: (d, k, s) => void lane.update(d, data(k, s), "arrow"), render: (p) => lane.render(p), destroy: () => lane.destroy() };
     },
   },
   {
