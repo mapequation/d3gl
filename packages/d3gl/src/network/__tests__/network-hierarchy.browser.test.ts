@@ -452,7 +452,8 @@ describe("the module tree is built off the main thread (#428)", () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = graph();
-    net.data(g, { modules: MODULES }).lod({ declutter: false }).layout({ backend: "gpu", iterations: 20 });
+    // The flat seed (a hierarchy lays out nested by default, #566).
+    net.data(g, { modules: MODULES }).lod({ declutter: false }).layout({ backend: "gpu", nested: false, iterations: 20 });
     expect(builds.count, "the GPU seed built the module tree on the main thread").toBe(0);
     await net.whenSettled();
     await frame();

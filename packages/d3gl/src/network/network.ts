@@ -376,12 +376,14 @@ export interface NetworkLayoutOptions {
    * full heat to untangle. Every backend stops as soon as the layout has converged (nodes moving a small
    * fraction of the equilibrium spacing per tick, and no faster than the tick before), resolving
    * {@link Network.whenSettled}; the GPU solve (`"gpu"`, or `"auto"` resolved to it) decides that on the
-   * GPU, once per tick, so its stop tick does not depend on frame timing (#376).
+   * GPU, once per tick, so its stop tick does not depend on frame timing (#376). A {@link nested} layout — the
+   * default with a module hierarchy (#566) — takes its own `nested.iterations` instead.
    */
   iterations?: number;
   /**
    * Force parameters for the force backends. The layout settles into a disc of radius
-   * `√(repulsion·N/centering)` — node spacing `√(π·repulsion/centering)` — and is seeded at that scale.
+   * `√(repulsion·N/centering)` — node spacing `√(π·repulsion/centering)` — and is seeded at that scale. A
+   * {@link nested} layout (the default with a module hierarchy, #566) ignores them.
    */
   force?: Partial<ForceParams>;
   /**
@@ -394,7 +396,8 @@ export interface NetworkLayoutOptions {
    * budget, and the first frame it paints is the seed (paced by animation frames: on web-NotreDame about
    * 0.8 s after a disc start's first frame at 120 Hz, about twice that at 60 Hz). `false` starts the GPU
    * layout from the disc with or without a module hierarchy. Where `"gpu"` / `"auto"` resolve to the
-   * worker, it honours `multilevel` too. A {@link warm} start has no seed and ignores it.
+   * worker, it honours `multilevel` too. A {@link warm} start has no seed and ignores it, as does a
+   * {@link nested} layout (the default with a module hierarchy, #566).
    */
   multilevel?: boolean;
   /**
@@ -469,7 +472,11 @@ export interface NetworkLayoutOptions {
    *
    * **Default `true` with a module hierarchy** (#566) on the backends that compute the layout (`"force"`,
    * `"worker"`, `"gpu"`, `"auto"`): a modular network opens as its map of modules. Pass `nested: false` for the flat
-   * layout (the module-aware force seed, N8.2). A state network keeps its own default (#182).
+   * layout (the module-aware force seed, N8.2). A state network keeps its own default (#182). The default is
+   * decided when `layout()` runs: give the hierarchy (`data(graph, { modules })` or `lod({ modules })`) first. Under
+   * it, `iterations`, `force` and `multilevel` do not apply, a `transition` does on every backend, a structure or
+   * spatial LOD tree is built on the main thread (a worker streams positions only), and a node drag reheats on the
+   * main thread (below).
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }` (or
@@ -2915,11 +2922,12 @@ export class Network extends BaseEngine {
     const sg = this.stateData;
     // A state network's layouts default to the main-thread force (#182), as they always have. Any other network
     // with a module hierarchy lays out as its map of modules by default (#566): nested, unless `nested` is given.
-    const opts: NetworkLayoutOptions = sg
-      ? (input.backend === undefined ? { ...input, backend: "force" } : input)
-      : input.nested === undefined && computesLayout(input.backend) && this.moduleSource()
-        ? { ...input, nested: true }
-        : input;
+    let opts: NetworkLayoutOptions = input;
+    if (sg) {
+      if (input.backend === undefined) opts = { ...input, backend: "force" };
+    } else if (input.nested === undefined && computesLayout(input.backend) && this.moduleSource()) {
+      opts = { ...input, nested: true };
+    }
     // The graph the layout places: the active view's, except the both view, which draws the physical layout.
     const graph = sg && this.activeView === "both" ? sg.physical : this.graph;
     if (sg && graph && opts.backend === "positions" && opts.positions && opts.positions.length !== 2 * graph.nodeCount) {

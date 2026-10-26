@@ -58,6 +58,22 @@ describe("the nested layout is the default with a module hierarchy (#566)", () =
     expect(Array.from(byDefault)).not.toEqual(Array.from(flat));
   });
 
+  it("follows a hierarchy given through lod({ modules }) too", async () => {
+    const { graph, modules } = modularGraph();
+    const run = async (opts: NetworkLayoutOptions): Promise<number[]> => {
+      const el = host();
+      const net = network(el, { width: 300, height: 300, backend: "canvas" });
+      await net.whenReady();
+      const g = graph();
+      net.data(g).lod({ modules }).layout(opts);
+      const out = Array.from(g.positions);
+      net.destroy();
+      el.remove();
+      return out;
+    };
+    expect(await run({ backend: "force", iterations: 60 })).toEqual(await run({ backend: "force", iterations: 60, nested: true }));
+  });
+
   it("is flat without a hierarchy, and leaves caller-supplied positions alone", async () => {
     const plain = await laidOut({ backend: "force", iterations: 60 }, false);
     const plainFlat = await laidOut({ backend: "force", iterations: 60, nested: false }, false);
