@@ -43,6 +43,11 @@ new one, titled by the rule and citing the issue). Put a rule here only if most 
 - **Unified rendering.** Before changing the rendering path, work out how to do it the same way on
   WebGL, Canvas and SVG with shared code, as long as that is as efficient as a backend-specific
   alternative. When you touch backend-specific code, check whether the other backends need the change too.
+  Equivalence holds within a backend too: what a backend shows on screen is exactly what its
+  `toPNG()`/`toSVG()` export contains (same resolution, antialiasing, colours and labels), produced from
+  the same draw, not an export-only render path or ad hoc styling. Anything drawn outside the canvas
+  (the WebGL label overlay) must look like what Canvas, SVG and the exports draw, from the same options.
+  Check quality at devicePixelRatio 1 (non-retina) as well as 2.
 - **d3 compatibility.** Design for d3 familiarity: keep d3's low-level flexibility and offer an API that
   keeps example code simple. Accept `d3-shape` generators, `d3-geo` projections, `d3-hierarchy` layouts,
   `d3-scale` scales and the like.
