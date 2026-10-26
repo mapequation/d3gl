@@ -497,10 +497,12 @@ The engine owns the hierarchy, not the LOD options, so every module feature read
 - the **LOD cut** draws it by default; `lod({ source: "structure" })` coarsens the graph structurally
   instead, `lod({ source: "spatial" })` groups by position, and `lod(false)` draws every node — all keep
   the hierarchy, so switching back reuses the tree it built (once) rather than rebuilding it;
-- **`layout({ nested: true })`** lays the module tree out top-down, each module's children inside its
-  own disc — with LOD on or off ([re-clustering](#re-clustering-warm-re-layout-and-transitions) re-lays
-  it out *warm*, from the current positions);
-- the **module-aware GPU seed** (`layout({ backend: "gpu" })`) seeds over the modules;
+- **the layout is nested by default**: `layout({ backend })` on `"force"`, `"worker"`, `"gpu"` or `"auto"`
+  lays the module tree out top-down, each module's children inside its own disc — with LOD on or off
+  ([re-clustering](#re-clustering-warm-re-layout-and-transitions) re-lays it out *warm*, from the current
+  positions). `"positions"` keeps the coordinates you pass;
+- the **module-aware GPU seed** (`layout({ backend: "gpu", nested: false })`) lays it out flat, seeded over
+  the modules;
 - every **pick** reports the target's Infomap `path` (`hit.datum.path`): a module's path for an
   aggregate, the node's own path for a leaf, LOD on or off.
 
@@ -695,8 +697,10 @@ Flow then drives every channel: node **radius** ∝ visit rate, the **ring** ∝
 and the **half-arrow** width + colour ∝ link flow — so a reciprocal pair's two arrows carry genuinely
 different weight. The **Nodes** slider resizes the generated network (500 → 20,000).
 
-The layout is the **module-aware GPU seed**: the module hierarchy is supplied with the graph,
-`data(graph, { modules })`, so `layout({ backend: "gpu" })` seeds the WebGL2 Barnes-Hut solve
+The map opens on the **nested** module layout: with the module hierarchy supplied with the graph,
+`data(graph, { modules })`, a layout is nested by default (described below). The
+**Layout** control switches to the flat **Force** layout, the **module-aware GPU seed**:
+`layout({ backend: "gpu", nested: false })` seeds the WebGL2 Barnes-Hut solve
 **top-down over the module tree** in every LOD mode — modules (including the ragged, deeper-nested
 super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (the nodes'
 bounding box → the view), so the map opens framed and settles in place rather than piling at the
@@ -711,7 +715,7 @@ while it streams it is framed on a box the worker knows it will end inside — t
 depth's placed discs — and the camera only zooms in as depths land, ending on the nodes' own box like
 any other layout.
 
-The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
+The **nested** module layout (`layout({ nested })`, the default for a graph with a module hierarchy) lays each module's
 children are laid out inside its own disc, arranged by their sibling links, so every module stays a
 compact region of its parent. The example runs it on the GPU (`backend: "gpu"`): every module at every
 depth is solved at once — one batched solve over the whole tree, not one per module — and a fresh map
@@ -831,8 +835,9 @@ solves:
 
 ```ts
 // Nested map → force layout: the force solve starts from the map on screen.
-net.layout({ backend: "gpu", warm: true, fit: true });
-// Force layout → nested map: the map streams from the force layout on screen.
+net.layout({ backend: "gpu", nested: false, warm: true, fit: true });
+// Force layout → nested map: the map streams from the force layout on screen (nested is the default
+// with a module hierarchy; `nested: true` says so).
 net.layout({ backend: "gpu", nested: true, warm: true, fit: true });
 ```
 

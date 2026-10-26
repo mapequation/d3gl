@@ -467,6 +467,10 @@ export interface NetworkLayoutOptions {
    * `"force"`. `"auto"` runs the same GPU solve wherever `"gpu"` would, and the worker elsewhere without a
    * warning (#375). Ignored without a hierarchy.
    *
+   * **Default `true` with a module hierarchy** (#566) on the backends that compute the layout (`"force"`,
+   * `"worker"`, `"gpu"`, `"auto"`): a modular network opens as its map of modules. Pass `nested: false` for the flat
+   * layout (the module-aware force seed, N8.2). A state network keeps its own default (#182).
+   *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }` (or
    * {@link warm}) re-lays the map out from the current positions — for a re-clustering (#328), or a switch
@@ -1101,6 +1105,13 @@ const FOLLOW_FRAME_MS = 50;
 function layoutClass(backend: NetworkLayoutOptions["backend"]): "positions" | "force" | "streaming" | null {
   if (backend === "worker" || requestsGpu(backend)) return "streaming";
   return backend ?? null;
+}
+
+/** Whether `backend` computes the layout (`"force"`, `"worker"`, `"gpu"`, `"auto"`), rather than taking the caller's
+ *  `"positions"` or none: those lay a module hierarchy out nested by default (#566). */
+function computesLayout(backend: NetworkLayoutOptions["backend"]): boolean {
+  const c = layoutClass(backend);
+  return c === "force" || c === "streaming";
 }
 
 /**
@@ -2902,8 +2913,13 @@ export class Network extends BaseEngine {
   /** {@link layout} without remembering `opts` in state-network mode: a view laid out on show runs this (#495). */
   private runLayout(input: NetworkLayoutOptions): this {
     const sg = this.stateData;
-    // A state network's layouts default to the main-thread force (#182), as they always have.
-    const opts: NetworkLayoutOptions = sg && input.backend === undefined ? { ...input, backend: "force" } : input;
+    // A state network's layouts default to the main-thread force (#182), as they always have. Any other network
+    // with a module hierarchy lays out as its map of modules by default (#566): nested, unless `nested` is given.
+    const opts: NetworkLayoutOptions = sg
+      ? (input.backend === undefined ? { ...input, backend: "force" } : input)
+      : input.nested === undefined && computesLayout(input.backend) && this.moduleSource()
+        ? { ...input, nested: true }
+        : input;
     // The graph the layout places: the active view's, except the both view, which draws the physical layout.
     const graph = sg && this.activeView === "both" ? sg.physical : this.graph;
     if (sg && graph && opts.backend === "positions" && opts.positions && opts.positions.length !== 2 * graph.nodeCount) {
