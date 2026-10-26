@@ -203,6 +203,14 @@ describe("plot().labels() — setBackend() routes the labels to the new backend 
     chart.setBackend("canvas");
     await chart.whenReady();
     expect(labelEls(h).length).toBe(0);
+    // The labels are in the Canvas frame itself, drawn by the swap's first render: "Alpha" runs right
+    // of its anchor (40, 40) + offset (6, 0), and the plot draws nothing else.
+    const canvas = h.querySelector("canvas")!;
+    const s = canvas.width / 240;
+    const { data } = canvas.getContext("2d")!.getImageData(46 * s, 32 * s, 40 * s, 16 * s);
+    let ink = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i]! > 128) ink++;
+    expect(ink).toBeGreaterThan(20);
     expect((chart.toSVG().match(/<text/g) ?? []).length).toBe(4);
     chart.destroy();
     h.remove();

@@ -25,6 +25,7 @@ This file holds only what every task needs. Read more when the task calls for it
 | `network/gpu/**` (the GPU layout) | every `GPU …` section |
 | browser tests that mock modules or spawn workers | Test infrastructure |
 | perf guards | Perf-guard coverage map |
+| labels: the overlay, native text, `TextData` (`labels/`, `paintTexts`, `serializeTexts`) | Labels: the overlay and native text share one style and one box |
 
 When you learn something that will bite again in one area, add it to that area's `LOG.md` section (or a
 new one, titled by the rule and citing the issue). Put a rule here only if most tasks need it.

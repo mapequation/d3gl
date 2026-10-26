@@ -1105,3 +1105,27 @@ with the radii does the same for free.
 `crossFade` 0.2, before and after #468); and a footprint threshold small for its glyphs (#512's 4-node graph)
 opens modules into children that overlap at any spacing.
 
+
+## Labels: the overlay and native text share one style and one box (#571, #577, #580)
+
+**Rule.** On WebGL, labels are HTML elements in an overlay (`LabelLayer`), and every WebGL export draws them again
+with Canvas `paintTexts`; the overlay is never rasterized into an export. Canvas and SVG draw native text
+(`paintTexts`, `serializeTexts`). So every property the overlay shows must reach `TextData` from the same resolved
+options, or the WebGL screen differs from its own export as well as from the other backends. `resolveLabelText` gives
+the font, colour and halo; the box gives the position, anchor and rotation (`labelTextY`, `labelTextAnchor`,
+`labelTextRotation`, all derived from `writeExtents`, the same description `labelGeometry` culls with). Before #580,
+`TextData` had no rotation and native text ignored the upright flip, so oriented labels were flat and mis-anchored
+everywhere but the WebGL screen.
+
+**Measured browser facts** (Chromium, Oct 2026):
+- Chromium ignores `stroke-linejoin` on HTML text: a `-webkit-text-stroke` halo always has miter joins, and matches
+  Canvas `lineJoin = "miter"` with `miterLimit = 4` (mean difference 0.0001); Canvas and SVG with round joins
+  differ from it by about 0.001, visible at V, W and A. SVG `<text>` does honour `stroke-linejoin`.
+- Canvas ignores `lineWidth = 0` and keeps the previous width, so a 0-width halo must skip `strokeText` (#571).
+- Rotated text is far slower to paint than flat text, on every backend: each distinct angle rasterizes its own
+  glyphs. 2,000 labels at random angles took 311 ms to fill (1,092 ms with the halo) against 13 ms flat (18 ms) on
+  an M1 Max Canvas, and the overlay paid the same in headless Chromium (about 125 ms per 1,000 rotated labels,
+  HTML or SVG, against 10 ms flat). Rounding angles to whole degrees only cut it 2.5–3×.
+- An SVG overlay costs more than the HTML one per frame: moving N `<text>` elements took 3–5× the style + layout
+  of N positioned `<div>`s (M1 Max: 3.2 vs 1.3 ms at 1k labels, 25 vs 7 ms at 5k, 125 vs 34 ms at 20k), and
+  moving them by `transform` instead of `x`/`y` was slower still. Paint was the same.

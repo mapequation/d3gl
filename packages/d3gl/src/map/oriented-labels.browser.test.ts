@@ -4,7 +4,7 @@ import { plot } from "./plot.js";
 
 // #580: an oriented data label (`rotationOf`) is drawn at the same place and angle on every backend. WebGL
 // draws it in the HTML overlay (a CSS rotate), Canvas with `ctx.rotate` and SVG with a `rotate()` transform,
-// all from the one box the culler placed. Both screens are captured in ONE screenshot and their text ink is
+// all from the one box the culler placed. The three screens are captured in ONE screenshot and their text ink is
 // compared by its centroid and principal axis, which pins position and angle without depending on how two
 // text rasterizers antialias.
 
@@ -22,10 +22,10 @@ const CASES: Case[] = [
 ];
 
 beforeAll(async () => {
-  await page.viewport(2 * W + 40, H + 40);
+  await page.viewport(3 * W + 40, H + 40);
 });
 
-async function chart(host: HTMLElement, backend: "webgl" | "canvas", c: Case) {
+async function chart(host: HTMLElement, backend: "webgl" | "canvas" | "svg", c: Case) {
   const p = plot(host, { width: W, height: H, backend });
   await p.whenReady();
   p.labels([{ x: W / 2, y: H / 2 }], {
@@ -60,33 +60,39 @@ function axisDelta(a: number, b: number): number {
   return Math.min(d, Math.PI - d);
 }
 
-describe("oriented data labels draw the same on WebGL and Canvas (#580)", () => {
+describe("oriented data labels draw the same on WebGL, Canvas and SVG (#580)", () => {
   for (const c of CASES) {
     it(c.name, async () => {
       const row = document.createElement("div");
-      row.style.cssText = `display:flex;width:${2 * W}px;height:${H}px;background:#fff`;
+      row.style.cssText = `display:flex;width:${3 * W}px;height:${H}px;background:#fff`;
       const gl = document.createElement("div");
       const cv = document.createElement("div");
-      for (const h of [gl, cv]) { h.style.cssText = `position:relative;flex:none;width:${W}px;height:${H}px;overflow:hidden`; row.appendChild(h); }
+      const sv = document.createElement("div");
+      for (const h of [gl, cv, sv]) { h.style.cssText = `position:relative;flex:none;width:${W}px;height:${H}px;overflow:hidden`; row.appendChild(h); }
       document.body.appendChild(row);
       const a = await chart(gl, "webgl", c);
       const b = await chart(cv, "canvas", c);
+      const d = await chart(sv, "svg", c);
 
       const base64 = await page.screenshot({ element: row, save: false });
       const bitmap = await createImageBitmap(await (await fetch(`data:image/png;base64,${base64}`)).blob());
-      expect([bitmap.width, bitmap.height]).toEqual([2 * W, H]); // captured 1:1, not rescaled
+      expect([bitmap.width, bitmap.height]).toEqual([3 * W, H]); // captured 1:1, not rescaled
       const ctx = new OffscreenCanvas(bitmap.width, bitmap.height).getContext("2d")!;
       ctx.drawImage(bitmap, 0, 0);
       const onGL = inkMoments(ctx.getImageData(0, 0, W, H).data);
       const onCanvas = inkMoments(ctx.getImageData(W, 0, W, H).data);
+      const onSVG = inkMoments(ctx.getImageData(2 * W, 0, W, H).data);
 
       // The expected axis: the rendered rotation is the given one, or π more when flipped (the same axis).
       expect(axisDelta(onGL.angle, c.rotation)).toBeLessThan((2 * Math.PI) / 180);
       expect(axisDelta(onCanvas.angle, onGL.angle)).toBeLessThan((2 * Math.PI) / 180);
       expect(Math.hypot(onCanvas.cx - onGL.cx, onCanvas.cy - onGL.cy)).toBeLessThan(1.5);
+      expect(axisDelta(onSVG.angle, onGL.angle)).toBeLessThan((2 * Math.PI) / 180);
+      expect(Math.hypot(onSVG.cx - onGL.cx, onSVG.cy - onGL.cy)).toBeLessThan(1.5);
 
       a.destroy();
       b.destroy();
+      d.destroy();
       row.remove();
     });
   }
