@@ -214,7 +214,7 @@ beforeAll(async () => {
 
     /** Start a worker stream with the fit on or off, on the idle transport (see the header). */
     const startStream = (fit: boolean): void => {
-      net.layout({ backend: "worker", fit, multilevel: false });
+      net.layout({ backend: "worker", nested: false, fit, multilevel: false }); // the flat stream (nested by default, #566)
       flush();
     };
     /** One streamed layout frame: the transport's position copy, then the coalesced repaint. */

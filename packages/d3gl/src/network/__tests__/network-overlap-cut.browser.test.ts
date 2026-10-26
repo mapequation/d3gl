@@ -156,7 +156,7 @@ describe("LOD aggregates only where glyphs would overlap (#426)", () => {
         const g = ring(n);
         const modules: ModuleNode[] = Array.from({ length: n }, (_, i) => ({ id: i, path: [Math.floor(i / 40) + 1, (i % 40) + 1] }));
         const lod: NetworkLODOptions = kind === "structure" ? { source: "structure", maxAggregateRadius: 18 } : { maxAggregateRadius: 18 };
-        net.data(g, kind === "modules" ? { modules } : undefined).style({ sizeMode: "screen", nodeRadius: 3 }).lod(lod).layout({ backend: "force", iterations: 30 });
+        net.data(g, kind === "modules" ? { modules } : undefined).style({ sizeMode: "screen", nodeRadius: 3 }).lod(lod).layout({ backend: "force", nested: false, iterations: 30 }); // a flat force drag (nested by default, #566)
         expect(net.lodSource).toBe(kind === "structure" ? "main" : "modules"); // a main-thread tree of this kind
         net.setTransform({ k: 1, x: SIZE / 2 - (g.positions[0] ?? 0), y: SIZE / 2 - (g.positions[1] ?? 0) });
         net.interactive({ draggable: true });

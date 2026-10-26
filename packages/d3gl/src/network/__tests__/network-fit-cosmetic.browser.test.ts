@@ -48,7 +48,7 @@ describe("fit + cosmetic restyle", () => {
     net.data(graph);
     net.lod({ modules });
     net.style({ nodeRadius: 5 });
-    net.layout({ backend: "gpu", fit: true, iterations: 150 });
+    net.layout({ backend: "gpu", nested: false, fit: true, iterations: 150 }); // the flat GPU fit (nested by default, #566)
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
 
@@ -67,7 +67,7 @@ describe("fit + cosmetic restyle", () => {
     const next = moduleGraph(0x9999);
     net.data(next.graph);
     net.lod({ modules: next.modules });
-    net.layout({ backend: "gpu", fit: true, iterations: 150 });
+    net.layout({ backend: "gpu", nested: false, fit: true, iterations: 150 }); // the flat GPU fit (nested by default, #566)
     await net.whenSettled();
     const reframed = tf(net);
     const moved = Math.abs(reframed.k - framed.k) > 1e-4 || Math.abs(reframed.x - framed.x) > 0.5 || Math.abs(reframed.y - framed.y) > 0.5;

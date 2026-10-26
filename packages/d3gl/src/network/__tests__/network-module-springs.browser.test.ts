@@ -1,6 +1,6 @@
 /**
  * Module links as springs in the engine's flat force layouts (#455), end to end: `data(graph, { modules,
- * moduleLinks })` reaches every flat backend's solver.
+ * moduleLinks })` reaches every flat backend's solver. (Flat: `nested: false`, as a module hierarchy lays out nested by default, #566.)
  *
  * - `force`: a real pointer drag of a selected module (one tick per animation frame, as the drag loop runs)
  *   pulls the module linked to it and not the unlinked ones; without module links nothing follows it.
@@ -53,7 +53,7 @@ async function forceDrag(links: ModuleLink[] | undefined): Promise<{ followed2: 
   const net: Network = network(h, { width: SIZE, height: SIZE });
   await net.whenReady();
   net.data(f.graph, { modules: f.records, ...(links ? { moduleLinks: links } : {}) }).style({ nodeRadius: 6 });
-  net.layout({ backend: "force", iterations: 300 });
+  net.layout({ nested: false, backend: "force", iterations: 300 });
   const p = f.graph.positions;
   const all = Array.from({ length: f.graph.nodeCount }, (_, i) => i);
   const [x0, y0] = centroid(p, all);
@@ -105,7 +105,7 @@ describe("network flat layouts pull along module links (#455)", () => {
       const f = fixture();
       const net = network(host(), { width: SIZE, height: SIZE });
       await net.whenReady();
-      net.data(f.graph, withModules ? { modules: f.records } : {}).layout({ backend: "force", iterations: 120 });
+      net.data(f.graph, withModules ? { modules: f.records } : {}).layout({ nested: false, backend: "force", iterations: 120 });
       const positions = f.graph.positions.slice();
       net.destroy();
       return positions;
@@ -120,7 +120,7 @@ describe("network flat layouts pull along module links (#455)", () => {
       const f = fixture();
       const net = network(host(), { width: SIZE, height: SIZE });
       await net.whenReady();
-      net.data(f.graph, { modules: f.records, ...(links ? { moduleLinks: links } : {}) }).layout({ backend: "worker", iterations: 60 });
+      net.data(f.graph, { modules: f.records, ...(links ? { moduleLinks: links } : {}) }).layout({ nested: false, backend: "worker", iterations: 60 });
       await net.whenSettled();
       net.destroy();
     }
@@ -138,7 +138,7 @@ describe("network flat layouts pull along module links (#455)", () => {
       const f = fixture();
       const net = network(host(), { width: SIZE, height: SIZE, backend: "webgl" });
       await net.whenReady();
-      net.data(f.graph, { modules: f.records, ...(links ? { moduleLinks: links } : {}) }).layout({ backend: "gpu", iterations: 60 });
+      net.data(f.graph, { modules: f.records, ...(links ? { moduleLinks: links } : {}) }).layout({ nested: false, backend: "gpu", iterations: 60 });
       await net.whenSettled();
       expect(net.layoutTransport).toBe("gpu");
       net.destroy();
@@ -152,9 +152,9 @@ describe("network flat layouts pull along module links (#455)", () => {
     const f = fixture();
     const net = network(host(), { width: SIZE, height: SIZE });
     await net.whenReady();
-    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ backend: "force", iterations: 120 });
+    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ nested: false, backend: "force", iterations: 120 });
     const from = f.graph.positions.slice();
-    net.layout({ backend: "force", warm: true, iterations: 120 });
+    net.layout({ nested: false, backend: "force", warm: true, iterations: 120 });
     const want = { ...f.graph, positions: from.slice(), moduleSprings: springsOf(f, LINKS) };
     new ForceLayout(want).run(120, "cool");
     expect(Array.from(f.graph.positions)).toEqual(Array.from(want.positions));
@@ -168,10 +168,10 @@ describe("network flat layouts pull along module links (#455)", () => {
     const f = fixture();
     const net = network(host(), { width: SIZE, height: SIZE });
     await net.whenReady();
-    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ backend: "worker", iterations: 60 });
+    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ nested: false, backend: "worker", iterations: 60 });
     await net.whenSettled();
     const post = vi.spyOn(Worker.prototype, "postMessage"); // calls through
-    net.layout({ backend: "worker", warm: true, iterations: 60 });
+    net.layout({ nested: false, backend: "worker", warm: true, iterations: 60 });
     await net.whenSettled();
     net.destroy();
     const starts = post.mock.calls.map((call): MainToWorker => call[0]).filter((m): m is StartMessage => m.type === "start");
@@ -184,10 +184,10 @@ describe("network flat layouts pull along module links (#455)", () => {
     const f = fixture();
     const net = network(host(), { width: SIZE, height: SIZE, backend: "webgl" });
     await net.whenReady();
-    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ backend: "gpu", iterations: 60 });
+    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ nested: false, backend: "gpu", iterations: 60 });
     await net.whenSettled();
     const prepare = vi.spyOn(GpuModuleSprings.prototype, "prepare");
-    net.layout({ backend: "gpu", warm: true, iterations: 60 });
+    net.layout({ nested: false, backend: "gpu", warm: true, iterations: 60 });
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
     net.destroy();
