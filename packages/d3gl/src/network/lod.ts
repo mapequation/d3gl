@@ -1969,14 +1969,17 @@ export interface CrowdingOptions {
 export const DEFAULT_DECLUTTER_SPACING = 2;
 
 /**
- * The spacing the LOD cut, its crowding and its declutter treat glyphs at (#561): `declutterSpacing` (default
- * {@link DEFAULT_DECLUTTER_SPACING}) while declutter is on, else 1. Every glyph counts as that many times its size,
- * the expand threshold with it, so the cut at zoom `k` is the spacing-1 cut at `k / spacing` and declutter keeps
- * every glyph the cut opens wherever spacing 1 keeps them. O(1).
+ * The spacing the LOD cut and its crowding treat glyphs at (#561): `declutterSpacing` (default
+ * {@link DEFAULT_DECLUTTER_SPACING}) while declutter is on and it exceeds 1, else 1. Every glyph counts as that many
+ * times its size, the expand threshold with it, so the cut at zoom `k` is the spacing-1 cut at `k / spacing` and
+ * declutter keeps every glyph the cut opens wherever spacing 1 keeps them. Below 1 the cut stays at its own 1 and
+ * only the declutter thins less — it hides only glyphs overlapping deeper than `spacing·(rᵢ + rⱼ)` — down to
+ * nothing at 0, as `declutter: false`.
+ * O(1).
  */
 export function lodSpacing(declutter: boolean | undefined, declutterSpacing: number | undefined): number {
   const s = declutterSpacing ?? DEFAULT_DECLUTTER_SPACING;
-  return declutter === false || !(s > 0 && Number.isFinite(s)) ? 1 : s; // a spacing ≤ 0 hides nothing, as declutter: false
+  return declutter !== false && Number.isFinite(s) && s > 1 ? s : 1;
 }
 
 /**

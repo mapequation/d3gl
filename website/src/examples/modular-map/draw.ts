@@ -172,7 +172,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // Expand slider; "Auto" (0) passes no expandPx, so the cut uses the tree-adaptive default —
       // ~48px for the structural tree, a module-sized threshold for the partition.
       const expandPx = (options.expand as number) || undefined;
-      const declutter = options.declutter !== "Off";
+      // Declutter spacing (#561): a glyph is hidden within `spacing·(rᵢ + rⱼ)` of a kept one, and above 1 the cut
+      // treats glyphs as that many times their size too, so it opens nothing the declutter would hide. 0 = off.
+      const declutterSpacing = (options.declutterSpacing as number) ?? 2;
+      const declutter = declutterSpacing > 0;
       // Node-radius range top (leaf max; modules extrapolate above it via the same scale). Smaller →
       // smaller glyphs → declutter keeps more → more nodes + inter-module edges visible.
       const maxRadius = (options.maxRadius as number) ?? 21;
@@ -221,13 +224,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — ignores the partition; aggregates joined by plain super-edge lines.
-        net.lod({ source: "structure", expandPx, declutter, moduleBoundary, crossLevelEdges, crossFade });
+        net.lod({ source: "structure", expandPx, declutter, declutterSpacing, moduleBoundary, crossLevelEdges, crossFade });
       } else {
         // The planted partition (the default source) drives the cut → directed half-arrow super-edges
         // ∝ accumulated flow. No aggregate-radius cap: a module is sized by `nodeRadius` applied to its
         // members' summed flow (the scale extrapolates above the leaf domain), so a module reads as its
         // total flow.
-        net.lod({ expandPx, declutter, superEdges: true, moduleBoundary, crossLevelEdges, crossFade });
+        net.lod({ expandPx, declutter, declutterSpacing, superEdges: true, moduleBoundary, crossLevelEdges, crossFade });
       }
     },
   };

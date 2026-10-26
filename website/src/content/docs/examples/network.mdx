@@ -338,10 +338,12 @@ What it composes:
   glyph wins an overlap. A glyph is hidden when its centre lies within `declutterSpacing·(rᵢ + rⱼ)` of a
   kept glyph. The default `declutterSpacing: 2` keeps a gap around each kept glyph, so the links between
   them stay visible; `declutterSpacing: 1` hides only real overlaps, and `declutter: false` hides nothing.
-  The cut treats every glyph as `declutterSpacing` times its size too, the expand threshold with it: at
-  spacing 2 the map you see at zoom `k` is the one spacing 1 shows at `k / 2`, so declutter keeps every
+  Above 1 the cut treats every glyph as `declutterSpacing` times its size too, the expand threshold with it:
+  at spacing 2 the map you see at zoom `k` is the one spacing 1 shows at `k / 2`, so declutter keeps every
   glyph the cut opens, with its links, and only thins overlaps the cut cannot avoid — in a small graph that
-  can still be a whole module.
+  can still be a whole module. Below 1 the cut stays as at 1 and glyphs may overlap partly, less and less
+  hidden, until `declutterSpacing: 0` hides nothing, as `declutter: false`. The directed map of modules below
+  has a **Declutter spacing** slider from 0 (off) to 5.
 - **Super-edges** draw connectivity between visible nodes (a leaf↔leaf graph edge, or an
   aggregate↔aggregate coarse edge); a visible node keeps its edges even when a neighbour is
   off-screen. By default they connect *same-level* pairs (and, in a ragged module tree, a leaf to a
@@ -757,7 +759,7 @@ net.lod({
 - **Where the ring goes.** After `layout({ nested })` the ring is that module's **disc**, and it follows
   the module's members through a drag or a `transition`. After any other layout it is centred on the
   members, with their extent as its radius. The disc is also what the cut sees: after a nested layout a
-  module is culled by its disc and opens once the disc is `expandPx · declutterSpacing` across on screen, rings or not.
+  module is culled by its disc and opens once the disc is `expandPx · max(1, declutterSpacing)` across on screen, rings or not.
 - **`width`** is in the active `sizeMode`'s units, so in `screen` mode it is a constant pixel stroke
   around a ring that scales with the map. Rings fade with their members under `crossFade`, draw **above
   the links and under the nodes**, so a dense module's links never hide where it ends, and export with

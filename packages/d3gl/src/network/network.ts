@@ -635,10 +635,11 @@ export interface NetworkLODOptions {
   /**
    * Spacing multiplier for {@link declutter}: a glyph is hidden when its centre is within
    * `declutterSpacing·(rᵢ + rⱼ)` of a kept glyph. Default 2: kept glyphs keep a gap around them, so
-   * the links between them stay visible. 1 hides only real overlaps; <1 lets glyphs overlap partly. The cut
-   * treats glyphs at the same spacing, its {@link expandPx} with it (#561): the map at zoom `k` is the one
-   * spacing 1 shows at `k / declutterSpacing`, so declutter keeps every glyph the cut opens. In a small graph a
-   * whole non-overlapping module aggregate can still be hidden (#512).
+   * the links between them stay visible. 1 hides only real overlaps. Above 1 the cut treats glyphs at the same
+   * spacing, its {@link expandPx} with it (#561): the map at zoom `k` is the one spacing 1 shows at
+   * `k / declutterSpacing`, so declutter keeps every glyph the cut opens. Below 1 the cut stays as at 1 and glyphs
+   * may overlap partly, less and less, until 0 hides nothing, as `declutter: false`. In a small graph a whole
+   * non-overlapping module aggregate can still be hidden (#512).
    */
   declutterSpacing?: number;
   /**

@@ -1086,7 +1086,9 @@ spacing, default 2; 1 with `declutter: false`): the crowding measures radii × s
 also scales the horizon) and the cut's threshold is `expandPx × spacing` (`CutOptions.spacing`). Scaling *both*
 makes the cut at zoom `k` the spacing-1 cut at `k / spacing`, and declutter at that spacing the spacing-1 declutter
 there, so whatever spacing 1 keeps, every spacing keeps — at no added cost (`lod-spacing-cut.test.ts` checks the
-equivalence on every tree kind). Every caller of `cut` passes it: the engine (`computeFrontier`) and a spatial
+equivalence on every tree kind). Below 1 the cut stays at 1 (`lodSpacing` is never below 1): only the declutter
+thins less, down to nothing at 0 — continuous with `declutter: false`. Scaling the cut below 1 instead would open
+everything as the spacing approaches 0 (LOD off), then jump back at 0. Every caller of `cut` passes it: the engine (`computeFrontier`) and a spatial
 stream's row cut (`keptRows` in `lod-frame.ts`), or the rows no longer match the engine's cut.
 
 **How it broke.** #468 raised the default `declutterSpacing` to 2 while the cut still opened at overlap (spacing

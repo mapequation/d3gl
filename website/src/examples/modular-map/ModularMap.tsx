@@ -30,7 +30,8 @@ export default function ModularMap() {
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"] },
         // Fill by module (categorical) or by flow (`nodeFill: { by: "flow", scale }`, #445).
         { type: "segmented", key: "fill", label: "Fill", options: ["Module", "Flow"], value: "Module" },
-        { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
+        // Declutter spacing (#561): 0 = off, 1 = only overlaps, 2 = the default gap; the cut follows it above 1.
+        { type: "range", key: "declutterSpacing", label: "Declutter spacing", min: 0, max: 5, step: 0.1, value: 2, display: ["Off"] },
         // 0 = "Auto": no expandPx at all, i.e. the library's tree-adaptive default (#191).
         { type: "range", key: "expand", label: "Expand", min: 0, max: 500, step: 8, value: 0, display: ["Auto"] },
         { type: "range", key: "maxRadius", label: "Max radius", min: 12, max: 40, step: 1, value: 18 },

@@ -46,11 +46,25 @@ function frontierAt(tree: LODTree, t: LODTransform, spacing: number, w = W, h = 
 }
 
 describe("the LOD cut at the declutter spacing (#561)", () => {
-  it("the default spacing is the declutter's, and 1 without declutter", () => {
+  it("the default spacing is the declutter's, and 1 without declutter or below 1", () => {
     expect(lodSpacing(undefined, undefined)).toBe(2);
     expect(lodSpacing(true, 3)).toBe(3);
     expect(lodSpacing(false, 3)).toBe(1);
-    expect(lodSpacing(undefined, 0)).toBe(1); // a spacing ≤ 0 hides nothing
+    expect(lodSpacing(undefined, 0.5)).toBe(1); // below 1 the cut stays at 1: only the declutter thins less
+    expect(lodSpacing(undefined, 0)).toBe(1);
+    expect(lodSpacing(undefined, Infinity)).toBe(1);
+  });
+
+  it("below spacing 1 the cut stays as at 1: where 1 thins nothing neither does any spacing below it, and 0 hides nothing", () => {
+    const tree = gasketTree(1); // the cut and its crowding at lodSpacing(_, s < 1) = 1
+    for (const k of [0.3, 0.54, 0.8, 1.3, 1.9]) {
+      const t = { k, x: W / 2 - 500 * k, y: H / 2 - 433 * k };
+      const drawn = cut(tree, t, W, H, { expandPx: EXPAND_PX, spacing: 1, screenSized: true, maxAggregateRadius: MAX_AGG }).slice();
+      const keptAt = (spacing: number): Set<number> => new Set(declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k, maxAggregateRadius: MAX_AGG, spacing }));
+      const one = keptAt(1);
+      for (const s of [0.9, 0.5, 0.1]) for (const g of one) expect(keptAt(s).has(g), `k = ${k}, spacing ${s} keeps what 1 keeps`).toBe(true);
+      expect(keptAt(0).size, `k = ${k}: spacing 0 hides nothing`).toBe(drawn.length);
+    }
   });
 
   it("never thins the example's gasket, at any zoom of its range, centred or panned, at the default spacing and others", () => {
