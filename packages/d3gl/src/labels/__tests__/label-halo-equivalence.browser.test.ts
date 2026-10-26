@@ -112,8 +112,8 @@ describe("label halo equivalence (#571)", () => {
   });
 
   it("is not vacuous: the old text-shadow glow does not pass as the width-1 stroke", async () => {
-    const glow = { ...resolveLabelStyle(undefined, undefined, undefined), textShadow: "0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff" };
-    const { mass, diff } = await compare(glow, DEFAULT_LABEL_TEXT.halo);
+    const glow = { ...resolveLabelStyle(undefined, undefined, null), textShadow: "0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff" };
+    const { diff } = await compare(glow, DEFAULT_LABEL_TEXT.halo);
     expect(diff).toBeGreaterThanOrEqual(MAX_DIFF);
   });
 });

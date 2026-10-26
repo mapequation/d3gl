@@ -1736,7 +1736,7 @@ export abstract class BaseEngine {
       this.host.style.position = "relative";
     }
     this.labelLayer?.destroy();
-    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style, text.halo));
+    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style, text.halo ?? null));
     this.labelText = text;
   }
 

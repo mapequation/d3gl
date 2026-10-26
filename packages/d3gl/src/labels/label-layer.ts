@@ -110,21 +110,22 @@ export const DEFAULT_LABEL_STYLE: LabelStyle = {
 /**
  * The overlay CSS for a {@link LabelHalo} (#571): a text stroke twice the halo width, painted under
  * the fill (`paint-order`), so it reaches `width` px beyond the glyphs with round joins — as the
- * Canvas/SVG stroke does. Empty for no halo or width 0.
+ * Canvas/SVG stroke does. Empty for no halo (`null`/`undefined`) or width 0.
  */
-export function haloStyle(halo: LabelHalo | undefined): LabelStyle {
+export function haloStyle(halo: LabelHalo | null | undefined): LabelStyle {
   if (!halo || halo.width <= 0) return {};
   return { webkitTextStroke: `${halo.width * 2}px ${halo.color}`, paintOrder: "stroke", strokeLinejoin: "round" };
 }
 
 /**
  * The engine-label styling policy (#224): {@link DEFAULT_LABEL_STYLE}, then the `halo`'s stroke
- * ({@link haloStyle}), then a caller's inline {@link LabelStyle} — a partial override keeps the rest —
+ * ({@link haloStyle}; the default white halo when omitted, `null` for none), then a caller's inline
+ * {@link LabelStyle} — a partial override keeps the rest —
  * but when a `className` is given, return only the explicit `style` (possibly undefined): the class's
  * CSS keeps full control, since an inline default would beat it. Shared so other engines lift the
  * exact same policy (#223); pass the result as {@link LabelLayer}'s `style`.
  */
-export function resolveLabelStyle(className: string | undefined, style: LabelStyle | undefined, halo?: LabelHalo): LabelStyle | undefined {
+export function resolveLabelStyle(className: string | undefined, style: LabelStyle | undefined, halo: LabelHalo | null = DEFAULT_LABEL_TEXT.halo): LabelStyle | undefined {
   return className ? style : { ...DEFAULT_LABEL_STYLE, ...haloStyle(halo), ...style };
 }
 

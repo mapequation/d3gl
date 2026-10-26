@@ -4,12 +4,12 @@ import { resolveLabelStyle, resolveLabelHalo, haloStyle, DEFAULT_LABEL_STYLE, DE
 // The engine-label styling policy (#224): what net.labels() (and, later, the other engines — #223)
 // passes to LabelLayer. The raw LabelLayer itself applies the result verbatim.
 describe("resolveLabelStyle (#224)", () => {
-  it("defaults to DEFAULT_LABEL_STYLE when neither className nor style is given", () => {
-    expect(resolveLabelStyle(undefined, undefined)).toEqual(DEFAULT_LABEL_STYLE);
+  it("defaults to DEFAULT_LABEL_STYLE and the default halo when neither className nor style is given", () => {
+    expect(resolveLabelStyle(undefined, undefined)).toEqual({ ...DEFAULT_LABEL_STYLE, ...haloStyle(DEFAULT_LABEL_TEXT.halo) });
   });
 
   it("merges a partial style over the defaults (the override wins, the rest is kept)", () => {
-    expect(resolveLabelStyle(undefined, { color: "#1f2937" })).toEqual({ ...DEFAULT_LABEL_STYLE, color: "#1f2937" });
+    expect(resolveLabelStyle(undefined, { color: "#1f2937" }, null)).toEqual({ ...DEFAULT_LABEL_STYLE, color: "#1f2937" });
   });
 
   it("className alone skips the defaults so the class's CSS keeps full control", () => {
@@ -37,6 +37,7 @@ describe("label halo (#571)", () => {
   it("draws no halo at width 0 or without one", () => {
     expect(haloStyle({ color: "#fff", width: 0 })).toEqual({});
     expect(haloStyle(undefined)).toEqual({});
+    expect(resolveLabelStyle(undefined, undefined, null)).toEqual(DEFAULT_LABEL_STYLE);
   });
 
   it("adds the halo's stroke to the default overlay look, under the caller's style", () => {
