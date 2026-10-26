@@ -110,7 +110,7 @@ jobs:
   perf-browser-shard:
     name: perf-browser / ${{ matrix.shard }}
     needs: perf-browser-plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Playwright 1.60 cannot install Chromium on ubuntu-26.04 (#567)
     timeout-minutes: 30
     strategy:
       # Every shard runs to the end, so one red shard doesn't hide another's result.
@@ -158,7 +158,7 @@ jobs:
     name: perf-browser / ${{ matrix.shard }}
     needs: [perf-browser-plan, perf-browser-shard]
     if: ${{ !cancelled() && needs.perf-browser-plan.result == 'success' && needs.perf-browser-plan.outputs.solo != '[]' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # Playwright 1.60 cannot install Chromium on ubuntu-26.04 (#567)
     timeout-minutes: 30
     strategy:
       fail-fast: false
