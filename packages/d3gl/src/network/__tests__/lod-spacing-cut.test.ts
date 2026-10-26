@@ -125,8 +125,9 @@ describe("the LOD cut at the declutter spacing (#561)", () => {
           computeLODGeometry(tree, graph, radii, graph.strength);
           computeLODCrowding(tree, crowdingOptionsOf(tree, { screenSized: true, expandPx: 48, spacing: s }));
         }
-        // A view far larger than the layout, so neither cut culls (a glyph's cull margin is its drawn size).
-        const big = 1e5;
+        // A view larger than the layout at every zoom below (≈ 1,060 world units, ≤ 3,900 px at k = 3.7), so neither
+        // cut culls (a glyph's cull margin is its drawn size) — and small enough for the declutter's screen grid.
+        const big = 6000;
         for (const k of [0.02, 0.05, 0.13, 0.4, 1.1, 3.7]) {
           const at = (z: number): LODTransform => ({ k: z, x: big / 2 - 400 * z, y: big / 2 - 400 * z });
           const cutAt = (tree: LODTree, z: number, s: number) => cut(tree, at(z), big, big, { expandPx: 48, spacing: s, screenSized: true, maxAggregateRadius: 20 }).slice();
