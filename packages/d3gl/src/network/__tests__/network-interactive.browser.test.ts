@@ -50,6 +50,39 @@ describe("network interactive lane (#105 N7c-2)", () => {
     net.destroy();
   });
 
+  it("on(event, null) removes the callback (#558)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 8 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: { multi: true } });
+
+    const calls = { hover: 0, click: 0, select: 0 };
+    net.on("hover", () => calls.hover++).on("click", () => calls.click++).on("select", () => calls.select++);
+    const { left, top } = h.getBoundingClientRect();
+    const tap = (x: number, y: number) => {
+      const init = { clientX: left + x, clientY: top + y, bubbles: true, pointerId: 1 };
+      h.dispatchEvent(new PointerEvent("pointermove", init));
+      h.dispatchEvent(new PointerEvent("pointerdown", init));
+      h.dispatchEvent(new PointerEvent("pointerup", init));
+    };
+
+    tap(10, 10); // node 0: every callback is live before it is removed
+    expect(calls.hover).toBeGreaterThan(0);
+    expect(calls.click).toBe(1);
+    expect(calls.select).toBe(1);
+
+    net.on("hover", null).on("click", null).on("select", null);
+    const before = { ...calls };
+    tap(90, 90); // node 1: selection still changes, but nobody is called
+    net.select("nodes", [2]);
+    expect(net.selection().map((s) => s.id)).toEqual([2]);
+    expect(calls).toEqual(before);
+    net.destroy();
+    h.remove();
+  });
+
   it("pick resolves a node hit carrying members()", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

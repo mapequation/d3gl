@@ -2126,14 +2126,17 @@ export abstract class BaseEngine {
     sel.call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
     this.suppressZoomEmit = false;
   }
-  on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this;
-  on(event: "select", cb: (selected: HoverHit[], ev?: PointerEvent) => void): this;
-  on(event: "hover" | "click" | "select", cb: ((hit: HoverHit | null, ev: PointerEvent) => void) | ((selected: HoverHit[], ev?: PointerEvent) => void)): this {
+  on(event: "hover" | "click", cb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null): this;
+  on(event: "select", cb: ((selected: HoverHit[], ev?: PointerEvent) => void) | null): this;
+  on(event: "hover" | "click" | "select", cb: ((hit: HoverHit | null, ev: PointerEvent) => void) | ((selected: HoverHit[], ev?: PointerEvent) => void) | null): this {
+    // `on(event, null)` removes the callback, as in d3. The host pointer listeners stay: selection,
+    // drag, tooltips and hover specs share them, and their handlers skip the pick without a consumer.
     if (event === "hover") {
-      this.hoverCb = cb as (hit: HoverHit | null, ev: PointerEvent) => void;
-      this.attachPointer();
+      this.hoverCb = cb as ((hit: HoverHit | null, ev: PointerEvent) => void) | null;
+      if (cb) this.attachPointer();
     } else if (event === "click") {
-      this.clickCb = cb as (hit: HoverHit | null, ev: PointerEvent) => void;
+      this.clickCb = cb as ((hit: HoverHit | null, ev: PointerEvent) => void) | null;
+      if (!cb) return this;
       // Re-calling on("click") swaps the callback; the addEventListener calls below are
       // no-ops when the same handler refs are already registered — intentional.
       this.host.addEventListener("pointerdown", this.onPointerDown);
@@ -2142,7 +2145,7 @@ export abstract class BaseEngine {
     } else if (event === "select") {
       // Pure observer — registering on("select") does NOT attach gesture listeners.
       // Gesture attachment happens in registerLayer when a layer has `selectable` set.
-      this.selectCb = cb as (selected: HoverHit[], ev?: PointerEvent) => void;
+      this.selectCb = cb as ((selected: HoverHit[], ev?: PointerEvent) => void) | null;
     }
     return this;
   }

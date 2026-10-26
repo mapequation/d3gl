@@ -66,7 +66,7 @@ function findAggregate(net: Network, host: HTMLDivElement): HoverHit | null {
       host.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + x, clientY: rect.top + y, bubbles: true, pointerId: 1 }));
     }
   }
-  net.on("hover", () => {}); // stop collecting: `on()` has no way to remove a callback
+  net.on("hover", null); // stop collecting
   return found;
 }
 
