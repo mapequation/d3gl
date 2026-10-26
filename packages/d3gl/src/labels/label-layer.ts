@@ -121,15 +121,16 @@ export const DEFAULT_LABEL_TEXT: { font: string; color: string; halo: LabelHalo 
  * (the low-level primitive keeps today's inherit-from-container behaviour).
  */
 export const DEFAULT_LABEL_STYLE: LabelStyle = {
-  font: "600 11px/1 system-ui, sans-serif",
-  color: "#111827",
+  font: overlayFont(DEFAULT_LABEL_TEXT.font),
+  color: DEFAULT_LABEL_TEXT.color,
 };
 
 /** The overlay form of a label font: line-height 1 (`11px` → `11px/1`), so the element's box is the
- *  measured label box and its text sits where Canvas/SVG centre theirs. A font that names its own
- *  line-height keeps it. Px font sizes only, as {@link canvasFont}. */
+ *  measured label box and its text sits where Canvas/SVG centre theirs. A line-height in the font is
+ *  replaced (native text has none); set `style.lineHeight` to change the overlay's. Px font sizes
+ *  only, as {@link canvasFont}. */
 export function overlayFont(font: string): string {
-  return /\d(?:\.\d+)?px\//.test(font) ? font : font.replace(/(\d+(?:\.\d+)?px)/, "$1/1");
+  return canvasFont(font).replace(/(\d+(?:\.\d+)?px)/, "$1/1");
 }
 
 /**

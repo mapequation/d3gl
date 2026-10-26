@@ -80,9 +80,16 @@ describe("label text (#577)", () => {
     expect(keys.indexOf("lineHeight")).toBeGreaterThan(keys.indexOf("font"));
   });
 
-  it("overlayFont sets line-height 1 unless the font names one", () => {
+  it("overlayFont sets line-height 1, replacing any the font names", () => {
     expect(overlayFont("600 11px system-ui, sans-serif")).toBe("600 11px/1 system-ui, sans-serif");
     expect(overlayFont("12.5px serif")).toBe("12.5px/1 serif");
-    expect(overlayFont("14px/1.2 serif")).toBe("14px/1.2 serif");
+    expect(overlayFont("14px/1.2 serif")).toBe("14px/1 serif");
+    expect(overlayFont("600 11px / 1 system-ui")).toBe("600 11px/1 system-ui"); // the browser's own serialization
+    expect(overlayFont("12px/normal Arial")).toBe("12px/1 Arial");
+  });
+
+  it("canvasFont strips a line-height with or without spaces around the slash", () => {
+    expect(resolveLabelText({ style: { font: "12px / 1.2 serif" } }).font).toBe("12px serif");
+    expect(resolveLabelText({ font: "bold 12px/1.4 Georgia, serif" }).font).toBe("bold 12px Georgia, serif");
   });
 });

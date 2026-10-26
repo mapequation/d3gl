@@ -50,6 +50,28 @@ describe("plot().labels() — engine-owned data labels (#223)", () => {
     h.remove();
   });
 
+  it("styles the WebGL overlay with the same font, colour and halo as native text (#571, #577)", async () => {
+    const h = host();
+    const chart = plot(h, { width: 240, height: 180, backend: "webgl" });
+    await chart.whenReady();
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], font: "13px serif", color: "rgb(187, 0, 0)", halo: { color: "#000000", width: 1.5 } });
+
+    const els = labelEls(h);
+    expect(els.length).toBe(4);
+    expect(els.every((e) => e.style.font.includes("13px") && e.style.font.includes("serif"))).toBe(true);
+    expect(els.every((e) => e.style.lineHeight === "1")).toBe(true); // the measured box, as native text centres on it
+    expect(els.every((e) => e.style.color === "rgb(187, 0, 0)")).toBe(true);
+    expect(els.every((e) => e.style.webkitTextStroke.includes("3px"))).toBe(true); // 2 × width
+
+    // `style.font`/`style.color` style it too when font/color are not given.
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], style: { font: "12px / 1.6 monospace", color: "rgb(0, 0, 187)" } });
+    const restyled = labelEls(h);
+    expect(restyled.every((e) => e.style.font.includes("12px") && e.style.font.includes("monospace"))).toBe(true);
+    expect(restyled.every((e) => e.style.color === "rgb(0, 0, 187)")).toBe(true);
+    chart.destroy();
+    h.remove();
+  });
+
   it("caps to the top-k by importance when `max` is set", async () => {
     const h = host();
     const chart = plot(h, { width: 240, height: 180, backend: "webgl" });
