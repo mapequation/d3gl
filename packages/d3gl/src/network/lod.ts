@@ -1976,7 +1976,7 @@ export const DEFAULT_DECLUTTER_SPACING = 2;
  */
 export function lodSpacing(declutter: boolean | undefined, declutterSpacing: number | undefined): number {
   const s = declutterSpacing ?? DEFAULT_DECLUTTER_SPACING;
-  return declutter === false || !(s > 0) ? 1 : s; // a spacing ≤ 0 hides nothing, as declutter: false
+  return declutter === false || !(s > 0 && Number.isFinite(s)) ? 1 : s; // a spacing ≤ 0 hides nothing, as declutter: false
 }
 
 /**

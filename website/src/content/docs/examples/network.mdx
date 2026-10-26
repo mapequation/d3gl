@@ -308,7 +308,7 @@ not the whole graph.
 net
   .style({ sizeMode: "screen" }) // constant-pixel glyphs — the natural register for navigating
   .lod({
-    expandPx: 48,            // optional: pin the expand footprint in px (omit ⇒ tree-adaptive default)
+    expandPx: 48,            // optional: pin the expand footprint in px, × declutterSpacing (omit ⇒ tree-adaptive default)
     aggregateFill: "#7f97c8",
     maxAggregateRadius: 26,  // cap the aggregate glyph size (pixels, in screen sizeMode)
     declutter: true,         // thin overlapping glyphs by importance (default: the node-size metric)
@@ -757,7 +757,7 @@ net.lod({
 - **Where the ring goes.** After `layout({ nested })` the ring is that module's **disc**, and it follows
   the module's members through a drag or a `transition`. After any other layout it is centred on the
   members, with their extent as its radius. The disc is also what the cut sees: after a nested layout a
-  module is culled by its disc and opens once the disc is `expandPx` across on screen, rings or not.
+  module is culled by its disc and opens once the disc is `expandPx · declutterSpacing` across on screen, rings or not.
 - **`width`** is in the active `sizeMode`'s units, so in `screen` mode it is a constant pixel stroke
   around a ring that scales with the map. Rings fade with their members under `crossFade`, draw **above
   the links and under the nodes**, so a dense module's links never hide where it ends, and export with

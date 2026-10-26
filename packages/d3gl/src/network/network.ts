@@ -628,7 +628,8 @@ export interface NetworkLODOptions {
    * Thin overlapping frontier glyphs in screen space, keeping the most important (by strength) and
    * hiding a glyph whose centre is within `declutterSpacing·(rᵢ + rⱼ)` of a kept glyph — so dense
    * regions stay readable instead of a solid mass. Zoom-dependent (more resolve as you zoom in).
-   * Default `true`; `false` hides nothing.
+   * Default `true`; `false` hides nothing — and the cut then treats glyphs at their own size (#561): a module
+   * opens at {@link expandPx}, not at `expandPx · declutterSpacing`, so the map is finer at the same zoom.
    */
   declutter?: boolean;
   /**
