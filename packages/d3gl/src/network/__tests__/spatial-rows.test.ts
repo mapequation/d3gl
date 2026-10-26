@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
+import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, lodSpacing, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazyCut } from "../lazy-super-edges.js";
 import { allocateSpatialRows, buildKeptRows, makeSpatialRowsScratch, rowOf, spatialRowsByteLength, spatialRowsGraph, type SpatialRows, type SpatialRowsGraph } from "../spatial-rows.js";
@@ -93,7 +93,9 @@ function styleOf(directed: boolean, linkStyle: "line" | "half-arrow" = "line"): 
 function cutAt(tree: LODTree, t: LODTransform, declutter: boolean, fadeBand = 0): LazyCut & { fade?: Float32Array } {
   const sc = makeCutScratch();
   const fade = fadeBand > 0 ? new Float32Array(tree.size) : undefined;
-  const drawn = cut(tree, t, W, H, { screenSized: true, maxAggregateRadius: 20, recordCulled: true, fadeBand, fadeAlpha: fade }, sc).slice();
+  // As the engine and the stream cut: at the declutter's spacing (#561), or 1 without declutter.
+  const spacing = lodSpacing(declutter, undefined);
+  const drawn = cut(tree, t, W, H, { screenSized: true, maxAggregateRadius: 20, recordCulled: true, fadeBand, fadeAlpha: fade, spacing }, sc).slice();
   const kept = declutter ? declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: 20, fadeAlpha: fade }, makeDeclutterFrontierScratch()).slice() : drawn;
   return { drawn, kept, culled: sc.culled.slice(0, sc.culledCount), split: sc.split.slice(0, sc.splitCount), fade };
 }
