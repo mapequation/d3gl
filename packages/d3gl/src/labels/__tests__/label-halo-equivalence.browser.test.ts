@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { page } from "vitest/browser";
-import { LabelLayer, resolveLabelStyle, DEFAULT_LABEL_TEXT, type LabelHalo, type LabelStyle } from "../label-layer.js";
+import { LabelLayer, resolveLabelStyle, DEFAULT_LABEL_TEXT, type LabelStyle, type LabelText } from "../label-layer.js";
 import { paintTexts } from "../../canvas/draw-texts.js";
 
 // #571: the WebGL overlay (an HTML label with a CSS text stroke) and Canvas/SVG/export (`paintTexts`) draw
@@ -20,7 +20,7 @@ const MAX_DIFF = 0.005;
 const MAX_MASS = 0.1;
 
 /** One row: the overlay label on the left, the Canvas-painted label on the right, on the same background. */
-function row(overlayStyle: LabelStyle | undefined, halo: LabelHalo | undefined): { el: HTMLElement; destroy: () => void } {
+function row(overlayStyle: LabelStyle | undefined, text: LabelText): { el: HTMLElement; destroy: () => void } {
   const bg = `rgb(${BG.join(",")})`;
   const el = document.createElement("div");
   el.style.cssText = `display:flex;width:${2 * W}px;height:${H}px;background:${bg}`;
@@ -38,7 +38,7 @@ function row(overlayStyle: LabelStyle | undefined, halo: LabelHalo | undefined):
   const ctx = canvas.getContext("2d")!;
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, W, H);
-  paintTexts(ctx, [{ x: 20, y: 20, text: TEXT, font: DEFAULT_LABEL_TEXT.font, color: DEFAULT_LABEL_TEXT.color, halo }]);
+  paintTexts(ctx, [{ x: 20, y: 20, text: TEXT, font: text.font, color: text.color, halo: text.halo }]);
   return { el, destroy: () => { layer.destroy(); el.remove(); } };
 }
 
@@ -84,8 +84,8 @@ function alignedDiff(a: Uint8ClampedArray, b: Uint8ClampedArray): number {
   return best;
 }
 
-async function compare(overlayStyle: LabelStyle | undefined, halo: LabelHalo | undefined): Promise<{ mass: [number, number]; diff: number }> {
-  const r = row(overlayStyle, halo);
+async function compare(overlayStyle: LabelStyle | undefined, text: LabelText): Promise<{ mass: [number, number]; diff: number }> {
+  const r = row(overlayStyle, text);
   const { overlay, canvas } = await capture(r.el);
   r.destroy();
   return { mass: [haloMass(overlay), haloMass(canvas)], diff: alignedDiff(overlay, canvas) };
@@ -97,23 +97,31 @@ describe("label halo equivalence (#571)", () => {
   });
 
   it.each([1, 2])("the overlay strokes the same halo as Canvas at width %d", async (width) => {
-    const halo = { color: "#ffffff", width };
-    const { mass, diff } = await compare(resolveLabelStyle(undefined, undefined, halo), halo);
+    const text = { ...DEFAULT_LABEL_TEXT, halo: { color: "#ffffff", width } };
+    const { mass, diff } = await compare(resolveLabelStyle(undefined, undefined, text), text);
+    expect(mass[1]).toBeGreaterThan(20);
+    expect(Math.abs(mass[0] - mass[1]) / mass[1]).toBeLessThan(MAX_MASS);
+    expect(diff).toBeLessThan(MAX_DIFF);
+  });
+
+  it("draws a custom font and colour the same on the overlay as on Canvas (#577)", async () => {
+    const text = { font: "700 13px Georgia, serif", color: "#7f1d1d", halo: { color: "#ffffff", width: 1 } };
+    const { mass, diff } = await compare(resolveLabelStyle(undefined, undefined, text), text);
     expect(mass[1]).toBeGreaterThan(20);
     expect(Math.abs(mass[0] - mass[1]) / mass[1]).toBeLessThan(MAX_MASS);
     expect(diff).toBeLessThan(MAX_DIFF);
   });
 
   it("draws no halo on either at width 0", async () => {
-    const halo = { color: "#ffffff", width: 0 };
-    const { mass } = await compare(resolveLabelStyle(undefined, undefined, halo), halo);
+    const text = { ...DEFAULT_LABEL_TEXT, halo: { color: "#ffffff", width: 0 } };
+    const { mass } = await compare(resolveLabelStyle(undefined, undefined, text), text);
     expect(mass[0]).toBeLessThan(1);
     expect(mass[1]).toBeLessThan(1);
   });
 
   it("is not vacuous: the old text-shadow glow does not pass as the width-1 stroke", async () => {
-    const glow = { ...resolveLabelStyle(undefined, undefined, null), textShadow: "0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff" };
-    const { diff } = await compare(glow, DEFAULT_LABEL_TEXT.halo);
+    const glow = { ...resolveLabelStyle(undefined, undefined, { ...DEFAULT_LABEL_TEXT, halo: undefined }), textShadow: "0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff" };
+    const { diff } = await compare(glow, DEFAULT_LABEL_TEXT);
     expect(diff).toBeGreaterThanOrEqual(MAX_DIFF);
   });
 });

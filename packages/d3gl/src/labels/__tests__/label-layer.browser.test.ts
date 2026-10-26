@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { LabelLayer, resolveLabelStyle, DEFAULT_LABEL_TEXT } from "../label-layer.js";
+import { LabelLayer, resolveLabelStyle } from "../label-layer.js";
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -64,7 +64,7 @@ describe("LabelLayer styling (#224)", () => {
   it("the engine policy result lands on elements: defaults merged, className opting out", () => {
     const h = host();
     // net.labels()-style wiring: pass resolveLabelStyle's result through.
-    const layer = new LabelLayer(h, (a) => a.text, undefined, resolveLabelStyle(undefined, { color: "rgb(31, 41, 55)" }, DEFAULT_LABEL_TEXT.halo));
+    const layer = new LabelLayer(h, (a) => a.text, undefined, resolveLabelStyle(undefined, { color: "rgb(31, 41, 55)" }));
     layer.update([ANCHOR], { k: 1, x: 0, y: 0 }, VIEW);
 
     const el = el1(h);

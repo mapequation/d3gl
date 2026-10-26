@@ -1,6 +1,7 @@
 import type { ViewTransform } from "../webgl/index.js";
 import { cullLabels, labelCullScratch, labelTransform } from "./cull.js";
 import type { LabelBaseline, LabelBox, LabelCullScratch, TextAnchor } from "./cull.js";
+import { canvasFont } from "./measure.js";
 
 /** A label anchored in REFERENCE (projected, pre-transform) pixel space. */
 export interface LabelAnchor {
@@ -96,43 +97,16 @@ export type LabelStyle = {
 export type LabelHalo = { color: string; width: number };
 
 /**
- * Default overlay label look (#224) — a compact dark sans-serif label, readable over busy geometry
- * with zero user CSS. Its white halo is not here: {@link resolveLabelStyle} adds it from the label
- * set's {@link LabelHalo}, so the overlay strokes the same halo as Canvas/SVG (#571). Applied by the
- * engine label APIs (e.g. `network.labels()`); a raw {@link LabelLayer} stays unstyled by default (the
- * low-level primitive keeps today's inherit-from-container behaviour).
+ * What a label set draws with on EVERY backend (#577): the font (a canvas font shorthand, no
+ * line-height), the fill colour and the halo (`undefined` for none). Resolved once per `labels()` call
+ * by {@link resolveLabelText}; the overlay ({@link resolveLabelStyle}), Canvas/SVG native text, every
+ * export and the label measurement all read it, so they agree.
  */
-export const DEFAULT_LABEL_STYLE: LabelStyle = {
-  font: "600 11px/1 system-ui, sans-serif",
-  color: "#111827",
-};
+export interface LabelText { font: string; color: string; halo: LabelHalo | undefined }
 
 /**
- * The overlay CSS for a {@link LabelHalo} (#571): a text stroke twice the halo width, painted under
- * the fill (`paint-order`), so it reaches `width` px beyond the glyphs with round joins — as the
- * Canvas/SVG stroke does. Empty for no halo (`null`/`undefined`) or width 0.
- */
-export function haloStyle(halo: LabelHalo | null | undefined): LabelStyle {
-  if (!halo || halo.width <= 0) return {};
-  return { webkitTextStroke: `${halo.width * 2}px ${halo.color}`, paintOrder: "stroke", strokeLinejoin: "round" };
-}
-
-/**
- * The engine-label styling policy (#224): {@link DEFAULT_LABEL_STYLE}, then the `halo`'s stroke
- * ({@link haloStyle}; the default white halo when omitted, `null` for none), then a caller's inline
- * {@link LabelStyle} — a partial override keeps the rest —
- * but when a `className` is given, return only the explicit `style` (possibly undefined): the class's
- * CSS keeps full control, since an inline default would beat it. Shared so other engines lift the
- * exact same policy (#223); pass the result as {@link LabelLayer}'s `style`.
- */
-export function resolveLabelStyle(className: string | undefined, style: LabelStyle | undefined, halo: LabelHalo | null = DEFAULT_LABEL_TEXT.halo): LabelStyle | undefined {
-  return className ? style : { ...DEFAULT_LABEL_STYLE, ...haloStyle(halo), ...style };
-}
-
-/**
- * The same default look for BACKEND-NATIVE text (SVG `<text>` / Canvas `fillText`, incl. export),
- * which CSS can't reach: the `font`/`color` equivalent of {@link DEFAULT_LABEL_STYLE} (canvas font
- * shorthand takes no line-height), and the default halo every backend strokes (#571).
+ * The default {@link LabelText} — a compact dark sans-serif label with a 1px white halo, readable
+ * over busy geometry with zero user CSS.
  */
 export const DEFAULT_LABEL_TEXT: { font: string; color: string; halo: LabelHalo } = {
   font: "600 11px system-ui, sans-serif",
@@ -141,11 +115,70 @@ export const DEFAULT_LABEL_TEXT: { font: string; color: string; halo: LabelHalo 
 };
 
 /**
+ * Default overlay label look (#224): {@link DEFAULT_LABEL_TEXT}'s font and colour as overlay CSS. Its
+ * halo is added by {@link resolveLabelStyle} from the label set's {@link LabelHalo} (#571). Applied by
+ * the engine label APIs (e.g. `network.labels()`); a raw {@link LabelLayer} stays unstyled by default
+ * (the low-level primitive keeps today's inherit-from-container behaviour).
+ */
+export const DEFAULT_LABEL_STYLE: LabelStyle = {
+  font: "600 11px/1 system-ui, sans-serif",
+  color: "#111827",
+};
+
+/** The overlay form of a label font: line-height 1 (`11px` → `11px/1`), so the element's box is the
+ *  measured label box and its text sits where Canvas/SVG centre theirs. A font that names its own
+ *  line-height keeps it. Px font sizes only, as {@link canvasFont}. */
+export function overlayFont(font: string): string {
+  return /\d(?:\.\d+)?px\//.test(font) ? font : font.replace(/(\d+(?:\.\d+)?px)/, "$1/1");
+}
+
+/**
+ * The overlay CSS for a {@link LabelHalo} (#571): a text stroke twice the halo width, painted under
+ * the fill (`paint-order`), so it reaches `width` px beyond the glyphs as the Canvas/SVG stroke does.
+ * `stroke-linejoin: round` matches their round joins where the browser applies it to HTML text
+ * (Chromium strokes HTML text with miter joins regardless). Empty for no halo or width 0.
+ */
+export function haloStyle(halo: LabelHalo | undefined): LabelStyle {
+  if (!halo || halo.width <= 0) return {};
+  return { webkitTextStroke: `${halo.width * 2}px ${halo.color}`, paintOrder: "stroke", strokeLinejoin: "round" };
+}
+
+/**
+ * The engine-label styling policy (#224): the overlay CSS for a label set's {@link LabelText} — its
+ * font ({@link overlayFont}) and colour, the halo's stroke ({@link haloStyle}) — with the caller's
+ * inline {@link LabelStyle} for anything else. The resolved font and colour win over `style`'s: they
+ * already fold `style.font`/`style.color` in (#577), so the overlay draws what Canvas/SVG draw. When a
+ * `className` is given, return only the explicit `style` (possibly undefined): the class's CSS keeps
+ * full control, since an inline default would beat it. `text` defaults to what `style` alone resolves
+ * to. Shared so every engine lifts the exact same policy (#223); pass the result as {@link LabelLayer}'s `style`.
+ */
+export function resolveLabelStyle(className: string | undefined, style: LabelStyle | undefined, text: LabelText = resolveLabelText({ style })): LabelStyle | undefined {
+  if (className) return style;
+  const base: LabelStyle = { font: overlayFont(text.font), color: text.color };
+  // `base` again last: its values win, but its keys keep their first place in the order the styles
+  // are applied, so a `style.lineHeight` still lands after the `font` shorthand has reset it.
+  return { ...base, ...haloStyle(text.halo), ...style, ...base };
+}
+
+/**
  * The halo a label set draws (#571): the explicit `halo`, else none when `style.textShadow` is
  * `"none"` (the opt-out from when the overlay's halo was a text-shadow), else {@link DEFAULT_LABEL_TEXT}'s.
  */
 export function resolveLabelHalo(halo: LabelHalo | undefined, style: LabelStyle | undefined): LabelHalo | undefined {
   return halo ?? (style?.textShadow === "none" ? undefined : DEFAULT_LABEL_TEXT.halo);
+}
+
+/**
+ * Resolve a label set's {@link LabelText} from its options (#577), once per `labels()` call: the
+ * explicit `font`/`color`, else `style`'s, else {@link DEFAULT_LABEL_TEXT}'s; the halo per
+ * {@link resolveLabelHalo}. Shared by `network.labels()` and the plot/geoMap `labels()`.
+ */
+export function resolveLabelText(opts: { font?: string; color?: string; halo?: LabelHalo; style?: LabelStyle }): LabelText {
+  return {
+    font: canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font),
+    color: opts.color ?? opts.style?.color ?? DEFAULT_LABEL_TEXT.color,
+    halo: resolveLabelHalo(opts.halo, opts.style),
+  };
 }
 
 /**
