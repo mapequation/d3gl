@@ -1077,3 +1077,31 @@ is hidden from `nodeRadius` ≈ 8.7 up although the two are ≈ 15 px apart at r
 `declutterSpacing: 1`) explicitly rather than picking a radius small enough to dodge the exclusion
 (`network-node-border-shade.browser.test.ts`). A perf-guard reference implementation that mirrors
 `declutterFrontier` must mirror the default too (`frontier-perf.test.ts`).
+
+## The LOD cut treats glyphs at the declutter spacing, threshold included (#561)
+
+**Rule.** The cut and the declutter must agree on how big a glyph is, or declutter hides glyphs the cut just opened,
+with every link touching them. `lodSpacing(declutter, declutterSpacing)` is that one factor (the declutter's
+spacing, default 2; 1 with `declutter: false`): the crowding measures radii × spacing (`crowdingOptionsOf`, which
+also scales the horizon) and the cut's threshold is `expandPx × spacing` (`CutOptions.spacing`). Scaling *both*
+makes the cut at zoom `k` the spacing-1 cut at `k / spacing`, and declutter at that spacing the spacing-1 declutter
+there, so whatever spacing 1 keeps, every spacing keeps — at no added cost (`lod-spacing-cut.test.ts` checks the
+equivalence on every tree kind). Below 1 the cut stays at 1 (`lodSpacing` is never below 1): only the declutter
+thins less, down to nothing at 0 — continuous with `declutter: false`. Scaling the cut below 1 instead would open
+everything as the spacing approaches 0 (LOD off), then jump back at 0. Every caller of `cut` passes it: the engine (`computeFrontier`) and a spatial
+stream's row cut (`keptRows` in `lod-frame.ts`), or the rows no longer match the engine's cut.
+
+**How it broke.** #468 raised the default `declutterSpacing` to 2 while the cut still opened at overlap (spacing
+1): the Modular LOD example drew no links at its opening view (27 module glyphs cut, 9 kept) and lost about half
+its leaves near the leaf level (34 of 86 zoom steps thinned, 0 before #468).
+
+**Ruled out: scaling the radii alone.** Doubling only the crowding radii keeps the footprint threshold at
+`expandPx`, so modules still open into children that collide at 2× (22 of 76 steps thinned). Patching that with a
+per-node "children fit" gate plus sibling-aware crowding fixed the gaps but made the crowding pass ~3× slower
+(100k leaves: 8 → 25 ms spatial, 13 → 45 ms coarsening; branch `backup/561-consistent-cut`). Scaling the threshold
+with the radii does the same for free.
+
+**Still thins.** Cross-fade transitions fade children in before they fit (about 7 of 86 steps at spacing 1 with
+`crossFade` 0.2, before and after #468); and a footprint threshold small for its glyphs (#512's 4-node graph)
+opens modules into children that overlap at any spacing.
+

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
+import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, lodSpacing, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazyCut } from "../lazy-super-edges.js";
 import { allocateSpatialRows, buildKeptRows, makeSpatialRowsScratch, rowOf, spatialRowsByteLength, spatialRowsGraph, type SpatialRows, type SpatialRowsGraph } from "../spatial-rows.js";
@@ -90,11 +90,13 @@ function styleOf(directed: boolean, linkStyle: "line" | "half-arrow" = "line"): 
 }
 
 /** The cut the engine runs (screen-sized, declutter optional), with its covers. */
-function cutAt(tree: LODTree, t: LODTransform, declutter: boolean, fadeBand = 0): LazyCut & { fade?: Float32Array } {
+function cutAt(tree: LODTree, t: LODTransform, declutter: boolean, fadeBand = 0, declutterSpacing?: number): LazyCut & { fade?: Float32Array } {
   const sc = makeCutScratch();
   const fade = fadeBand > 0 ? new Float32Array(tree.size) : undefined;
-  const drawn = cut(tree, t, W, H, { screenSized: true, maxAggregateRadius: 20, recordCulled: true, fadeBand, fadeAlpha: fade }, sc).slice();
-  const kept = declutter ? declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: 20, fadeAlpha: fade }, makeDeclutterFrontierScratch()).slice() : drawn;
+  // As the engine and the stream cut: at the declutter's spacing (#561), or 1 without declutter.
+  const spacing = lodSpacing(declutter, declutterSpacing);
+  const drawn = cut(tree, t, W, H, { screenSized: true, maxAggregateRadius: 20, recordCulled: true, fadeBand, fadeAlpha: fade, spacing }, sc).slice();
+  const kept = declutter ? declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: 20, fadeAlpha: fade, spacing: declutterSpacing }, makeDeclutterFrontierScratch()).slice() : drawn;
   return { drawn, kept, culled: sc.culled.slice(0, sc.culledCount), split: sc.split.slice(0, sc.splitCount), fade };
 }
 
@@ -341,6 +343,21 @@ describe("lazySuperEdges takes a streamed tree's rows and draws the same super-e
 });
 
 describe("a spatial stream ships the rows of the glyphs its view keeps with each tree (#433)", () => {
+  it("cuts at the view's declutter spacing, as the engine does (#561)", () => {
+    const g = fixture(3000, 7);
+    const style = { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength };
+    const t: LODTransform = { k: 1.3, x: W / 2 - 60, y: H / 2 + 30 };
+    const rowsAt = (declutterSpacing: number | undefined): Uint32Array => {
+      const view: LODView = { transform: t, fitPad: 3, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0, declutter: true, declutterSpacing };
+      const f = lodFrameStep(makeSpatialLODStream(g.nodeCount, style, 1, g, view), g.positions, 1);
+      if (!f?.rows) throw new Error("no rows");
+      const tree = lodTreeFromSpatialFrame(f);
+      expect(tree.rows?.cell, `spacing ${declutterSpacing ?? "default"}: the rows of the engine's cut`).toEqual(rowsForCut(tree, g, cutAt(tree, t, true, 0, declutterSpacing)).cell);
+      return tree.rows?.cell.slice() ?? new Uint32Array(0);
+    };
+    expect(Array.from(rowsAt(3)), "not vacuous: spacing 3 cuts another frontier than the default").not.toEqual(Array.from(rowsAt(undefined)));
+  });
+
   it("builds them for every rebuilt tree at the view (a transform, or the fit), reuses buffers, and builds none without links or a view", () => {
     const g = fixture(3000, 7);
     const style = { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength };

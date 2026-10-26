@@ -5,7 +5,7 @@ import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, fro
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, markHolders, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingOptionsOf, lodSpacing, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, markHolders, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
@@ -607,7 +607,8 @@ export interface NetworkLODOptions {
    * not overlap at the current zoom, when it expands whatever its size (#426: an aggregate is drawn only
    * where its members would overlap, so a small graph opens on every node). The threshold therefore sets
    * how coarse the map is where members *would* overlap. Larger → coarser (fewer, bigger aggregates).
-   * After a `layout({ nested })`, a module's extent is its disc's radius (#329).
+   * It scales with {@link declutterSpacing} (#561): a module opens once its footprint reaches
+   * `expandPx · declutterSpacing`. After a `layout({ nested })`, a module's extent is its disc's radius (#329).
    *
    * **Omit it** to get the tree-adaptive default (#191), which scales with how many children the
    * tree's finest aggregates hold: 48 px for structural coarsening / a spatial quadtree (unchanged),
@@ -627,14 +628,18 @@ export interface NetworkLODOptions {
    * Thin overlapping frontier glyphs in screen space, keeping the most important (by strength) and
    * hiding a glyph whose centre is within `declutterSpacing·(rᵢ + rⱼ)` of a kept glyph — so dense
    * regions stay readable instead of a solid mass. Zoom-dependent (more resolve as you zoom in).
-   * Default `true`; `false` hides nothing.
+   * Default `true`; `false` hides nothing — and the cut then treats glyphs at their own size (#561): a module
+   * opens at {@link expandPx}, not at `expandPx · declutterSpacing`, so the map is finer at the same zoom.
    */
   declutter?: boolean;
   /**
    * Spacing multiplier for {@link declutter}: a glyph is hidden when its centre is within
    * `declutterSpacing·(rᵢ + rⱼ)` of a kept glyph. Default 2: kept glyphs keep a gap around them, so
-   * the links between them stay visible. The cost: in a small graph a whole non-overlapping module
-   * aggregate can be hidden (#512). 1 hides only real overlaps; <1 lets glyphs overlap partly.
+   * the links between them stay visible. 1 hides only real overlaps. Above 1 the cut treats glyphs at the same
+   * spacing, its {@link expandPx} with it (#561): the map at zoom `k` is the one spacing 1 shows at
+   * `k / declutterSpacing`, so declutter keeps every glyph the cut opens. Below 1 the cut stays as at 1 and glyphs
+   * may overlap partly, less and less, until 0 hides nothing, as `declutter: false`. In a small graph a whole
+   * non-overlapping module aggregate can still be hidden (#512).
    */
   declutterSpacing?: number;
   /**
@@ -1300,6 +1305,7 @@ export class Network extends BaseEngine {
   private lodViewPosted: LODView | null = null;
   private lodStyleVersionOf: ResolvedNetworkStyle | null = null;
   private lodStyleExpandPx: number | undefined = undefined;
+  private lodStyleSpacing = 1;
   /** The leaf style version the worker's LOD stream last received. */
   private lodStylePosted = -1;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
@@ -3185,26 +3191,28 @@ export class Network extends BaseEngine {
 
   /**
    * The leaf style a spatial tree aggregates (#343) — radii, declutter importance, flow-border metric,
-   * colours — plus what a worker tree's crowding needs (#426: the size mode, the explicit `expandPx`), and
-   * its version, bumped whenever the resolved style or `expandPx` changes. A worker-built spatial tree
+   * colours — plus what a worker tree's crowding needs (#426: the size mode, the explicit `expandPx`, the LOD
+   * spacing, #561), and its version, bumped whenever the resolved style, `expandPx` or the spacing changes. A worker-built spatial tree
    * carries the version it was aggregated with, so a stale one is re-aggregated here.
    */
   private lodLeafStyle(graph: NetworkGraph): { style: LeafStyle; version: number } {
     const r = this.resolvedStyleCached(graph);
     const expandPx = this.lodOptions?.expandPx;
-    if (this.lodStyleVersionOf !== r || this.lodStyleExpandPx !== expandPx) {
+    const spacing = this.lodSpacing();
+    if (this.lodStyleVersionOf !== r || this.lodStyleExpandPx !== expandPx || this.lodStyleSpacing !== spacing) {
       this.lodStyleVersionOf = r;
       this.lodStyleExpandPx = expandPx;
+      this.lodStyleSpacing = spacing;
       this.lodStyleVersion++;
     }
     const links = drawsLinks(graph, r); // the worker builds super-edge rows only for drawn links (#433)
-    const crowding = { screenSized: r.sizeMode === "screen", expandPx };
+    const crowding = { screenSized: r.sizeMode === "screen", expandPx, spacing };
     return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, borderFlow: r.flowBorder?.flow, colors: r.nodeColors, links, crowding }, version: this.lodStyleVersion };
   }
 
   /**
    * The tree's crowding (#426) from its current positions and radii — so the cut opens an aggregate whose
-   * members would not overlap — computed up to the cut's own expand threshold ({@link crowdingHorizon}).
+   * members would not overlap — computed up to the cut's own expand threshold, at the LOD spacing ({@link crowdingOptionsOf}).
    * O(tree size) plus the cross pairs near sibling borders; run with every position + style pass on a
    * main-thread tree (never per zoom frame) — except while a layout runs ({@link layoutLive}), when the tree
    * gets none (`Infinity`, the footprint rule alone) until it settles: the pass costs 0.35-1 s at 2M nodes.
@@ -3216,7 +3224,12 @@ export class Network extends BaseEngine {
       return;
     }
     const screenSized = this.resolvedStyleCached(this.graph).sizeMode === "screen";
-    computeLODCrowding(tree, { screenSized, expandPx: crowdingHorizon(tree, this.lodOptions.expandPx) }, this.lodCrowding);
+    computeLODCrowding(tree, crowdingOptionsOf(tree, { screenSized, expandPx: this.lodOptions.expandPx, spacing: this.lodSpacing() }), this.lodCrowding);
+  }
+
+  /** The spacing the LOD cut, its crowding and its declutter treat glyphs at ({@link lodSpacing}, #561). */
+  private lodSpacing(): number {
+    return lodSpacing(this.lodOptions?.declutter, this.lodOptions?.declutterSpacing);
   }
 
   /**
@@ -5445,6 +5458,7 @@ export class Network extends BaseEngine {
     bnd.radius = this.lodDiscs(tree)?.r;
     let frontier = cut(tree, this.transform, this.width, this.height, {
       expandPx: opts.expandPx,
+      spacing: this.lodSpacing(), // every glyph counts as `declutterSpacing` times its size, so declutter keeps what this opens (#561)
       screenSized: style.sizeMode === "screen",
       maxAggregateRadius: opts.maxAggregateRadius,
       fadeBand,

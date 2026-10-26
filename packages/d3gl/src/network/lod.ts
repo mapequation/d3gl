@@ -1957,6 +1957,39 @@ export interface CrowdingOptions {
    * opens a node whose members overlap, it only opens some later than it could.
    */
   expandPx: number;
+  /**
+   * The LOD spacing ({@link lodSpacing}, #561): members are measured as if every glyph were `spacing` times its
+   * radius, and the horizon `expandPx` must be scaled by it too, as the cut's threshold is
+   * ({@link CutOptions.spacing}). Use {@link crowdingOptionsOf}. Default 1.
+   */
+  spacing?: number;
+}
+
+/** The LOD declutter's default spacing (#468): kept glyphs keep a gap around them for the links between them. */
+export const DEFAULT_DECLUTTER_SPACING = 2;
+
+/**
+ * The spacing the LOD cut and its crowding treat glyphs at (#561): `declutterSpacing` (default
+ * {@link DEFAULT_DECLUTTER_SPACING}) while declutter is on and it exceeds 1, else 1. Every glyph counts as that many
+ * times its size, the expand threshold with it, so the cut at zoom `k` is the spacing-1 cut at `k / spacing` and
+ * declutter keeps every glyph the cut opens wherever spacing 1 keeps them. Below 1 the cut stays at its own 1 and
+ * only the declutter thins less — it hides only glyphs overlapping deeper than `spacing·(rᵢ + rⱼ)` — down to
+ * nothing at 0, as `declutter: false`.
+ * O(1).
+ */
+export function lodSpacing(declutter: boolean | undefined, declutterSpacing: number | undefined): number {
+  const s = declutterSpacing ?? DEFAULT_DECLUTTER_SPACING;
+  return declutter !== false && Number.isFinite(s) && s > 1 ? s : 1;
+}
+
+/**
+ * The crowding pass's options for `tree` under a sizing (#426, #561): the size mode, the horizon — the cut's
+ * explicit `expandPx` or the adaptive default ({@link crowdingHorizon}), scaled by the spacing as the cut's
+ * threshold is — and the spacing ({@link lodSpacing}). O(1).
+ */
+export function crowdingOptionsOf(tree: Pick<LODTree, "leafBranching">, sizing: { screenSized: boolean; expandPx?: number; spacing?: number }): CrowdingOptions {
+  const spacing = sizing.spacing ?? 1;
+  return { screenSized: sizing.screenSized, expandPx: crowdingHorizon(tree, sizing.expandPx) * spacing, spacing };
 }
 
 /** The part of an {@link LODTree} that {@link computeLODCrowding} reads and writes. */
@@ -2053,9 +2086,10 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
   let permTop = 0; // perm in use
   let seen = 0; // node pairs examined (lodCrowdingPairs)
   // A glyph covers at least half a pixel: floor screen radii once here; world radii scale with the zoom.
+  const spacing = opts.spacing ?? 1;
   const eff = (i: number): number => {
     const r = radius[i] ?? 0;
-    return screen ? (r > MIN_SCREEN_RADIUS ? r : MIN_SCREEN_RADIUS) : r > 0 ? r : 0;
+    return spacing * (screen ? (r > MIN_SCREEN_RADIUS ? r : MIN_SCREEN_RADIUS) : r > 0 ? r : 0);
   };
   // The larger of `beta` and the pair zoom of two leaves `(dx, dy)` apart with effective radii `ra`, `rb`. With
   // screen radii it is (ra + rb) / d, so a pair that cannot beat beta ((ra + rb)² ≤ beta²·d²) needs no root.
@@ -2480,6 +2514,13 @@ export interface CutOptions {
   /** Aggregate draw-radius cap (matches rendering), so the cull margin reflects the drawn size. */
   maxAggregateRadius?: number;
   /**
+   * The LOD spacing ({@link lodSpacing}, #561): the threshold is `expandPx·spacing`, as if every glyph were
+   * `spacing` times its size. With the crowding computed at the same spacing ({@link CrowdingOptions.spacing}),
+   * the cut at zoom `k` is the spacing-1 cut at `k / spacing`, and declutter at that spacing keeps every glyph the
+   * spacing-1 declutter keeps there. Default 1.
+   */
+  spacing?: number;
+  /**
    * **Cross-fade band** (#133): half-width, as a fraction of `expandPx`, of the zoom band around the
    * expand threshold over which an aggregate and its children are drawn *together* — the aggregate
    * easing out (alpha 1→0) as its children ease in (0→1), so a split/merge reads smoothly instead of
@@ -2630,7 +2671,9 @@ export function cut(
   const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius, clearZoom } = tree;
   // No explicit threshold ⇒ the tree-adaptive default (#191) — O(1) off `tree.leafBranching`, which
   // was computed once at tree build; nothing here scales with the tree or the frontier.
-  const expandPx = opts.expandPx ?? defaultExpandPx(tree, width, height);
+  // At a declutter spacing every glyph counts as `spacing` times its size (#561), so the footprint a node needs to
+  // open grows with it: the cut at zoom k is the spacing-1 cut at k / spacing, and declutter keeps what it opens.
+  const expandPx = (opts.expandPx ?? defaultExpandPx(tree, width, height)) * (opts.spacing ?? 1);
   // Overlap (#426): a node whose members clear each other at this zoom (k ≥ clearZoom) counts as reaching
   // the threshold — it is lent the footprint `expandPx·k/clearZoom` (≥ expandPx exactly when k ≥
   // clearZoom), so the expand test and the cross-fade band below take it unchanged. 0 while clearZoom is
@@ -2794,7 +2837,8 @@ export interface DeclutterOptions {
   /**
    * Multiplier on the exclusion distance: a glyph is dropped when its centre is within
    * `spacing·(rᵢ + rⱼ)` of a kept glyph (>1 = sparser, <1 = denser). Default 2: kept glyphs keep a
-   * gap around them, so the links between them stay visible (#512); 1 drops only real overlaps.
+   * gap around them, so the links between them stay visible (#512); 1 drops only real overlaps. Cut with the
+   * same spacing ({@link CutOptions.spacing}, {@link lodSpacing}) so this keeps every glyph the cut opens (#561).
    */
   spacing?: number;
   /**
@@ -2898,8 +2942,9 @@ function sortOrderByWeightDesc(sc: DeclutterFrontierScratch, F: number): Uint32A
  * Thin an LOD frontier in screen space: keep higher-importance glyphs (by tree {@link LODTree.weight}
  * = strength) and drop lower-importance ones whose centre lies within `spacing·(rᵢ + rⱼ)` of a kept
  * glyph. The default spacing 2 also drops near neighbours, so kept glyphs keep a gap around them and
- * the links between them stay visible; in a small graph that can hide a whole non-overlapping module
- * aggregate (#512). Spacing 1 drops only glyphs that really **overlap** a kept one. Greedy in descending importance over a screen grid, so a dense
+ * the links between them stay visible; the cut treats glyphs at the same spacing ({@link lodSpacing}, #561), so
+ * this thins only overlaps the cut could not avoid — in a small graph that can still be a whole module aggregate
+ * (#512). Spacing 1 drops only glyphs that really **overlap** a kept one. Greedy in descending importance over a screen grid, so a dense
  * cluster keeps its most important members and the kept set is overlap-free (no overdraw). Runs per
  * cut, so it's zoom-dependent — more glyphs resolve as you zoom in. Returns the kept frontier ids
  * (original order).
@@ -2920,7 +2965,7 @@ export function declutterFrontier(
   const F = frontier.length;
   if (F <= 1) return frontier;
   const maxAgg = opts.maxAggregateRadius ?? Infinity;
-  const spacing = opts.spacing ?? 2;
+  const spacing = opts.spacing ?? DEFAULT_DECLUTTER_SPACING;
 
   // #213: all working storage comes from the (reused) scratch, grown together to the largest frontier
   // seen. Every array's `[0, F)` prefix is fully rewritten below, so reuse needs no clearing.

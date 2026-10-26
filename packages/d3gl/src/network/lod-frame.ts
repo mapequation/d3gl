@@ -30,9 +30,11 @@ import {
   computeLODCrowding,
   computeLODPositions,
   computeLODStyle,
+  crowdingOptionsOf,
   cut,
   declutterFrontier,
   crowdingHorizon,
+  lodSpacing,
   lodTreeFromTopology,
   makeCutScratch,
   makeDeclutterFrontierScratch,
@@ -101,6 +103,8 @@ export interface LeafCrowding {
   screenSized: boolean;
   /** The cut's explicit `expandPx`, or undefined for the tree-adaptive default ({@link crowdingHorizon}). */
   expandPx?: number;
+  /** The LOD spacing the cut and declutter treat glyphs at ({@link lodSpacing}, #561). Default 1. */
+  spacing?: number;
 }
 
 /** A packed spatial frame's shape: what {@link spatialFrameViews} needs to read it. */
@@ -430,7 +434,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
         tree.radius.set(stream.style.radii.subarray(0, tree.leafCount));
         stream.radiiOf = stream.style;
       }
-      computeLODCrowding(tree, { screenSized: crowd.screenSized, expandPx: crowdingHorizon(tree, crowd.expandPx) }, stream.crowding);
+      computeLODCrowding(tree, crowdingOptionsOf(tree, crowd), stream.crowding);
     } else tree.clearZoom.fill(Infinity); // streamed: the footprint rule alone
     return null;
   }
@@ -476,7 +480,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     views.border.fill(0);
   }
   if (!style?.colors) views.color.fill(0); // a reused buffer holds the last frame's colours
-  if (crowding && style?.crowding) computeLODCrowding(tree, { screenSized: style.crowding.screenSized, expandPx: crowdingHorizon(tree, style.crowding.expandPx) }, stream.crowding);
+  if (crowding && style?.crowding) computeLODCrowding(tree, crowdingOptionsOf(tree, style.crowding), stream.crowding);
   else views.clearZoom.fill(Infinity); // streamed, or no sizing: the footprint rule alone (a reused buffer holds the last frame's)
   // The super-edge rows of the glyphs the main thread's view will keep (#433), into a pooled buffer.
   const links = stream.links;
@@ -521,6 +525,7 @@ function keptRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, li
   const sc = links.cut;
   const drawn = cut(tree, t, view.width, view.height, {
     expandPx: view.expandPx,
+    spacing: lodSpacing(view.declutter, view.declutterSpacing), // as the engine cuts (#561)
     screenSized: view.screenSized,
     maxAggregateRadius: view.maxAggregateRadius,
     fadeBand: view.fadeBand,

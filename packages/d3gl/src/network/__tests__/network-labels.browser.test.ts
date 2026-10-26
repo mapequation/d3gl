@@ -53,7 +53,7 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     net.setTransform({ k: 1, x: 0, y: 0 });
     expect(labelEls(h).some((e) => e.textContent === "agg")).toBe(true); // collapsed → aggregate labels
 
-    net.setTransform({ k: 2, x: -100, y: -100 }); // zoom in: modules expand to leaves
+    net.setTransform({ k: 3, x: -200, y: -200 }); // zoom in: modules expand to leaves (footprint 45 px ≥ expandPx · declutterSpacing, #561)
     const leaves = labelEls(h).filter((e) => /^leaf\d+$/.test(e.textContent ?? ""));
     expect(leaves.length).toBeGreaterThan(0); // re-placed to per-leaf labels
     net.destroy();
