@@ -2213,7 +2213,7 @@ export abstract class BaseEngine {
   // Exports feed the export-only stashes first: labels (#219) — a WebGL backend never draws them live
   // (the HTML overlay does) — and, for toSVG, the instanced lanes' vector view (#200), which has no
   // retained Scene to serialize. Both are pushed once at export time, never per frame. toPNG needs
-  // only the labels: it is a GPU readback, so the lanes are already in the pixels.
+  // only the labels: it is the canvas as drawn (#569), so the lanes are already in its pixels.
   toSVG(): string { this.flushDeferredLayers(); this.pushExportLabels(); this.pushExportGeometry(); return this.handle?.backend.toSVG() ?? ""; }
   toPNG(): string { this.flushDeferredLayers(); this.pushExportLabels(); return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {

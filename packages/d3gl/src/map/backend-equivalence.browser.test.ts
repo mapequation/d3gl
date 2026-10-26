@@ -11,6 +11,9 @@ import {
   clippedShapes,
   fadedGlyphs,
   translucentBorderedGlyphs,
+  edgeGlyphs,
+  edgePies,
+  PIE_GROUP,
   nestedRingShapes,
   roundedRectShapes,
   glyphSceneLayers,
@@ -19,7 +22,9 @@ import {
   renderCanvasBackend,
   renderSVG,
   diffPixels,
+  edgeError,
   type BackendRenderOptions,
+  type DiffOptions,
   type DiffResult,
   type PixelBuffer,
 } from "./__tests__/backend-equivalence-harness.js";
@@ -36,12 +41,23 @@ interface ThreeWayDiffs {
   glSvg: DiffResult;
 }
 
-/** Render the same layers through all three backends and diff every pair (#209). */
-async function threeWay(layers: RenderLayer[], opts?: BackendRenderOptions): Promise<ThreeWayDiffs> {
+/**
+ * The WebGL pairs' diff where triangle edges carry the drawing (strokes, clip edges). The WebGL export
+ * is its screen (#569), whose 4× MSAA grades a triangle edge in steps of 64 (a quarter of the pixel)
+ * where Canvas and SVG grade it exactly; a colour tolerance of one step accepts that grading and nothing
+ * wider. Measured on the stroke cases: 1.2-1.3% of pixels differ at the default tolerance of 40, which
+ * the old hard-edged export passed, and 0.07-0.16% at 64, while a bevel for a miter still scores 2.3%,
+ * a butt for a round cap 2.5% and a bevel for a round join 0.7% (Canvas against Canvas).
+ */
+const MSAA_EDGES: DiffOptions = { colorTolerance: 64 };
+
+/** Render the same layers through all three backends and diff every pair (#209); `glDiff` sets the
+ *  WebGL pairs' tolerance. */
+async function threeWay(layers: RenderLayer[], opts?: BackendRenderOptions, glDiff?: DiffOptions): Promise<ThreeWayDiffs> {
   const gl = await renderWebGLBackend(layers, W, H, opts);
   const cv = renderCanvasBackend(layers, W, H, opts);
   const svg = await renderSVG(layers, W, H, opts);
-  return { glCv: diffPixels(gl, cv), cvSvg: diffPixels(cv, svg), glSvg: diffPixels(gl, svg) };
+  return { glCv: diffPixels(gl, cv, glDiff), cvSvg: diffPixels(cv, svg), glSvg: diffPixels(gl, svg, glDiff) };
 }
 
 describe("backend equivalence: overlapping bordered shapes (#41)", () => {
@@ -61,7 +77,7 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
 
   it("all three backends stroke joins identically (miter + limit)", async () => {
     const scene = strokeJoinShapes(W, H, { join: "miter" });
-    const d = await threeWay([layerOf(scene, "lines")]);
+    const d = await threeWay([layerOf(scene, "lines")], undefined, MSAA_EDGES);
     expect(d.glCv.considered).toBeGreaterThan(W * H * 0.05);
     // WebGL beveled every corner while Canvas miters them — sharp corners add several-px
     // pointed regions far wider than the 1px tolerance. Passes once WebGL miters with the
@@ -73,7 +89,7 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
 
   it("all three backends draw round caps identically", async () => {
     const scene = strokeJoinShapes(W, H, { cap: "round" });
-    const d = await threeWay([layerOf(scene, "lines")]);
+    const d = await threeWay([layerOf(scene, "lines")], undefined, MSAA_EDGES);
     expect(d.glCv.considered).toBeGreaterThan(W * H * 0.05);
     // WebGL tessellates the round cap into a fan; Canvas/SVG draw a true arc. The
     // position-tolerant diff absorbs the sub-pixel chord error; a missing cap (butt
@@ -85,13 +101,14 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
 
   it("all three backends draw round joins identically", async () => {
     const scene = strokeJoinShapes(W, H, { join: "round" });
-    const d = await threeWay([layerOf(scene, "lines")]);
+    const d = await threeWay([layerOf(scene, "lines")], undefined, MSAA_EDGES);
     expect(d.glCv.considered).toBeGreaterThan(W * H * 0.05);
     // WebGL's arc-fan round join vs the native round joins — sub-pixel chord error
-    // only. A miter/bevel fallback at sharp corners would leave a multi-px divergence.
-    expect(d.glCv.fraction).toBeLessThan(0.01);
+    // only. A bevel fallback at the corners scores 0.7% (Canvas against Canvas), so the
+    // WebGL pairs are held to 0.5%: at 1% the old bound let it through.
+    expect(d.glCv.fraction).toBeLessThan(0.005);
     expect(d.cvSvg.fraction).toBeLessThan(0.01);
-    expect(d.glSvg.fraction).toBeLessThan(0.01);
+    expect(d.glSvg.fraction).toBeLessThan(0.005);
   });
 });
 
@@ -157,6 +174,57 @@ describe("backend equivalence: point glyphs (#209)", () => {
   });
 });
 
+describe("backend equivalence: antialiased disc edges (#570)", () => {
+  // Canvas covers a disc's edge over about one device px. WebGL used to keep or discard whole pixels
+  // there (MSAA smooths only triangle edges, and a disc's quad edges lie outside it), so every edge
+  // pixel was 0 or 255, at any devicePixelRatio. A position-tolerant diff accepts that, so this
+  // compares each edge pixel with the same pixel of the Canvas render. What error remains is mostly
+  // Canvas's: measured on the plain disc, WebGL's covered area gives the true radius to 0.01 px and
+  // its centroid to 0.006 px, while headless Chromium's Canvas draws it 0.1 px small and 0.05 px low.
+  for (const pixelRatio of [1, 2]) {
+    it(`instanced discs, rings and their fill-to-ring edge match Canvas pixel for pixel at devicePixelRatio ${pixelRatio}`, async () => {
+      const { circles, scene } = edgeGlyphs(W, H);
+      const opts = { pixelRatio };
+      const gl = await renderWebGLBackend([], W, H, { ...opts, instanced: [{ name: "glyphs", primitive: "circles", circles }] });
+      const cv = renderCanvasBackend(glyphSceneLayers(scene), W, H, opts);
+      const e = edgeError(gl, cv);
+      expect(e.pixels).toBeGreaterThan(400 * pixelRatio);
+      // Canvas's partly covered edge pixels are partly covered on WebGL too.
+      expect(e.partialInA / e.partial, JSON.stringify(e)).toBeGreaterThan(0.95);
+      expect(e.mean, JSON.stringify(e)).toBeLessThan(12);
+    });
+
+    it(`instanced pie wedges, their arcs and their straight edges, match Canvas pixel for pixel at devicePixelRatio ${pixelRatio}`, async () => {
+      const { pie, scene } = edgePies(W, H);
+      const opts = { pixelRatio };
+      const gl = await renderWebGLBackend([], W, H, { ...opts, instanced: [{ name: "pies", primitive: "pie", pie }] });
+      const e = edgeError(gl, renderCanvasBackend([layerOf(scene, PIE_GROUP)], W, H, opts));
+      expect(e.pixels).toBeGreaterThan(600 * pixelRatio);
+      expect(e.partialInA / e.partial, JSON.stringify(e)).toBeGreaterThan(0.95);
+      expect(e.mean, JSON.stringify(e)).toBeLessThan(12);
+    });
+
+    it(`Scene point discs keep a one-device-px edge when their layer outlives a resize, at devicePixelRatio ${pixelRatio}`, async () => {
+      // The ramp's width reads the renderer's viewport: left at the creation size, a 4× resize made it 4 px wide.
+      const layers = [layerOf(pointGlyphs(W, H), "points")];
+      const opts = { pixelRatio, transform: { k: 1.37, x: -31.3, y: -27.8 } };
+      const gl = await renderWebGLBackend(layers, W, H, { ...opts, resizedFrom: { width: W / 4, height: H / 4 } });
+      const e = edgeError(gl, renderCanvasBackend(layers, W, H, opts));
+      expect(e.pixels).toBeGreaterThan(200 * pixelRatio);
+      expect(e.mean, JSON.stringify(e)).toBeLessThan(12);
+    });
+
+    it(`Scene point discs (the point pass) match Canvas pixel for pixel at devicePixelRatio ${pixelRatio}`, async () => {
+      const layers = [layerOf(pointGlyphs(W, H), "points")];
+      const opts = { pixelRatio, transform: { k: 1.37, x: -31.3, y: -27.8 } };
+      const e = edgeError(await renderWebGLBackend(layers, W, H, opts), renderCanvasBackend(layers, W, H, opts));
+      expect(e.pixels).toBeGreaterThan(200 * pixelRatio);
+      expect(e.partialInA / e.partial, JSON.stringify(e)).toBeGreaterThan(0.95);
+      expect(e.mean, JSON.stringify(e)).toBeLessThan(12);
+    });
+  }
+});
+
 describe("backend equivalence: translucency (#209)", () => {
   it("overlapping translucent fills composite identically on all three backends", async () => {
     const backdrop = backdropScene(W, H);
@@ -192,7 +260,7 @@ describe("backend equivalence: clipped layer (#209)", () => {
   it("SVG <clipPath>, Canvas clip() and the WebGL stencil cut content identically", async () => {
     const scene = clippedShapes(W, H);
     const layers = [layerOf(scene, "mask"), layerOf(scene, "content", { clipTo: "mask" })];
-    const d = await threeWay(layers);
+    const d = await threeWay(layers, undefined, MSAA_EDGES);
     expect(d.glCv.considered).toBeGreaterThan(W * H * 0.2);
     // A leak (unclipped bar/disc parts) is a multi-px region far over these bounds.
     expect(d.glCv.fraction).toBeLessThan(0.01);

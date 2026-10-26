@@ -390,6 +390,7 @@ export class InstancedCircles {
       u_screen: 0,
       u_viewport: [width, height],
       u_borderPx: data.bordersPx ? 1 : 0, // #495: px rings on world discs
+      u_pixelRatio: 1, // #570: the target's device px per CSS px, for the edge ramp
       ...highlightUniforms(0), // nodes are dimmed/kept but not recoloured (recolor = 0)
     };
     this.model = new Model(device, {
@@ -436,6 +437,10 @@ export class InstancedCircles {
   }
   setViewport(width: number, height: number): void {
     this.uniforms["u_viewport"] = [width, height];
+  }
+  /** The target's device px per CSS px (#570): the disc's edge ramp is one device px wide. */
+  setPixelRatio(ratio: number): void {
+    this.uniforms["u_pixelRatio"] = ratio;
   }
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
@@ -520,8 +525,8 @@ export class InstancedCircles {
 
 /**
  * GPU-instanced **pie wedges** (#171) — one instance per wedge, reusing the circle's quad positioning
- * (per-instance centre/radius + world/screen sizeMode). The fragment discards outside the disc and
- * outside the wedge's `[startFrac, endFrac]` angular slice, so a full pie is one instanced draw and
+ * (per-instance centre/radius + world/screen sizeMode). The fragment covers the disc and the wedge's
+ * `[startFrac, endFrac]` angular slice, edges antialiased (#570), so a full pie is one instanced draw and
  * updates in place like {@link InstancedCircles}. Group id = the physical node id, so a hover/select
  * lights the whole pie (#162).
  */
@@ -566,6 +571,7 @@ export class InstancedPie {
       u_screen: 0,
       u_viewport: [width, height],
       u_borderDarken: data.borderDarken ?? 1,
+      u_pixelRatio: 1, // #570: the target's device px per CSS px, for the edge ramp
       ...highlightUniforms(0), // pie is a node glyph — dimmed/kept, not recoloured (recolor = 0)
     };
     this.model = new Model(device, {
@@ -606,6 +612,10 @@ export class InstancedPie {
   }
   setViewport(width: number, height: number): void {
     this.uniforms["u_viewport"] = [width, height];
+  }
+  /** The target's device px per CSS px (#570): the disc's edge ramp is one device px wide. */
+  setPixelRatio(ratio: number): void {
+    this.uniforms["u_pixelRatio"] = ratio;
   }
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;

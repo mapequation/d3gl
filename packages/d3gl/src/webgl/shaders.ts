@@ -87,19 +87,47 @@ in vec4 v_color;
 out vec4 fragColor;
 void main() { fragColor = v_color; }`;
 
+// Antialiased disc edges (#570), shared by every disc shader (points, instanced circles, pie wedges). A disc is a
+// quad whose fragment shader covers the disc's edge over one device px, as Canvas draws it, rather than discarding
+// the fragments outside it: MSAA smooths only triangle edges, and the quad's lie outside the disc. Injected into the
+// vertex shaders after their uniforms (`discPx` reads `u_transform` and `u_viewport`, which is CSS px):
+//   - `discPx`: the disc's radius in CSS px (a `screen` radius is one, a world radius scales with the zoom). Times
+//     `u_pixelRatio`, the target's device px per CSS px (set by the backend only when it changes), it is the
+//     radius in device px that the ramp and the two helpers below take. A renderer given no viewport (a bare
+//     `GroupRenderer`) cannot size its discs in px: they keep the hard edge they always had.
+//   - `discGrow`: the quad's scale, half a device px larger than the disc, so the ramp's outer half is rasterized.
+//   - `discFade`: a disc smaller than half a device px fades with its size (alpha × 2r), so a sliver of a disc
+//     stays faint rather than a half-transparent px: its total coverage is within 1.5× of its area down to 0.1 px,
+//     and a zero radius draws nothing, as before.
+const DISC_VS = `
+uniform float u_pixelRatio;   // device px per CSS px of the target (#570)
+float discPx(float radius, bool screen) {
+  if (u_viewport.x <= 0.0) return 1e6;
+  float r = abs(radius); // a negative radius (a scale extrapolated below its domain) flips the quad: draw |r|, as before
+  return screen ? r : r * 0.5 * u_viewport.x * abs(u_transform[0][0]);
+}
+float discGrow(float radiusPx) { return 1.0 + 0.5 / max(radiusPx, 1e-6); }
+float discFade(float radiusPx) { return min(1.0, 2.0 * radiusPx); }`;
+
+// The coverage of a disc's edge at `r` (local units, 1 = the edge) for a disc of `radiusPx` device px: a ramp one
+// device px wide, centred on the edge (#570).
+const DISC_FS = `
+float discCover(float r, float radiusPx) { return clamp((1.0 - r) * radiusPx + 0.5, 0.0, 1.0); }`;
+
 export const POINT_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform highp sampler2D u_colorTable;
 uniform highp sampler2D u_flags;
 uniform float u_pointScreen;
-uniform vec2 u_viewport;
+uniform vec2 u_viewport;${DISC_VS}
 in vec2 a_center;
 in vec2 a_corner;
 in float a_radius;
 in float a_pointId;
 out vec4 v_color;
 out vec2 v_local;
+out float v_radiusPx;
 void main() {
   int id = int(a_pointId + 0.5);
   ivec2 cs = textureSize(u_colorTable, 0);
@@ -107,11 +135,14 @@ void main() {
   ivec2 fsz = textureSize(u_flags, 0);
   int flags = int(texelFetch(u_flags, ivec2(id % fsz.x, id / fsz.x), 0).r * 255.0 + 0.5);
   if ((flags & 1) == 0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
-  v_local = a_corner;
+  v_radiusPx = discPx(a_radius, u_pointScreen > 0.5) * u_pixelRatio;
+  v_color.a *= discFade(v_radiusPx);
+  vec2 corner = a_corner * discGrow(v_radiusPx);
+  v_local = corner;
   vec3 c = u_transform * vec3(a_center, 1.0);
   vec2 off = (u_pointScreen > 0.5)
-    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
-    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+    ? corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + corner * a_radius, 1.0)).xy - c.xy;
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
@@ -119,8 +150,13 @@ export const POINT_FS = `#version 300 es
 precision highp float;
 in vec4 v_color;
 in vec2 v_local;
-out vec4 fragColor;
-void main() { if (dot(v_local, v_local) > 1.0) discard; fragColor = v_color; }`;
+in float v_radiusPx;
+out vec4 fragColor;${DISC_FS}
+void main() {
+  float cover = discCover(length(v_local), v_radiusPx);
+  if (cover <= 0.0) discard;
+  fragColor = vec4(v_color.rgb, v_color.a * cover);
+}`;
 
 export const PICK_FS = `#version 300 es
 precision highp float;
@@ -177,32 +213,35 @@ export const PT_POINT_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_pointScreen;
-uniform vec2 u_viewport;
+uniform vec2 u_viewport;${DISC_VS}
 in vec2 a_center;
 in vec2 a_corner;
 in float a_radius;
 in vec4 a_color;
 out vec4 v_color;
 out vec2 v_local;
+out float v_radiusPx;
 void main() {
-  v_color = a_color;
-  v_local = a_corner;
+  v_radiusPx = discPx(a_radius, u_pointScreen > 0.5) * u_pixelRatio;
+  v_color = vec4(a_color.rgb, a_color.a * discFade(v_radiusPx));
+  vec2 corner = a_corner * discGrow(v_radiusPx);
+  v_local = corner;
   vec3 c = u_transform * vec3(a_center, 1.0);
   vec2 off = (u_pointScreen > 0.5)
-    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
-    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+    ? corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + corner * a_radius, 1.0)).xy - c.xy;
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
 // INSTANCED_CIRCLE_VS — true GPU-instanced circles for the network lane (#100). A shared
 // unit-quad template (a_corner, per-vertex) is offset by per-instance centre/radius and
-// coloured from a per-instance attribute (no texture lookup). Pairs with POINT_FS, which
-// discards fragments outside the unit disc. Mirrors PT_POINT_VS's world/screen sizeMode.
+// coloured from a per-instance attribute (no texture lookup). Pairs with INSTANCED_CIRCLE_FS, which
+// covers the unit disc's edge (#570). Mirrors PT_POINT_VS's world/screen sizeMode.
 export const INSTANCED_CIRCLE_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
-uniform vec2 u_viewport;    // device px, for screen sizeMode
+uniform vec2 u_viewport;    // CSS px, for screen sizeMode${DISC_VS}
 layout(location = 0) in vec2 a_corner; // per-vertex unit-quad corner in [-1, 1]; location 0 stays buffer-backed (OffsetColumn, instanced.ts)
 in vec2 a_center;           // per-instance world centre
 in vec2 a_offset;           // per-instance offset from the centre in size units (#509); the constant (0, 0) without one
@@ -215,50 +254,68 @@ out vec4 v_color;
 out vec2 v_local;
 out float v_border;
 out vec4 v_borderColor;
+out float v_radiusPx;
 void main() {
   v_color = a_color;${HL_APPLY}
-  v_local = a_corner;
   // A px ring on a world disc: the disc's radius in px is a_radius · k, with k = ½ · viewport · |transform₀₀|.
-  float radiusPx = (u_screen > 0.5) ? a_radius : a_radius * 0.5 * u_viewport.x * abs(u_transform[0][0]);
+  bool screen = u_screen > 0.5;
+  float radiusPx = discPx(a_radius, screen);
   v_border = (u_borderPx > 0.5) ? min(1.0, a_border / max(radiusPx, 1e-6)) : a_border;
   v_borderColor = a_borderColor;
   if (!hl && u_dimActive > 0.5) v_borderColor.a *= u_dimOpacity; // dim the flow-border ring with its node (#162)
+  v_radiusPx = radiusPx * u_pixelRatio;
+  float fade = discFade(v_radiusPx);
+  v_color.a *= fade;
+  v_borderColor.a *= fade;
+  vec2 corner = a_corner * discGrow(v_radiusPx);
+  v_local = corner;
   // The offset is in size units (#509): px after the projection in screen mode, world units before it.
-  bool screen = u_screen > 0.5;
   vec2 centre = screen ? a_center : a_center + a_offset;
   vec3 c = u_transform * vec3(centre, 1.0);
   vec2 off = screen
-    ? (a_corner * a_radius + a_offset) * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
-    : (u_transform * vec3(centre + a_corner * a_radius, 1.0)).xy - c.xy;
+    ? (corner * a_radius + a_offset) * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(centre + corner * a_radius, 1.0)).xy - c.xy;
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
 // INSTANCED_CIRCLE_FS — flow-border circle (#104 N6): a filled disc with an optional outer ring.
-// `v_border` is the ring thickness as a fraction of the radius; fragments in the outer annulus
-// (r > 1 - border) take the border colour, the rest the fill. border = 0 ⇒ a plain filled disc
-// (so every existing circle layer renders exactly as before). Kept separate from the shared POINT_FS
-// (which PT_POINT_VS also uses) since it reads the extra ring varyings.
+// `v_border` is the ring thickness as a fraction of the radius; the outer annulus (r > 1 - border)
+// takes the border colour, the rest the fill. border = 0 ⇒ a plain filled disc. The disc's edge and the
+// ring's inner edge are each a one-device-px coverage ramp (#570); the ring and the fill mix premultiplied
+// over theirs, so a transparent fill (a module-boundary ring) does not darken the ring's inner edge. Kept
+// separate from the shared POINT_FS (which PT_POINT_VS also uses) since it reads the extra ring varyings.
 export const INSTANCED_CIRCLE_FS = `#version 300 es
 precision highp float;
 in vec4 v_color;
 in vec2 v_local;
 in float v_border;
 in vec4 v_borderColor;
-out vec4 fragColor;
+in float v_radiusPx;
+out vec4 fragColor;${DISC_FS}
 void main() {
   float r = length(v_local);
-  if (r > 1.0) discard;
-  fragColor = (v_border > 0.0 && r > 1.0 - v_border) ? v_borderColor : v_color;
+  float cover = discCover(r, v_radiusPx);
+  if (cover <= 0.0) discard;
+  vec4 c = v_color;
+  if (v_border > 0.0) {
+    // The fill is a disc inside the ring: its own edge ramp, faded below half a device px like the disc's.
+    float innerPx = max(0.0, 1.0 - v_border) * v_radiusPx;
+    float fill = clamp(innerPx - r * v_radiusPx + 0.5, 0.0, 1.0) * min(1.0, 2.0 * innerPx);
+    vec4 m = mix(vec4(v_borderColor.rgb * v_borderColor.a, v_borderColor.a), vec4(v_color.rgb * v_color.a, v_color.a), fill);
+    c = vec4(m.a > 0.0 ? m.rgb / m.a : m.rgb, m.a);
+  }
+  fragColor = vec4(c.rgb, c.a * cover);
 }`;
 
 // INSTANCED_PIE_VS — GPU-instanced pie wedges for the physical view of a state network (#171). Reuses
 // the circle's quad positioning (per-instance centre/radius, world/screen sizeMode) and carries the
 // wedge's angular range [startFrac, endFrac] in [0,1] to the fragment shader. One instance per wedge.
+// `v_widths` holds the per-wedge sines the fragment shader's thin-wedge and thin-gap terms scale (#570).
 export const INSTANCED_PIE_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
-uniform vec2 u_viewport;    // device px, for screen sizeMode
+uniform vec2 u_viewport;    // CSS px, for screen sizeMode${DISC_VS}
 in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
 in vec2 a_center;           // per-instance world centre (shared by a pie's wedges)
 in float a_radius;          // per-instance radius
@@ -268,39 +325,62 @@ in float a_border;          // per-instance outer band as a fraction of the radi
 out vec4 v_color;
 out vec2 v_local;
 out vec2 v_angles;
+out vec2 v_widths;
 out float v_border;
+out float v_radiusPx;
 void main() {
   v_color = a_color;${HL_APPLY}
-  v_local = a_corner;
   v_angles = a_angles;
+  // The chord across the wedge, and across the gap it leaves, at unit distance from the centre (≤ half turn each).
+  float span = a_angles.y - a_angles.x;
+  v_widths = 2.0 * sin(3.14159265 * min(vec2(span, 1.0 - span), 0.5));
   v_border = a_border;
+  v_radiusPx = discPx(a_radius, u_screen > 0.5) * u_pixelRatio;
+  v_color.a *= discFade(v_radiusPx);
+  vec2 corner = a_corner * discGrow(v_radiusPx);
+  v_local = corner;
   vec3 c = u_transform * vec3(a_center, 1.0);
   vec2 off = (u_screen > 0.5)
-    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
-    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+    ? corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + corner * a_radius, 1.0)).xy - c.xy;
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
-// INSTANCED_PIE_FS — a filled disc clipped to one angular wedge. Discards outside the unit disc (like
-// the circle) and outside the wedge's [startFrac, endFrac] angular slice. The angle fraction is
-// atan2(y,x) normalised to [0,1) — the SAME convention the Canvas/SVG wedge-arc emitter uses (in world
-// coords, before the shared world→screen transform), so the three backends partition the pie identically.
+// INSTANCED_PIE_FS — a filled disc clipped to one angular wedge. The angle fraction is atan2(y,x)
+// normalised to [0,1) — the SAME convention the Canvas/SVG wedge-arc emitter uses (in world coords,
+// before the shared world→screen transform), so the three backends partition the pie identically.
+// Every edge is a one-device-px coverage ramp, as Canvas draws the wedge's path (#570): the disc's
+// edge, the band's inner edge, and the wedge's two straight edges, from the signed distance to the
+// nearer one (± the distance from the centre beyond a quarter turn). Where the wedge, or the gap it
+// leaves, is narrower than a px, its coverage is its width (or one minus the gap's), so a sliver is as
+// faint as it is thin and a single-wedge pie has no seam; at the centre each wedge covers its share.
 export const INSTANCED_PIE_FS = `#version 300 es
 precision highp float;
 in vec4 v_color;
 in vec2 v_local;
 in vec2 v_angles;
+in vec2 v_widths;
 in float v_border;
+in float v_radiusPx;
 uniform float u_borderDarken; // RGB factor of the outer band (#507)
-out vec4 fragColor;
+out vec4 fragColor;${DISC_FS}
 void main() {
   float r = length(v_local);
-  if (r > 1.0) discard;
-  float frac = atan(v_local.y, v_local.x) * 0.15915494309; // /(2π) -> [-0.5, 0.5]
-  if (frac < 0.0) frac += 1.0;                              // -> [0, 1)
-  if (frac < v_angles.x || frac >= v_angles.y) discard;     // outside this wedge
-  // The wedge's outer band (the node's flow border, #507) in its own colour, darker — the circle's ring test.
-  fragColor = (v_border > 0.0 && r > 1.0 - v_border) ? vec4(v_color.rgb * u_borderDarken, v_color.a) : v_color;
+  float cover = discCover(r, v_radiusPx);
+  // /(2π) -> [-0.5, 0.5]; atan(0, 0) is undefined, and at the centre the caps below give the wedge its share anyway.
+  float frac = r > 0.0 ? atan(v_local.y, v_local.x) * 0.15915494309 : 0.0;
+  float span = v_angles.y - v_angles.x;
+  float turn = fract(frac - v_angles.x);                    // counter-clockwise from the start edge, [0, 1)
+  float inside = turn < span ? min(turn, span - turn) : -min(turn - span, 1.0 - turn); // to the nearer edge
+  float px = r * v_radiusPx;                                // device px from the centre
+  float wedge = clamp(px * sin(6.28318531 * clamp(inside, -0.25, 0.25)) + 0.5, 0.0, 1.0);
+  wedge = min(wedge, max(px * v_widths.x, span));
+  wedge = max(wedge, 1.0 - max(px * v_widths.y, 1.0 - span));
+  cover *= wedge;
+  if (cover <= 0.0) discard;
+  // The wedge's outer band (the node's flow border, #507) in its own colour, darker — the circle's ring.
+  float band = v_border > 0.0 ? clamp((r - 1.0 + v_border) * v_radiusPx + 0.5, 0.0, 1.0) : 0.0;
+  fragColor = vec4(v_color.rgb * mix(1.0, u_borderDarken, band), v_color.a * cover);
 }`;
 
 // INSTANCED_LINE_VS — GPU-instanced "path-strip" lines for the network lane (#100, bent #104 N6c).

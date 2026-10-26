@@ -127,6 +127,11 @@ const svg = map.toSVG(); // vector, on any backend
 const png = map.toPNG(); // raster, on webgl/canvas/auto
 ```
 
+`toPNG()` is what the screen shows: the canvas as drawn, at its device pixels (the CSS size times
+`devicePixelRatio`, so a 650×560 view exports 1300×1120 on a retina screen), with the same antialiasing
+and colours on both raster backends. The labels the WebGL backend shows in its HTML overlay are painted
+on top.
+
 On WebGL, content the GPU draws outside the retained scene — the instanced network glyphs/links, an
 LOD cut frontier, decluttered plot points — has no scene geometry to serialize, so the engine builds
 a vector view of the lanes' *current* emit at export time and hands it to the backend alongside the

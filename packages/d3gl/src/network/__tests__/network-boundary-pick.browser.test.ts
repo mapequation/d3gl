@@ -305,7 +305,9 @@ describe("hover, selection and tooltip of an open module (WebGL, #476)", () => {
     at(leaves[0]!.x, leaves[0]!.y);
     const one = await alphas();
     expect(one[0]).toBeGreaterThan(200);
-    expect(Math.max(...one.slice(1)), "the other members dim on a leaf hover").toBeLessThan(120);
+    // A dimmed member reads its 0.2 opacity (51) where nothing is under it, and up to ~120 where the hovered
+    // leaf's lit links run under its centre (the export draws their antialiased edges as the screen does, #569).
+    expect(Math.max(...one.slice(1)), "the other members dim on a leaf hover").toBeLessThan(160);
     // The ring: module 1 hovered, all six of its drawn members stay opaque.
     at(ring.x, ring.y - ring.r);
     expect(Math.min(...(await alphas())), "members of the hovered open module").toBeGreaterThan(200);
