@@ -412,6 +412,9 @@ export interface TextData {
   opacity?: number;
   /** Which side of `x` the text runs from (`"start"`/`"middle"`/`"end"`). Defaults to `"start"`. */
   align?: "start" | "middle" | "end";
+  /** Clockwise rotation in radians about (`x`, `y`) (#580): the text runs along the rotated axis, as
+   *  the WebGL overlay draws an oriented label. Defaults to 0 (horizontal). */
+  rotation?: number;
   /** A halo stroked behind the fill for legibility on busy backgrounds — the same halo the WebGL
    *  overlay strokes in CSS (#571). `width` is the half-stroke in px; 0 draws none. */
   halo?: { color: string; width: number };

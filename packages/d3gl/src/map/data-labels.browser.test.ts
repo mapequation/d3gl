@@ -178,6 +178,37 @@ describe("geoMap().labels() — native-text export routing (#223)", () => {
   });
 });
 
+describe("plot().labels() — setBackend() routes the labels to the new backend (#581)", () => {
+  it("Canvas → WebGL: the overlay shows every label with no transform change", async () => {
+    const h = host();
+    const chart = plot(h, { width: 240, height: 180, backend: "canvas" });
+    await chart.whenReady();
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], offset: [6, 0] });
+    expect(labelEls(h).length).toBe(0); // native text on Canvas
+
+    chart.setBackend("webgl");
+    await chart.whenReady();
+    expect(labelEls(h).map((e) => e.textContent).sort()).toEqual(["Alpha", "Beta", "Delta", "Gamma"]);
+    chart.destroy();
+    h.remove();
+  });
+
+  it("WebGL → Canvas: native text draws every label and the overlay empties", async () => {
+    const h = host();
+    const chart = plot(h, { width: 240, height: 180, backend: "webgl" });
+    await chart.whenReady();
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], offset: [6, 0] });
+    expect(labelEls(h).length).toBe(4);
+
+    chart.setBackend("canvas");
+    await chart.whenReady();
+    expect(labelEls(h).length).toBe(0);
+    expect((chart.toSVG().match(/<text/g) ?? []).length).toBe(4);
+    chart.destroy();
+    h.remove();
+  });
+});
+
 describe("plot().labels() — per-frame signature (#223, docs/agents/performance.md)", () => {
   it("measures each label ONCE at registration and NEVER on the per-transform path", async () => {
     const h = host(400, 300);

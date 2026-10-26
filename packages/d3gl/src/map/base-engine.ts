@@ -1,7 +1,7 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance, type Backend, type GroupBuilder, type GroupOptions, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
-import { LabelLayer, placeLabels, anchorBox, labelCullScratch, labelTextY, resolveLabelStyle, resolveLabelText, measureText, type LabelAnchor, type LabelHalo, type LabelStyle, type LabelText } from "../labels/index.js";
+import { LabelLayer, placeLabels, anchorBox, labelCullScratch, labelTextY, labelTextAnchor, labelTextRotation, resolveLabelStyle, resolveLabelText, measureText, type LabelAnchor, type LabelHalo, type LabelStyle, type LabelText } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
@@ -173,7 +173,8 @@ export interface DataLabelOptions<D = unknown> {
   /** Constant screen-px offset `[dx, dy]` from the anchor, or a per-datum accessor. Default `[0, 0]`. */
   offset?: [number, number] | ((d: D, i: number) => [number, number]);
   /** Oriented labels: reading-direction angle (radians) per datum — switches to the rotated
-   *  collision/render model (text runs along the axis, vertically centred on the anchor). */
+   *  collision/render model (text runs along the axis, vertically centred on the anchor). Drawn at
+   *  that angle on every backend and in every export. */
   rotationOf?: (d: D, i: number) => number;
   /** Which way text runs from the anchor (default `"start"`). Also places a PLAIN label's box —
    *  `"middle"` centres it on the anchor — with the CSS transform derived to match (#204). */
@@ -1807,14 +1808,17 @@ export abstract class BaseEngine {
    *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends.
    *  Position and alignment come from the box's declared placement: `x` IS the anchor for the box's
    *  own `textAnchor` (start ⇒ left edge, middle ⇒ centre, end ⇒ right edge) and `y` is the box's
-   *  vertical centre for the backends' "middle" baseline ({@link labelTextY}). */
+   *  vertical centre for the backends' "middle" baseline ({@link labelTextY}). An oriented box also
+   *  carries the rotation it renders at, and anchor and rotation both include the upright flip
+   *  ({@link labelTextAnchor}, {@link labelTextRotation}), as the overlay's transform does (#580). */
   private toTextData(survivors: readonly LabelBox[]): TextData[] {
     const text = this.labelText;
     return survivors.map((b) => ({
       x: b.x,
       y: labelTextY(b),
       text: String(b.text),
-      align: b.textAnchor ?? "start",
+      align: labelTextAnchor(b),
+      rotation: labelTextRotation(b),
       font: text?.font,
       color: text?.color,
       halo: text?.halo,
@@ -2785,7 +2789,12 @@ export abstract class BaseEngine {
     const paint = !this.skipPlaceholderPaint();
     if (paint) this.pushRenderLayers(next.backend);
     next.backend.setTransform(this.transform);
-    if (paint) next.backend.render();
+    if (paint) {
+      // Route the retained data labels to the new backend (#581) before its first frame, so native
+      // text bakes into this render and the overlay fills or empties now, not on the next pan/zoom.
+      this.refreshDataLabels();
+      next.backend.render();
+    }
     // Replay retained pass-through layers onto the freshly-installed backend (mirrors the
     // retained setLayers re-push above). A deferred/not-ready registration is activated here.
     if (this.ptSpecs.size > 0) {

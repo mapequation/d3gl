@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { cullLabels, labelCullScratch, labelGeometry, labelTransform, labelTextY, type LabelBox } from "../cull.js";
+import { cullLabels, labelCullScratch, labelGeometry, labelTransform, labelTextY, labelTextAnchor, labelTextRotation, type LabelBox } from "../cull.js";
 
 const viewport = { width: 100, height: 100 };
 
@@ -199,5 +199,33 @@ describe("labelGeometry", () => {
       id: "a", x: 0, y: 0, width: 40, height: 12, rotation: -Math.PI, keepUpright: true,
     });
     expect(g.transform).toBe("rotate(0deg) translate(-100%, -50%)");
+  });
+
+  it("gives native text the box it culls against: anchor, rotation and the upright flip (#580)", () => {
+    // Native text is drawn aligned by labelTextAnchor at (x, labelTextY), turned by labelTextRotation
+    // about that point. Its corners must be the geometry's, for plain and oriented boxes alike.
+    const rotations = [undefined, 0.4, -1.2, 2.6, -Math.PI];
+    for (const rotation of rotations) {
+      for (const textAnchor of ["start", "middle", "end"] as const) {
+        for (const keepUpright of [false, true]) {
+          const box: LabelBox = { id: "a", x: 30, y: 40, width: 40, height: 12, rotation, textAnchor, keepUpright, baseline: "middle" };
+          const align = labelTextAnchor(box);
+          const lx0 = align === "start" ? 0 : align === "end" ? -40 : -20;
+          const rot = labelTextRotation(box), cos = Math.cos(rot), sin = Math.sin(rot);
+          const ty = labelTextY(box);
+          const drawn = [[lx0, -6], [lx0 + 40, -6], [lx0 + 40, 6], [lx0, 6]].map(([lx, ly]) => [30 + lx! * cos - ly! * sin, ty + lx! * sin + ly! * cos]);
+          const corners = labelGeometry(box).corners;
+          drawn.forEach(([px, py], i) => {
+            expect(px).toBeCloseTo(corners[i]![0]);
+            expect(py).toBeCloseTo(corners[i]![1]);
+          });
+        }
+      }
+    }
+    // The flip turns by π and runs the text from the other side.
+    const west: LabelBox = { id: "w", x: 0, y: 0, rotation: 2.6, keepUpright: true };
+    expect(labelTextRotation(west)).toBeCloseTo(2.6 + Math.PI);
+    expect(labelTextAnchor(west)).toBe("end");
+    expect(labelTextRotation({ id: "p", x: 0, y: 0 })).toBe(0); // plain labels are not rotated
   });
 });
