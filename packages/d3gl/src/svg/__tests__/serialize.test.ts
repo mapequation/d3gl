@@ -21,6 +21,11 @@ describe("serializeTexts (#105 N7b-2)", () => {
     expect(svg).toContain('opacity="0.500"');
   });
 
+  it("draws no halo stroke at width 0", () => {
+    const svg = serializeTexts([{ x: 0, y: 0, text: "n", halo: { color: "#fff", width: 0 } }]);
+    expect(svg).not.toContain("stroke=");
+  });
+
   it("is empty for no labels", () => {
     expect(serializeTexts([])).toBe("");
   });

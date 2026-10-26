@@ -17,7 +17,7 @@ export function serializeTexts(texts: readonly TextData[]): string {
     const anchor = td.align === "middle" ? "middle" : td.align === "end" ? "end" : "start";
     const fill = td.color ?? "#000";
     const op = td.opacity != null && td.opacity < 1 ? ` opacity="${td.opacity.toFixed(3)}"` : "";
-    const halo = td.halo ? ` stroke="${td.halo.color}" stroke-width="${td.halo.width * 2}" stroke-linejoin="round" paint-order="stroke"` : "";
+    const halo = td.halo && td.halo.width > 0 ? ` stroke="${td.halo.color}" stroke-width="${td.halo.width * 2}" stroke-linejoin="round" paint-order="stroke"` : "";
     return `<text x="${td.x}" y="${td.y}" text-anchor="${anchor}" dominant-baseline="central" style="font:${td.font ?? "12px sans-serif"}" fill="${fill}"${halo}${op}>${escapeXml(td.text)}</text>`;
   });
   return `<g>${els.join("")}</g>`;

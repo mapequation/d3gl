@@ -156,7 +156,7 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     let els = labelEls(h);
     expect(els.length).toBeGreaterThan(0);
     expect(els.every((e) => e.style.font.includes("11px"))).toBe(true); // DEFAULT_LABEL_STYLE
-    expect(els.every((e) => e.style.textShadow.includes("3px"))).toBe(true); // the white halo
+    expect(els.every((e) => e.style.webkitTextStroke.includes("2px"))).toBe(true); // the white halo, width 1 (#571)
 
     // Re-call with a partial `style`: merged over the default, and the overlay is restyled.
     net.labels({ labelOf: (id) => `n${id}`, style: { color: "rgb(31, 41, 55)" } });

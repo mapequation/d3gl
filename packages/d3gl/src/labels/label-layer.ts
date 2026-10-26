@@ -89,38 +89,63 @@ export type LabelStyle = {
 };
 
 /**
- * Default overlay label look (#224) — a compact dark sans-serif label with a white text-shadow
- * halo, readable over busy geometry with zero user CSS. Applied by the engine label APIs (e.g.
- * `network.labels()`) via {@link resolveLabelStyle}; a raw {@link LabelLayer} stays unstyled by
- * default (the low-level primitive keeps today's inherit-from-container behaviour).
+ * A legibility halo (#571): a `color` stroke reaching `width` px beyond the glyph outlines, painted
+ * behind the fill. One shape for every backend — the HTML overlay (a CSS text stroke, {@link haloStyle}),
+ * Canvas `strokeText` and SVG `<text>`, exports included — so they draw the same halo. `width` 0 draws none.
+ */
+export type LabelHalo = { color: string; width: number };
+
+/**
+ * Default overlay label look (#224) — a compact dark sans-serif label, readable over busy geometry
+ * with zero user CSS. Its white halo is not here: {@link resolveLabelStyle} adds it from the label
+ * set's {@link LabelHalo}, so the overlay strokes the same halo as Canvas/SVG (#571). Applied by the
+ * engine label APIs (e.g. `network.labels()`); a raw {@link LabelLayer} stays unstyled by default (the
+ * low-level primitive keeps today's inherit-from-container behaviour).
  */
 export const DEFAULT_LABEL_STYLE: LabelStyle = {
   font: "600 11px/1 system-ui, sans-serif",
   color: "#111827",
-  textShadow: "0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff",
 };
 
 /**
- * The engine-label styling policy (#224): merge a caller's inline {@link LabelStyle} over
- * {@link DEFAULT_LABEL_STYLE} — a partial override keeps the rest — but when a `className` is
- * given, return only the explicit `style` (possibly undefined): the class's CSS keeps full
- * control, since an inline default would beat it. Shared so other engines lift the exact same
- * policy (#223); pass the result as {@link LabelLayer}'s `style`.
+ * The overlay CSS for a {@link LabelHalo} (#571): a text stroke twice the halo width, painted under
+ * the fill (`paint-order`), so it reaches `width` px beyond the glyphs with round joins — as the
+ * Canvas/SVG stroke does. Empty for no halo or width 0.
  */
-export function resolveLabelStyle(className: string | undefined, style: LabelStyle | undefined): LabelStyle | undefined {
-  return className ? style : { ...DEFAULT_LABEL_STYLE, ...style };
+export function haloStyle(halo: LabelHalo | undefined): LabelStyle {
+  if (!halo || halo.width <= 0) return {};
+  return { webkitTextStroke: `${halo.width * 2}px ${halo.color}`, paintOrder: "stroke", strokeLinejoin: "round" };
+}
+
+/**
+ * The engine-label styling policy (#224): {@link DEFAULT_LABEL_STYLE}, then the `halo`'s stroke
+ * ({@link haloStyle}), then a caller's inline {@link LabelStyle} — a partial override keeps the rest —
+ * but when a `className` is given, return only the explicit `style` (possibly undefined): the class's
+ * CSS keeps full control, since an inline default would beat it. Shared so other engines lift the
+ * exact same policy (#223); pass the result as {@link LabelLayer}'s `style`.
+ */
+export function resolveLabelStyle(className: string | undefined, style: LabelStyle | undefined, halo?: LabelHalo): LabelStyle | undefined {
+  return className ? style : { ...DEFAULT_LABEL_STYLE, ...haloStyle(halo), ...style };
 }
 
 /**
  * The same default look for BACKEND-NATIVE text (SVG `<text>` / Canvas `fillText`, incl. export),
- * which CSS can't reach: the `font`/`color`/`halo` equivalent of {@link DEFAULT_LABEL_STYLE}
- * (canvas font shorthand takes no line-height; the 3px halo stroke ≈ the 3px shadow blur).
+ * which CSS can't reach: the `font`/`color` equivalent of {@link DEFAULT_LABEL_STYLE} (canvas font
+ * shorthand takes no line-height), and the default halo every backend strokes (#571).
  */
-export const DEFAULT_LABEL_TEXT: { font: string; color: string; halo: { color: string; width: number } } = {
+export const DEFAULT_LABEL_TEXT: { font: string; color: string; halo: LabelHalo } = {
   font: "600 11px system-ui, sans-serif",
   color: "#111827",
-  halo: { color: "#ffffff", width: 3 },
+  halo: { color: "#ffffff", width: 1 },
 };
+
+/**
+ * The halo a label set draws (#571): the explicit `halo`, else none when `style.textShadow` is
+ * `"none"` (the opt-out from when the overlay's halo was a text-shadow), else {@link DEFAULT_LABEL_TEXT}'s.
+ */
+export function resolveLabelHalo(halo: LabelHalo | undefined, style: LabelStyle | undefined): LabelHalo | undefined {
+  return halo ?? (style?.textShadow === "none" ? undefined : DEFAULT_LABEL_TEXT.halo);
+}
 
 /**
  * An HTML overlay of absolutely-positioned label elements. On each update it maps

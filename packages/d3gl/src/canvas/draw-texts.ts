@@ -14,7 +14,8 @@ export function paintTexts(ctx: CanvasRenderingContext2D, texts: readonly TextDa
     ctx.font = td.font ?? "12px sans-serif";
     ctx.textAlign = td.align === "middle" ? "center" : td.align === "end" ? "right" : "left";
     ctx.globalAlpha = td.opacity ?? 1;
-    if (td.halo) {
+    // Width 0 means no halo: Canvas ignores `lineWidth = 0`, so stroking would reuse the previous width.
+    if (td.halo && td.halo.width > 0) {
       ctx.strokeStyle = td.halo.color;
       ctx.lineWidth = td.halo.width * 2;
       ctx.lineJoin = "round";

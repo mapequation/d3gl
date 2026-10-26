@@ -412,8 +412,8 @@ export interface TextData {
   opacity?: number;
   /** Which side of `x` the text runs from (`"start"`/`"middle"`/`"end"`). Defaults to `"start"`. */
   align?: "start" | "middle" | "end";
-  /** A halo stroked behind the fill for legibility on busy backgrounds (the export analogue of the
-   *  overlay's text-shadow). `width` is the half-stroke in px. */
+  /** A halo stroked behind the fill for legibility on busy backgrounds — the same halo the WebGL
+   *  overlay strokes in CSS (#571). `width` is the half-stroke in px; 0 draws none. */
   halo?: { color: string; width: number };
 }
 

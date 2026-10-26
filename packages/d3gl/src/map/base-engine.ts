@@ -1,7 +1,7 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance, type Backend, type GroupBuilder, type GroupOptions, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
-import { LabelLayer, placeLabels, anchorBox, labelCullScratch, labelTextY, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
+import { LabelLayer, placeLabels, anchorBox, labelCullScratch, labelTextY, resolveLabelStyle, resolveLabelHalo, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelHalo, type LabelStyle } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
@@ -183,20 +183,21 @@ export interface DataLabelOptions<D = unknown> {
   /** Cap the number of shown labels to the top-k by importance (default: no cap — collision thins). */
   max?: number;
   /** Inline overlay CSS (camelCased property → value), merged over the built-in default label look
-   *  (a dark 11px sans-serif with a white halo) — a partial override like `{ color: "#333" }` keeps
-   *  the rest. Applied once per element at creation, never per frame. */
+   *  (a dark 11px sans-serif, plus the {@link halo}'s stroke) — a partial override like `{ color: "#333" }`
+   *  keeps the rest. Applied once per element at creation, never per frame. */
   style?: LabelStyle;
-  /** Advanced overlay styling: a CSS class that SKIPS the built-in default so the class's CSS has
-   *  full control (combine with {@link style} for inline overrides). */
+  /** Advanced overlay styling: a CSS class that SKIPS the built-in default (the overlay's {@link halo}
+   *  included) so the class's CSS has full control (combine with {@link style} for inline overrides). */
   className?: string;
   /** Font for backend-native text (SVG/Canvas, incl. export). Defaults to {@link style}'s font, then
    *  the built-in default. Also the font used to MEASURE label boxes. */
   font?: string;
   /** Fill colour for backend-native text. Defaults to {@link style}'s colour, then the default. */
   color?: string;
-  /** Legibility halo stroked behind backend-native text. Defaults to the built-in white halo unless
-   *  {@link style} sets `textShadow: "none"`. */
-  halo?: { color: string; width: number };
+  /** Legibility halo stroked behind the label text on every backend (#571): the WebGL overlay (a CSS
+   *  text stroke), SVG/Canvas, and every export. `width` is the half-stroke in px; `0` draws none.
+   *  Default `{ color: "#ffffff", width: 1 }`, or none when {@link style} sets `textShadow: "none"`. */
+  halo?: LabelHalo;
 }
 
 /**
@@ -349,7 +350,7 @@ export abstract class BaseEngine {
   protected labelLayer: LabelLayer | null = null;
   /** Backend-native text style (SVG/Canvas `<text>`/`fillText`, incl. export) for the current label
    *  set — set once by {@link createLabelOverlay}, read by {@link routeLabels}. Null when off. */
-  private labelText: { font?: string; color?: string; halo?: { color: string; width: number } } | null = null;
+  private labelText: { font?: string; color?: string; halo?: LabelHalo } | null = null;
   /** The last {@link routeLabels} anchor set, retained (reference only) for the export-only text
    *  backend push (#219): a WebGL toPNG()/toSVG() places these once at export time. Always current —
    *  the overlay branch of routeLabels runs on every transform/rebuild. Covers BOTH network frontier
@@ -1729,13 +1730,13 @@ export abstract class BaseEngine {
   protected createLabelOverlay(
     className: string | undefined,
     style: LabelStyle | undefined,
-    text: { font?: string; color?: string; halo?: { color: string; width: number } },
+    text: { font?: string; color?: string; halo?: LabelHalo },
   ): void {
     if (typeof getComputedStyle === "function" && getComputedStyle(this.host).position === "static") {
       this.host.style.position = "relative";
     }
     this.labelLayer?.destroy();
-    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style));
+    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style, text.halo));
     this.labelText = text;
   }
 
@@ -1871,7 +1872,7 @@ export abstract class BaseEngine {
     // absent, so one `style` object styles both. Also the font used to MEASURE the label boxes.
     const font = canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font);
     const color = opts.color ?? opts.style?.color ?? DEFAULT_LABEL_TEXT.color;
-    const halo = opts.halo ?? (opts.style?.textShadow === "none" ? undefined : DEFAULT_LABEL_TEXT.halo);
+    const halo = resolveLabelHalo(opts.halo, opts.style);
     this.createLabelOverlay(opts.className, opts.style, { font, color, halo });
 
     const offsetOf = typeof opts.offset === "function" ? opts.offset : (): [number, number] => (opts.offset as [number, number]) ?? [0, 0];
