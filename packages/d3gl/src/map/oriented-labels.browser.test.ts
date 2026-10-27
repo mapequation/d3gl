@@ -97,6 +97,28 @@ describe("oriented data labels draw the same on WebGL, Canvas and SVG (#580)", (
     });
   }
 
+  it("rounds each angle to rotationStep degrees (default 1), the same on the overlay and native text", async () => {
+    const angle = 0.123; // 7.047°
+    const rotated = async (backend: "webgl" | "canvas", rotationStep?: number) => {
+      const h = document.createElement("div");
+      document.body.appendChild(h);
+      const p = plot(h, { width: W, height: H, backend });
+      await p.whenReady();
+      p.labels([{ x: W / 2, y: H / 2 }], { labelOf: () => TEXT, anchorOf: (d) => [d.x, d.y], rotationOf: () => angle, rotationStep, font: FONT });
+      const out = backend === "webgl"
+        ? (h.querySelector<HTMLElement>("[data-label-id]")?.style.transform.match(/rotate\(([-\d.e]+)deg\)/)?.[1] ?? "")
+        : (p.toSVG().match(/rotate\(([-\d.e]+) /)?.[1] ?? "");
+      p.destroy();
+      h.remove();
+      return Number(out);
+    };
+    for (const backend of ["webgl", "canvas"] as const) {
+      expect(await rotated(backend)).toBeCloseTo(7, 6);
+      expect(await rotated(backend, 5)).toBeCloseTo(5, 6);
+      expect(await rotated(backend, 0)).toBeCloseTo((angle * 180) / Math.PI, 3);
+    }
+  });
+
   it("toSVG() carries the same rotated <text> from WebGL and Canvas", async () => {
     const c: Case = { name: "", rotation: (5 * Math.PI) / 6, keepUpright: true };
     const gl = document.createElement("div");

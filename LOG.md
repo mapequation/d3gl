@@ -1127,7 +1127,9 @@ everywhere but the WebGL screen.
 - Rotated text is far slower to paint than flat text, on every backend: each distinct angle rasterizes its own
   glyphs. 2,000 labels at random angles took 311 ms to fill (1,092 ms with the halo) against 13 ms flat (18 ms) on
   an M1 Max Canvas, and the overlay paid the same in headless Chromium (about 125 ms per 1,000 rotated labels,
-  HTML or SVG, against 10 ms flat). Rounding angles to whole degrees only cut it 2.5–3×.
+  HTML or SVG, against 10 ms flat). Shared angles reuse glyphs, so `rotationStep` (default 1°) rounds them once
+  at `labels()` time. For 2,000 labels the HTML overlay took 392 ms at free angles, 266 at 1°, 149 at 2° and 67 at
+  5° (21 flat); Canvas 725, 598, 527 and 414 (7 flat) in headless Chromium, and 1° cut the M1 Max Canvas 2.5×.
 - An SVG overlay costs more than the HTML one per frame: moving N `<text>` elements took 3–5× the style + layout
   of N positioned `<div>`s (M1 Max: 3.2 vs 1.3 ms at 1k labels, 25 vs 7 ms at 5k, 125 vs 34 ms at 20k), and
   moving them by `transform` instead of `x`/`y` was slower still. Paint was the same.
