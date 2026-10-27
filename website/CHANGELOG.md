@@ -1,5 +1,12 @@
 # @d3gl/website
 
+## 0.0.20
+
+### Patch Changes
+
+- Updated dependencies [[`0151de3`](https://github.com/mapequation/d3gl/commit/0151de3c077c5e04cf15e76189291eb709381c8b), [`22513a8`](https://github.com/mapequation/d3gl/commit/22513a82634baa1f73c01460ef88cbb0550fb838), [`0151de3`](https://github.com/mapequation/d3gl/commit/0151de3c077c5e04cf15e76189291eb709381c8b), [`0151de3`](https://github.com/mapequation/d3gl/commit/0151de3c077c5e04cf15e76189291eb709381c8b), [`1cb763c`](https://github.com/mapequation/d3gl/commit/1cb763cb58b33a440098007fe86da6470a67e9b0), [`3140a4a`](https://github.com/mapequation/d3gl/commit/3140a4af4c3633d93993a50fa0125ad0b1e93721), [`42121f9`](https://github.com/mapequation/d3gl/commit/42121f938dca3f01762f787e005d4a4ab5a8eb30), [`6dc8d73`](https://github.com/mapequation/d3gl/commit/6dc8d730b94a6f63cb66abe0f58be0ac995f616f), [`0151de3`](https://github.com/mapequation/d3gl/commit/0151de3c077c5e04cf15e76189291eb709381c8b), [`b30eb84`](https://github.com/mapequation/d3gl/commit/b30eb8413225d1b5c60cfb2cfd7935a43df821e9), [`7d28ab6`](https://github.com/mapequation/d3gl/commit/7d28ab61bc25c2e92b4e9d564ac3b08413f59bae), [`b0bdacf`](https://github.com/mapequation/d3gl/commit/b0bdacfe193a5ef86c0b17596791e1ef3ed76a3e), [`c372385`](https://github.com/mapequation/d3gl/commit/c3723859c8af6764dbd51e92e5b0841977acd5ac), [`7cb01c8`](https://github.com/mapequation/d3gl/commit/7cb01c852eb83782af5fc85a33818da3a7449754)]:
+  - @mapequation/d3gl@0.13.0
+
 ## 0.0.19
 
 ### Patch Changes
