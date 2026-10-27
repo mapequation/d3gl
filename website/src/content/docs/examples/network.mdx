@@ -295,7 +295,8 @@ Removing the self-links from the edge list instead would change all three.
 A graph without self-links pays one scan of its edges, once per graph, and nothing per frame. With
 self-links, each frame that moves the nodes updates the loops in place, in time linear in the loops and
 the degree of their nodes; zoom and pan on WebGL cost nothing extra. With `selfLinks: false` the engine builds no
-loops at all, not even the scan, so the frame costs what the same edges without self-links cost.
+loops at all, not even the scan, and does no loop work on any frame; each self-link edge keeps its slot among the
+links, as when its loop draws.
 
 <ExampleCard files={["self-links/draw.ts", "self-links/data.ts"]}>
   <SelfLinks client:visible slot="demo" />

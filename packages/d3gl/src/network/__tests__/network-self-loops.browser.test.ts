@@ -590,17 +590,20 @@ describe("selfLinks: false hides the self-link loops (#586)", () => {
     });
 
   for (const backend of BACKENDS)
-    it(`${backend}: style({ selfLinks }) toggles the loops on a drawn network`, async () => {
-      const net = await draw({ backend, sizeMode: "screen", directed: true });
-      const on = await loopRed(frame(net, backend));
-      net.style({ selfLinks: false });
-      const off = await loopRed(frame(net, backend));
-      net.style({ selfLinks: true });
-      const back = await loopRed(frame(net, backend));
-      net.destroy();
-      expect(on).toBeGreaterThan(20);
-      expect(off).toBe(0);
-      expect(back).toBeCloseTo(on, 0);
+    it(`${backend}: style({ selfLinks }) toggles the loops on a drawn network, LOD off and on`, async () => {
+      for (const lod of [false, true]) {
+        const label = lod ? "LOD" : "no LOD";
+        const net = await draw({ backend, sizeMode: "screen", directed: true, lod });
+        const on = await loopRed(frame(net, backend));
+        net.style({ selfLinks: false });
+        const off = await loopRed(frame(net, backend));
+        net.style({ selfLinks: true });
+        const back = await loopRed(frame(net, backend));
+        net.destroy();
+        expect(on, label).toBeGreaterThan(20);
+        expect(off, label).toBe(0);
+        expect(back, label).toBeCloseTo(on, 0);
+      }
     });
 
   for (const backend of BACKENDS)

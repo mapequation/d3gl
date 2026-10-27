@@ -325,9 +325,9 @@ export interface NetworkStyle {
   linkBend?: number;
   /**
    * Draw self-links (#586): a node's self-links as one loop at its rim (#505, default `true`). `false` hides the loops
-   * on every backend and in every view (a state network's physical-view self-links too) and builds none of them, so the
-   * frame costs what it would without self-links. Display-only: the self-links stay in the data, and count in degree,
-   * strength and the layout as before.
+   * on every backend and in every view (a state network's physical-view self-links too) and builds none of them: no loop
+   * work on any frame (each self-link edge keeps its slot in the link lane, as when it draws). Display-only: the
+   * self-links stay in the data, and count in degree, strength and the layout as before.
    */
   selfLinks?: boolean;
   /**
