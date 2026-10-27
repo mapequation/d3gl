@@ -47,9 +47,10 @@ export function fontRowHeight(font: string): number {
 }
 
 /** Strip a `/line-height` token from a CSS font shorthand so it is valid for the canvas `font`
- *  property (which rejects line-height), e.g. `"600 11px/1 system-ui"` → `"600 11px system-ui"`. */
+ *  property (which rejects line-height), e.g. `"600 11px/1 system-ui"` → `"600 11px system-ui"`, with
+ *  or without spaces around the slash (browsers serialize it as `"11px / 1"`). */
 export function canvasFont(font: string): string {
-  return font.replace(/(\d+(?:\.\d+)?px)\/\S+/, "$1");
+  return font.replace(/(\d+(?:\.\d+)?px)\s*\/\s*[^\s,]+/, "$1");
 }
 
 /** The trim marker (#496): U+2026 HORIZONTAL ELLIPSIS, one glyph. */

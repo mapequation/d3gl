@@ -70,7 +70,8 @@ describe("LabelLayer styling (#224)", () => {
     const el = el1(h);
     expect(el.style.color).toBe("rgb(31, 41, 55)"); // the override
     expect(el.style.font).toContain("11px"); // the rest of DEFAULT_LABEL_STYLE kept
-    expect(el.style.textShadow).toContain("3px"); // the white halo
+    expect(el.style.webkitTextStroke).toContain("2px"); // the white halo: a 2 × width stroke (#571)
+    expect(el.style.paintOrder).toBe("stroke"); // painted under the fill, as on Canvas/SVG
     layer.destroy();
     h.remove();
   });

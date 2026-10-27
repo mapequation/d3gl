@@ -156,13 +156,19 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     let els = labelEls(h);
     expect(els.length).toBeGreaterThan(0);
     expect(els.every((e) => e.style.font.includes("11px"))).toBe(true); // DEFAULT_LABEL_STYLE
-    expect(els.every((e) => e.style.textShadow.includes("3px"))).toBe(true); // the white halo
+    expect(els.every((e) => e.style.webkitTextStroke.includes("2px"))).toBe(true); // the white halo, width 1 (#571)
 
     // Re-call with a partial `style`: merged over the default, and the overlay is restyled.
     net.labels({ labelOf: (id) => `n${id}`, style: { color: "rgb(31, 41, 55)" } });
     els = labelEls(h);
     expect(els.every((e) => e.style.color === "rgb(31, 41, 55)")).toBe(true); // the override applied
     expect(els.every((e) => e.style.font.includes("11px"))).toBe(true); // the rest of the default kept
+
+    // The native-text options style the overlay too (#577): one font and colour on every backend.
+    net.labels({ labelOf: (id) => `n${id}`, font: "14px serif", color: "rgb(187, 0, 0)" });
+    els = labelEls(h);
+    expect(els.every((e) => e.style.font.includes("14px") && e.style.font.includes("serif"))).toBe(true);
+    expect(els.every((e) => e.style.color === "rgb(187, 0, 0)")).toBe(true);
     net.destroy();
     h.remove();
   });

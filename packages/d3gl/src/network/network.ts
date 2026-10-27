@@ -6,7 +6,7 @@ import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingOptionsOf, lodSpacing, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, markHolders, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
-import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
+import { DEFAULT_LABEL_TEXT, resolveLabelText, type LabelAnchor, type LabelHalo, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./nested-layout.js";
@@ -172,15 +172,16 @@ export interface NetworkLabelOptions {
    *  (summed flow/strength) with LOD on, node strength with LOD off. */
   importanceOf?: (id: number, info: NetworkHit) => number;
   /** Class set on each label element — the **advanced** styling path for the HTML overlay (WebGL
-   *  backend): providing it SKIPS the built-in default style, so your class's CSS has full control
-   *  (combine with {@link style} for inline overrides). Backend-native text (SVG/Canvas) can't use
-   *  CSS; style it with the {@link font}/{@link color}/{@link halo} options below. */
+   *  backend): providing it SKIPS the built-in inline style (the {@link font}/{@link color}/{@link halo}
+   *  below included), so your class's CSS has full control on the overlay (combine with {@link style}
+   *  for inline overrides). Backend-native text (SVG/Canvas, exports) can't use CSS and still draws
+   *  {@link font}/{@link color}/{@link halo}, so keep the class in step with them. */
   className?: string;
   /** Inline CSS (camelCased property → value) for the **HTML overlay** label elements, merged over
-   *  the built-in default (a dark 11px sans-serif label with a white halo — `DEFAULT_LABEL_STYLE`),
-   *  so a partial override like `{ color: "#1f2937" }` keeps the rest. Applied ONCE per element at
-   *  creation — never per frame. Backend-native text (SVG/Canvas, incl. export) is styled with
-   *  {@link font}/{@link color}/{@link halo}, whose defaults match this look. */
+   *  the built-in look, so a partial override keeps the rest. Applied ONCE per element at creation —
+   *  never per frame. Its `font` and `color` style **every** backend when {@link font}/{@link color}
+   *  are not given (#577), and `textShadow: "none"` (without a {@link halo}) turns the halo off on
+   *  every backend; any other property styles the overlay only. */
   style?: LabelStyle;
   /** Longest a label is drawn, in **screen px** of text width (#496): longer text is cut and ends in an
    *  ellipsis (`…`), and placement (collision culling) uses the trimmed box. The full label shows in place
@@ -199,16 +200,17 @@ export interface NetworkLabelOptions {
    * (default 4). Ignored outside the `both` view. The primary {@link labelOf} still labels the state nodes.
    */
   physical?: { labelOf: (physicalId: number) => string | null | undefined; gap?: number };
-  /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, and `toSVG()`/`toPNG()`
-   *  export on every backend incl. WebGL — #105 N7b-2, #219) — a CSS font shorthand, e.g.
-   *  `"600 11px sans-serif"`. Defaults to the overlay default's font (`DEFAULT_LABEL_TEXT`), so
-   *  backends match with no options set. */
+  /** Label font on **every** backend (#577): the WebGL overlay, SVG `<text>` / Canvas `fillText`, and
+   *  every `toSVG()`/`toPNG()` — a CSS font shorthand with a px size, e.g. `"600 11px sans-serif"`. Also
+   *  the font label boxes are measured in. Defaults to {@link style}'s font, then `DEFAULT_LABEL_TEXT`'s. */
   font?: string;
-  /** Fill colour for backend-native text. Defaults to the overlay default's colour. */
+  /** Label fill colour on every backend (#577). Defaults to {@link style}'s colour, then the default. */
   color?: string;
-  /** A legibility halo stroked behind backend-native text — the export analogue of a CSS text-shadow.
-   *  `width` is the half-stroke in px. Defaults to the overlay default's white halo. */
-  halo?: { color: string; width: number };
+  /** A legibility halo stroked behind the label text on **every** backend (#571): the WebGL overlay (a
+   *  CSS text stroke), SVG/Canvas `<text>`/`strokeText`, and every `toSVG()`/`toPNG()`. `width` is the
+   *  half-stroke in px (how far the halo reaches beyond the glyphs); `0` draws none.
+   *  Default `{ color: "#ffffff", width: 1 }`. */
+  halo?: LabelHalo;
 }
 
 /** Visual style. Link appearance accessors arrive with the link pass (#100 N2.2). */
@@ -2686,16 +2688,18 @@ export class Network extends BaseEngine {
     // One default look across backends (#224): backend-native text (SVG/Canvas, incl. export)
     // defaults to the overlay default's equivalent; explicit font/color/halo win. Normalized once
     // here, so refreshLabels() reads plain opts with no per-frame defaulting.
-    this.labelOpts = { ...DEFAULT_LABEL_TEXT, ...opts };
+    // One font/colour/halo for the overlay, the native text and the measurement (#577), resolved once here.
+    const text = resolveLabelText(opts);
+    this.labelOpts = { ...opts, ...text };
     if (this.labelMaxWidth(this.labelOpts) !== undefined) this.attachPointer(); // the full label on hover (#496): the vector backends have no hover lane to attach it
     // Measure label boxes in the font the labels actually render in (explicit `font`, else the
     // overlay's `style.font`, else the shared default) — one memoizing measurer per label set (#204).
-    this.labelMeasure = new TextMeasurer(canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font));
+    this.labelMeasure = new TextMeasurer(text.font);
     // (Re)create the shared overlay on every call: className/style land once per element at creation
     // (never on the per-transform path), so a styling change must rebuild the elements. Cheap and
     // flash-free — labels() is a call-path, and the synchronous refreshLabels() below repopulates
     // in the same task at O(visible labels), the same order one overlay update already costs.
-    this.createLabelOverlay(opts.className, opts.style, { font: this.labelOpts.font, color: this.labelOpts.color, halo: this.labelOpts.halo });
+    this.createLabelOverlay(opts.className, opts.style, text);
     this.refreshLabels();
     this.render(); // bake just-set labels into the frame (Canvas); no-op-ish for the live-DOM backends
     return this;

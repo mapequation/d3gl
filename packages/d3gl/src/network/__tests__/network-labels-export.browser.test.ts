@@ -31,6 +31,19 @@ describe("network.labels() backend-native text (#105 N7b-2)", () => {
     net.destroy();
   });
 
+  it("style.font and style.color reach the native text too (#577)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    net.data(graph()).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: POS });
+    net.labels({ labelOf: (id) => `n${id}`, style: { font: "13px/1.4 serif", color: "#336699" } });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    const svg = net.toSVG();
+    expect(svg).toContain("font:13px serif"); // the style's font, line-height stripped for native text
+    expect(svg).toContain('fill="#336699"');
+    net.destroy();
+  });
+
   it("Canvas backend includes labels in toSVG() and renders to a PNG without throwing", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "canvas" });
     await net.whenReady();

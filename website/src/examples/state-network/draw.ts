@@ -166,7 +166,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
       // Labels: physical (1,2,…) in the physical + both views, state ((i,j)) in the state + both views.
       // In the both view physical labels sit just outside each physical node (≈1:30); state labels on the state nodes.
-      // The built-in label style covers font/colour; `style` thins the default halo a touch.
+      // The built-in label style (font, colour, halo) covers every backend, export included.
       const physOn = options.physLabels === "On";
       const stateOn = options.stateLabels === "On";
       const cap = LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12;
@@ -175,7 +175,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       net.labels(
         showState || showPhysical
           ? {
-              style: { textShadow: "0 0 3px #fff, 0 0 3px #fff" },
               max: Number.isFinite(cap) ? cap : undefined,
               // `info.level` names the id's graph: no per-view id mapping in the app.
               labelOf: (id, info) => (info.level === "physical" ? (physOn ? g.physicalNames[id] ?? null : null) : stateOn ? stateName(g, id) : null),
