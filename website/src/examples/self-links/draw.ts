@@ -10,6 +10,7 @@ import { buildSelfLinkGraph } from "./data.js";
  * switch the link **Style** and the **Sizing** mode, and the **backend** (WebGL / Canvas / SVG). **Bend** the
  * other links (`linkBend`, with its **Bend strength**), and shape the loop: **Loop spread** is the angle between its
  * two legs (`selfLinkSpread`, degrees) and **Loop length** how far it reaches out (`selfLinkLength`, node radii).
+ * **Loops: Hidden** turns them off (`selfLinks: false`): the node sizes, by degree, stay as they are.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -40,6 +41,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         linkWidth, // ∝ weight, loops included
         linkStroke: linkColor,
         linkBend: options.bend === "Bent" ? Number(options.bendStrength) : 0,
+        selfLinks: options.loops === "Shown",
         selfLinkSpread: Number(options.loopSpread),
         selfLinkLength: Number(options.loopLength),
       });

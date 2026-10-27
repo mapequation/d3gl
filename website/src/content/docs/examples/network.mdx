@@ -287,9 +287,15 @@ both view for the state graph's self-links, and the physical view for flow that 
 state nodes, the links between the state nodes of one lump likewise sum into that lump's self-link, drawn as a loop in
 the lumped state and both views.
 
+To hide the loops, set `selfLinks: false` in `style()` (the demo's **Loops** control). No loop is drawn on any
+backend or in any view, `toSVG()` included, and none is picked or highlighted. Hiding is display-only: the self-link
+edges stay in the data, so a node's degree and strength (each self-link counted once) and the layout are unchanged.
+Removing the self-links from the edge list instead would change all three.
+
 A graph without self-links pays one scan of its edges, once per graph, and nothing per frame. With
 self-links, each frame that moves the nodes updates the loops in place, in time linear in the loops and
-the degree of their nodes; zoom and pan on WebGL cost nothing extra.
+the degree of their nodes; zoom and pan on WebGL cost nothing extra. With `selfLinks: false` the engine builds no
+loops at all, not even the scan, so the frame costs what the same edges without self-links cost.
 
 <ExampleCard files={["self-links/draw.ts", "self-links/data.ts"]}>
   <SelfLinks client:visible slot="demo" />
