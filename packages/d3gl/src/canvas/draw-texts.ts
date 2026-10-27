@@ -10,6 +10,8 @@ import { TEXT_HALO_MITER_LIMIT, type TextData } from "../core/index.js";
 export function paintTexts(ctx: CanvasRenderingContext2D, texts: readonly TextData[]): void {
   if (texts.length === 0) return;
   ctx.textBaseline = "middle";
+  ctx.lineJoin = "miter"; // the halo's joins, the WebGL overlay's (#571); nothing below changes them
+  ctx.miterLimit = TEXT_HALO_MITER_LIMIT;
   // The caller's transform, restored after each rotated label; read only when one is rotated.
   let base: DOMMatrix | null = null;
   for (const td of texts) {
@@ -29,8 +31,6 @@ export function paintTexts(ctx: CanvasRenderingContext2D, texts: readonly TextDa
     if (td.halo && td.halo.width > 0) {
       ctx.strokeStyle = td.halo.color;
       ctx.lineWidth = td.halo.width * 2;
-      ctx.lineJoin = "miter";
-      ctx.miterLimit = TEXT_HALO_MITER_LIMIT;
       ctx.strokeText(td.text, x, y);
     }
     ctx.fillStyle = td.color ?? "#000";

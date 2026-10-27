@@ -1888,7 +1888,7 @@ export abstract class BaseEngine {
     this.createLabelOverlay(opts.className, opts.style, text);
 
     const offsetOf = typeof opts.offset === "function" ? opts.offset : (): [number, number] => (opts.offset as [number, number]) ?? [0, 0];
-    const step = ((opts.rotationStep ?? 1) * Math.PI) / 180; // radians; 0 keeps angles exact
+    const step = ((opts.rotationStep ?? 1) * Math.PI) / 180; // radians; 0 (or not a finite step) keeps angles exact
     const measured = new Map<string, { width: number; height: number }>(); // dedupe repeated texts (once each)
     const anchors: LabelAnchor[] = [];
     for (let i = 0; i < data.length; i++) {
@@ -1900,7 +1900,7 @@ export abstract class BaseEngine {
       let box = measured.get(text);
       if (!box) { box = measureText(text, font); measured.set(text, box); }
       const angle = opts.rotationOf?.(d, i);
-      const rotation = angle === undefined || step <= 0 ? angle : Math.round(angle / step) * step;
+      const rotation = angle === undefined || !(Number.isFinite(step) && step > 0) ? angle : Math.round(angle / step) * step;
       const [ox, oy] = offsetOf(d, i);
       // Plain labels: the box is top-left, so shift up by height/2 to sit centred on the anchor+offset.
       // Oriented labels: labelGeometry already centres vertically, so the offset is used as given.

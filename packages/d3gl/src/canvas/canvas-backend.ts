@@ -1,5 +1,6 @@
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath, StyleTables, TextData, HoverText } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
+import { TEXT_HALO_MITER_LIMIT } from "../core/index.js";
 import { paintTexts } from "./draw-texts.js";
 import { overlayBounds } from "./overlay-bounds.js";
 
@@ -315,8 +316,9 @@ export class CanvasBackend implements Backend {
     const left = (td.align === "middle" ? td.x - h.width / 2 : td.align === "end" ? td.x - h.width : td.x) - pad;
     const top = td.y - h.height / 2 - 1;
     const w = h.width + 2 * pad, ht = h.height + 2;
-    // Kept rectangle: the chip plus the halo's reach beyond it (the stroke is `pad` px on each side of the glyphs).
-    const m = pad + 1;
+    // Kept rectangle: the chip plus the halo's reach beyond it. The stroke is `pad` px on each side of the
+    // glyphs, and a miter join's spike at a sharp corner reaches up to TEXT_HALO_MITER_LIMIT times that (#571).
+    const m = pad * TEXT_HALO_MITER_LIMIT + 1;
     const cv = this.snapCanvas ?? document.createElement("canvas");
     this.snapCanvas = cv; // one reusable canvas, no per-hover allocation of a new one
     this.hoverSnap = this.keep(cv, left - m, top - m, left + w + m, top + ht + m);

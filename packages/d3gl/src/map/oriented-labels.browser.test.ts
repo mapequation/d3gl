@@ -98,13 +98,13 @@ describe("oriented data labels draw the same on WebGL, Canvas and SVG (#580)", (
   }
 
   it("rounds each angle to rotationStep degrees (default 1), the same on the overlay and native text", async () => {
-    const angle = 0.123; // 7.047°
-    const rotated = async (backend: "webgl" | "canvas", rotationStep?: number) => {
+    const deg = (rad: number) => (rad * 180) / Math.PI;
+    const rotated = async (backend: "webgl" | "canvas", rotationStep: number | undefined, angle: number, keepUpright = false) => {
       const h = document.createElement("div");
       document.body.appendChild(h);
       const p = plot(h, { width: W, height: H, backend });
       await p.whenReady();
-      p.labels([{ x: W / 2, y: H / 2 }], { labelOf: () => TEXT, anchorOf: (d) => [d.x, d.y], rotationOf: () => angle, rotationStep, font: FONT });
+      p.labels([{ x: W / 2, y: H / 2 }], { labelOf: () => TEXT, anchorOf: (d) => [d.x, d.y], rotationOf: () => angle, rotationStep, keepUpright, font: FONT });
       const out = backend === "webgl"
         ? (h.querySelector<HTMLElement>("[data-label-id]")?.style.transform.match(/rotate\(([-\d.e]+)deg\)/)?.[1] ?? "")
         : (p.toSVG().match(/rotate\(([-\d.e]+) /)?.[1] ?? "");
@@ -112,10 +112,14 @@ describe("oriented data labels draw the same on WebGL, Canvas and SVG (#580)", (
       h.remove();
       return Number(out);
     };
+    // Canvas's angle is read from its native-text layer in toSVG(), the TextData that paintTexts paints.
     for (const backend of ["webgl", "canvas"] as const) {
-      expect(await rotated(backend)).toBeCloseTo(7, 6);
-      expect(await rotated(backend, 5)).toBeCloseTo(5, 6);
-      expect(await rotated(backend, 0)).toBeCloseTo((angle * 180) / Math.PI, 3);
+      expect(await rotated(backend, undefined, 0.123)).toBeCloseTo(7, 6); // 7.047° → 7°
+      expect(await rotated(backend, undefined, -0.123)).toBeCloseTo(-7, 6);
+      expect(await rotated(backend, 5, 0.123)).toBeCloseTo(5, 6);
+      expect(await rotated(backend, 2.5, 0.123)).toBeCloseTo(7.5, 6);
+      expect(await rotated(backend, undefined, 2.6, true)).toBeCloseTo(329, 6); // 148.97° → 149°, flipped upright by 180°
+      for (const exact of [0, Number.NaN, Number.POSITIVE_INFINITY]) expect(await rotated(backend, exact, 0.123)).toBeCloseTo(deg(0.123), 3);
     }
   });
 

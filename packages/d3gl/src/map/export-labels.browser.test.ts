@@ -112,7 +112,7 @@ describe("WebGL export includes labels (#219)", () => {
     expect(glTexts[0]).toContain('text-anchor="middle"');
     expect(glTexts[0]).toContain("font:600 18px sans-serif");
     expect(glTexts[0]).toContain('fill="#111111"');
-    expect(glTexts[0]).toContain('paint-order="stroke"'); // halo
+    expect(glTexts[0]).toContain("stroke="); // halo
     expect(glTexts[0]).toContain(">Alpha<");
     expect(glTexts[1]).toContain('opacity="0.800"');
   });

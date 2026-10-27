@@ -3,7 +3,7 @@ import { page } from "vitest/browser";
 import { LabelLayer, resolveLabelStyle, DEFAULT_LABEL_TEXT, type LabelStyle, type LabelText } from "../label-layer.js";
 import { paintTexts } from "../../canvas/draw-texts.js";
 import { serializeTexts } from "../../svg/serialize.js";
-import type { TextData } from "../../core/index.js";
+import { TEXT_HALO_MITER_LIMIT, type TextData } from "../../core/index.js";
 
 // #571: the WebGL overlay (an HTML label with a CSS text stroke), Canvas (`paintTexts`, also every export) and
 // SVG (`serializeTexts`) draw the same halo, miter joins included. All three are rasterized by the browser and
@@ -15,15 +15,16 @@ const W = 120;
 const H = 40;
 const BG: [number, number, number] = [37, 99, 235]; // a saturated fill, so the white halo stands out
 const DIGITS = "169 23 114";
-const SHARP = "MVW AVAW"; // acute glyph corners, where miter and round joins differ most
+const SHARP = "MNMN 1477"; // acute glyph corners, where joins and miter limits differ most
 const SHIFT = 2;
 const MARGIN = 4; // ignore the panel borders: only the label matters
 // Measured in headless Chromium: with miter joins at TEXT_HALO_MITER_LIMIT, the three panels are pixel-identical
-// (difference 0, coverage equal) for both labels at widths 1-3. Round joins on Canvas differ from them by 0.0035
-// with 5% less coverage ("MVW AVAW", width 2), the old text-shadow glow by 0.015 with 6% more. The thresholds sit
-// below both.
-const MAX_DIFF = 0.001;
-const MAX_MASS = 0.02;
+// (difference 0, coverage equal) for both labels at widths 1-3. On "MNMN 1477" at width 2, Canvas differs from
+// them by 0.0035 with round joins (5% more halo) and by 0.015 at Canvas's default miter limit 10 (17% less);
+// the old text-shadow glow by 0.015. The thresholds sit below those and leave room for DOM text and fillText
+// to rasterize a little apart on other machines and fonts.
+const MAX_DIFF = 0.002;
+const MAX_MASS = 0.03;
 
 type Panels = { overlay: Uint8ClampedArray; canvas: Uint8ClampedArray; svg: Uint8ClampedArray };
 
@@ -147,19 +148,26 @@ describe("label halo equivalence (#571)", () => {
     expect(diff.overlay).toBeGreaterThanOrEqual(MAX_DIFF);
   });
 
-  it("is not vacuous: round joins on Canvas do not pass as the overlay's miter joins", async () => {
+  // A Canvas halo stroked with another join or miter limit must not pass as the overlay's.
+  const strokeWith = (join: CanvasLineJoin, limit: number) => (ctx: CanvasRenderingContext2D, texts: readonly TextData[]) => {
+    const td = texts[0]!;
+    ctx.font = td.font ?? "";
+    ctx.textBaseline = "middle";
+    ctx.strokeStyle = td.halo?.color ?? "";
+    ctx.lineWidth = 2 * (td.halo?.width ?? 0);
+    ctx.lineJoin = join;
+    ctx.miterLimit = limit;
+    ctx.strokeText(td.text, td.x, td.y);
+    ctx.fillStyle = td.color ?? "#000";
+    ctx.fillText(td.text, td.x, td.y);
+  };
+
+  it.each([
+    ["round joins", "round", TEXT_HALO_MITER_LIMIT],
+    ["Canvas's default miter limit (10)", "miter", 10],
+  ] as const)("is not vacuous: %s on Canvas do not pass as the overlay's halo", async (_name, join, limit) => {
     const text = { ...DEFAULT_LABEL_TEXT, halo: { color: "#ffffff", width: 2 } };
-    const round = (ctx: CanvasRenderingContext2D, texts: readonly TextData[]) => {
-      paintTexts(ctx, texts.map((t) => ({ ...t, halo: undefined }))); // the fill only, for the font setup
-      const td = texts[0]!;
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 4;
-      ctx.lineJoin = "round";
-      ctx.strokeText(td.text, td.x, td.y);
-      ctx.fillStyle = td.color ?? "#000";
-      ctx.fillText(td.text, td.x, td.y);
-    };
-    const { diff } = await compare(resolveLabelStyle(undefined, undefined, text), text, SHARP, round);
+    const { diff } = await compare(resolveLabelStyle(undefined, undefined, text), text, SHARP, strokeWith(join, limit));
     expect(diff.overlay).toBeGreaterThanOrEqual(MAX_DIFF);
   });
 });

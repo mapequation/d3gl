@@ -140,7 +140,8 @@ describe("geoMap().labels() — native-text export routing (#223)", () => {
     expect(svg).toContain(">Null<");
     expect(svg).toContain(">South<");
     expect(texts[0]).toContain('fill="#ff0000"');
-    expect(texts[0]).toContain('paint-order="stroke"'); // the halo
+    expect(texts[0]).toContain('stroke="#ffffff"'); // the halo…
+    expect(svg).toContain('paint-order="stroke"'); // …behind the fill, set on the labels' group
     // No HTML overlay divs on a native-text backend — the backend owns the labels.
     expect(labelEls(h).length).toBe(0);
     map.destroy();
