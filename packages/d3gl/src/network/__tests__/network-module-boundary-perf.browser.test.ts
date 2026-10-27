@@ -327,7 +327,8 @@ beforeAll(async () => {
     sweepFrames(steps, (t) => net.setTransform(t), 1);
     // #478: the highlight lane's layers get their GL buffers on first use (one grow each: a glyph's ring, an
     // open module's ring). Use them once here, so the legs below count what a hover change costs after that.
-    hoverWarm = runHover([steps[1]!], 40, 25);
+    // At steps[2]: the cut opens modules at the declutter spacing (2 by default, #561), so steps[1] opens no module the pointer sweep reaches.
+    hoverWarm = runHover([steps[2]!], 40, 25);
     hoverSweep = runHover(steps.slice(1), 40, 25);
     net.lod({ expandPx: 1e-6, declutter: false, crossLevelEdges: true, moduleBoundary: { width: widthOf, color: "fill" } });
     hoverAll = runHover([steps[0]!], 12, 8);
