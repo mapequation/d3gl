@@ -26,6 +26,10 @@ import { indexedLinkStats } from "../../webgl/indexed-links.js";
  * larger N is not a harder case, it aggregates. (At 800 × 600 and 150k, one run takes 20-50 s of software GL
  * locally, past the tier's per-file budget on CI.)
  *
+ * The LOD runs at declutter spacing 1. The cut opens glyphs at the declutter spacing (#561), so the default 2
+ * opens every leaf of the disc only at a lower N (at 45k it kept 39,665); spacing 1, as declutter off, opens
+ * leaves down to a pixel apart: the densest all-leaves cut.
+ *
  * Asserted: the worst case is reached (the LOD-on settled frame draws nearly every node, at most one leaf per
  * viewport pixel); the frame reads the worker's super-edge rows, with no incidence walked or row computed on the
  * main thread; its main-thread rebuild stays under an absolute `c0 + c1·N` ceiling; and the links between two
@@ -40,7 +44,7 @@ const N = perfN(LOCAL_N, { max: 45_000 });
 const W = 400;
 const H = 300;
 const ROUNDS = 2;
-const LOD = { source: "spatial" as const, declutter: true, superEdges: true, maxAggregateRadius: 26 };
+const LOD = { source: "spatial" as const, declutter: true, declutterSpacing: 1, superEdges: true, maxAggregateRadius: 26 };
 
 function makePrng(seed: number): () => number {
   let s = seed >>> 0;

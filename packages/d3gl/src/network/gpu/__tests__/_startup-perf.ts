@@ -143,7 +143,7 @@ export async function startupLeg(net: Network, graph: NetworkGraph, modules: Mod
     }
   });
   try {
-    net.layout(nested ? { nested: true, backend: "gpu" } : { backend: "gpu" });
+    net.layout(nested ? { nested: true, backend: "gpu" } : { nested: false, backend: "gpu" });
     // The nested layout issues its compile once its prep (a worker) is back.
     for (let i = 0; i < 3000 && programs === 0; i++) await nextFrame();
     expect(programs, "the run compiled its programs in parallel").toBeGreaterThan(0);

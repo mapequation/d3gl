@@ -3,7 +3,7 @@ import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
 /** Self-links drawn as loops on a modular weighted network. Toggle directed / undirected, switch the link style and
- *  the sizing mode, bend the links, and tune the loop's spread and length. */
+ *  the sizing mode, bend the links, tune the loop's spread and length, or hide the loops. */
 export default function SelfLinks() {
   return (
     <Example
@@ -13,8 +13,9 @@ export default function SelfLinks() {
         { type: "segmented", key: "sizing", label: "Sizing", options: ["World", "Screen"] },
         { type: "segmented", key: "bend", label: "Bend", options: ["Straight", "Bent"] },
         { type: "range", key: "bendStrength", label: "Bend strength", min: 0.05, max: 0.5, step: 0.05, value: 0.2, disabled: (o) => o.bend === "Straight" },
-        { type: "range", key: "loopSpread", label: "Loop spread (°)", min: 10, max: 90, step: 5, value: 25 },
-        { type: "range", key: "loopLength", label: "Loop length (radii)", min: 0.5, max: 5, step: 0.25, value: 1 },
+        { type: "segmented", key: "loops", label: "Loops", options: ["Shown", "Hidden"] },
+        { type: "range", key: "loopSpread", label: "Loop spread (°)", min: 10, max: 90, step: 5, value: 25, disabled: (o) => o.loops === "Hidden" },
+        { type: "range", key: "loopLength", label: "Loop length (radii)", min: 0.5, max: 5, step: 0.25, value: 1, disabled: (o) => o.loops === "Hidden" },
       ]}
       width={720}
       height={440}

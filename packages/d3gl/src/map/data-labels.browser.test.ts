@@ -50,6 +50,28 @@ describe("plot().labels() — engine-owned data labels (#223)", () => {
     h.remove();
   });
 
+  it("styles the WebGL overlay with the same font, colour and halo as native text (#571, #577)", async () => {
+    const h = host();
+    const chart = plot(h, { width: 240, height: 180, backend: "webgl" });
+    await chart.whenReady();
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], font: "13px serif", color: "rgb(187, 0, 0)", halo: { color: "#000000", width: 1.5 } });
+
+    const els = labelEls(h);
+    expect(els.length).toBe(4);
+    expect(els.every((e) => e.style.font.includes("13px") && e.style.font.includes("serif"))).toBe(true);
+    expect(els.every((e) => e.style.lineHeight === "1")).toBe(true); // the measured box, as native text centres on it
+    expect(els.every((e) => e.style.color === "rgb(187, 0, 0)")).toBe(true);
+    expect(els.every((e) => e.style.webkitTextStroke.includes("3px"))).toBe(true); // 2 × width
+
+    // `style.font`/`style.color` style it too when font/color are not given.
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], style: { font: "12px / 1.6 monospace", color: "rgb(0, 0, 187)" } });
+    const restyled = labelEls(h);
+    expect(restyled.every((e) => e.style.font.includes("12px") && e.style.font.includes("monospace"))).toBe(true);
+    expect(restyled.every((e) => e.style.color === "rgb(0, 0, 187)")).toBe(true);
+    chart.destroy();
+    h.remove();
+  });
+
   it("caps to the top-k by importance when `max` is set", async () => {
     const h = host();
     const chart = plot(h, { width: 240, height: 180, backend: "webgl" });
@@ -118,7 +140,8 @@ describe("geoMap().labels() — native-text export routing (#223)", () => {
     expect(svg).toContain(">Null<");
     expect(svg).toContain(">South<");
     expect(texts[0]).toContain('fill="#ff0000"');
-    expect(texts[0]).toContain('paint-order="stroke"'); // the halo
+    expect(texts[0]).toContain('stroke="#ffffff"'); // the halo…
+    expect(svg).toContain('paint-order="stroke"'); // …behind the fill, set on the labels' group
     // No HTML overlay divs on a native-text backend — the backend owns the labels.
     expect(labelEls(h).length).toBe(0);
     map.destroy();
@@ -151,6 +174,45 @@ describe("geoMap().labels() — native-text export routing (#223)", () => {
     chart.labels(false);
     expect(chart.toSVG()).not.toContain("<text");
     pushes.mockRestore();
+    chart.destroy();
+    h.remove();
+  });
+});
+
+describe("plot().labels() — setBackend() routes the labels to the new backend (#581)", () => {
+  it("Canvas → WebGL: the overlay shows every label with no transform change", async () => {
+    const h = host();
+    const chart = plot(h, { width: 240, height: 180, backend: "canvas" });
+    await chart.whenReady();
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], offset: [6, 0] });
+    expect(labelEls(h).length).toBe(0); // native text on Canvas
+
+    chart.setBackend("webgl");
+    await chart.whenReady();
+    expect(labelEls(h).map((e) => e.textContent).sort()).toEqual(["Alpha", "Beta", "Delta", "Gamma"]);
+    chart.destroy();
+    h.remove();
+  });
+
+  it("WebGL → Canvas: native text draws every label and the overlay empties", async () => {
+    const h = host();
+    const chart = plot(h, { width: 240, height: 180, backend: "webgl" });
+    await chart.whenReady();
+    chart.labels(NODES, { labelOf: (d) => d.name, anchorOf: (d) => [d.x, d.y], offset: [6, 0] });
+    expect(labelEls(h).length).toBe(4);
+
+    chart.setBackend("canvas");
+    await chart.whenReady();
+    expect(labelEls(h).length).toBe(0);
+    // The labels are in the Canvas frame itself, drawn by the swap's first render: "Alpha" runs right
+    // of its anchor (40, 40) + offset (6, 0), and the plot draws nothing else.
+    const canvas = h.querySelector("canvas")!;
+    const s = canvas.width / 240;
+    const { data } = canvas.getContext("2d")!.getImageData(46 * s, 32 * s, 40 * s, 16 * s);
+    let ink = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i]! > 128) ink++;
+    expect(ink).toBeGreaterThan(20);
+    expect((chart.toSVG().match(/<text/g) ?? []).length).toBe(4);
     chart.destroy();
     h.remove();
   });

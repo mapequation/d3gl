@@ -160,6 +160,8 @@ export interface SelfLoopStyle {
   arrowSize: number;
   linkStyle: string;
   sizeMode: "world" | "screen";
+  /** Whether loops draw at all (#586): `false` ⇒ {@link selfLoopCache} is `null`, as for a graph without self-links. */
+  selfLinks: boolean;
   /** The angle between a loop's two legs (degrees). */
   selfLinkSpread: number;
   /** A loop's leg length (node radii). */
@@ -223,9 +225,11 @@ export interface SelfLoopCache {
  *  loop angles read (the Σ degree term). */
 export const selfLoopStats = { updates: 0, instances: 0, neighbours: 0 };
 
-/** The {@link SelfLoopCache} for `graph` under `style`, `null` without self-links. O(S) (+ the O(E) index once
- *  per graph). Leaves the position columns for {@link updateSelfLoops}. */
+/** The {@link SelfLoopCache} for `graph` under `style`, `null` without self-links or with `selfLinks: false` (#586:
+ *  then not even the index is built). O(S) (+ the O(E) index once per graph). Leaves the position columns for
+ *  {@link updateSelfLoops}. */
 export function selfLoopCache(graph: NetworkGraph, style: SelfLoopStyle): SelfLoopCache | null {
+  if (!style.selfLinks) return null;
   const loops = selfLoopIndex(graph);
   if (!loops) return null;
   const S = loops.count;

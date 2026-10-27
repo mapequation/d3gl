@@ -1,4 +1,4 @@
-import type { VectorLayer, ViewTransform, DrawableVector, TextData, HoverText } from "../core/index.js";
+import { TEXT_HALO_MITER_LIMIT, type VectorLayer, type ViewTransform, type DrawableVector, type TextData, type HoverText } from "../core/index.js";
 import { SvgPathContext } from "./svg-context.js";
 
 function rgba([r, g, b, a]: readonly [number, number, number, number]): string {
@@ -9,18 +9,29 @@ function escapeXml(s: string): string {
   return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
 }
 
+/** The group attributes every label inherits: a halo stroke painted behind the fill, joined as the WebGL
+ *  overlay joins it (#571). Set once per group, not per `<text>`, since the SVG backend re-serializes
+ *  the placed labels on every pan/zoom. */
+const TEXT_GROUP = ` stroke-linejoin="miter" stroke-miterlimit="${TEXT_HALO_MITER_LIMIT}" paint-order="stroke"`;
+
 /** Serialize screen-space text labels (#105 N7b-2) to `<text>` elements (coords already in screen px,
- *  so no view-transform wrapper). A halo is a stroke drawn behind the fill via `paint-order:stroke`. */
+ *  so no view-transform wrapper), in a group carrying {@link TEXT_GROUP}. */
 export function serializeTexts(texts: readonly TextData[]): string {
   if (texts.length === 0) return "";
+  return `<g${TEXT_GROUP}>${textElements(texts)}</g>`;
+}
+
+function textElements(texts: readonly TextData[]): string {
   const els = texts.map((td) => {
     const anchor = td.align === "middle" ? "middle" : td.align === "end" ? "end" : "start";
     const fill = td.color ?? "#000";
     const op = td.opacity != null && td.opacity < 1 ? ` opacity="${td.opacity.toFixed(3)}"` : "";
-    const halo = td.halo ? ` stroke="${td.halo.color}" stroke-width="${td.halo.width * 2}" stroke-linejoin="round" paint-order="stroke"` : "";
-    return `<text x="${td.x}" y="${td.y}" text-anchor="${anchor}" dominant-baseline="central" style="font:${td.font ?? "12px sans-serif"}" fill="${fill}"${halo}${op}>${escapeXml(td.text)}</text>`;
+    const halo = td.halo && td.halo.width > 0 ? ` stroke="${td.halo.color}" stroke-width="${td.halo.width * 2}"` : "";
+    // A rotated label (#580) turns about its anchor; SVG's rotate() takes clockwise degrees.
+    const rotate = td.rotation ? ` transform="rotate(${Number(((td.rotation * 180) / Math.PI).toFixed(3))} ${td.x} ${td.y})"` : "";
+    return `<text x="${td.x}" y="${td.y}" text-anchor="${anchor}" dominant-baseline="central"${rotate} style="font:${td.font ?? "12px sans-serif"}" fill="${fill}"${halo}${op}>${escapeXml(td.text)}</text>`;
   });
-  return `<g>${els.join("")}</g>`;
+  return els.join("");
 }
 
 /** The hovered label (#496): a solid chip under the text, so it covers the trimmed label beneath. */
@@ -30,7 +41,7 @@ export function serializeHoverText(h: HoverText | null): string {
   const pad = td.halo?.width ?? 2;
   const left = td.align === "middle" ? td.x - width / 2 : td.align === "end" ? td.x - width : td.x;
   const chip = `<rect x="${left - pad}" y="${td.y - height / 2 - 1}" width="${width + 2 * pad}" height="${height + 2}" fill="${td.halo?.color ?? "#fff"}"/>`;
-  return `<g>${chip}${serializeTexts([td]).replace(/^<g>|<\/g>$/g, "")}</g>`;
+  return `<g${TEXT_GROUP}>${chip}${textElements([td])}</g>`;
 }
 
 function pathD(d: DrawableVector): string {

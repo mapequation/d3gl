@@ -287,9 +287,16 @@ both view for the state graph's self-links, and the physical view for flow that 
 state nodes, the links between the state nodes of one lump likewise sum into that lump's self-link, drawn as a loop in
 the lumped state and both views.
 
+To hide the loops, set `selfLinks: false` in `style()` (the demo's **Loops** control). No loop is drawn on any
+backend or in any view, `toSVG()` included, and none is picked or highlighted. Hiding is display-only: the self-link
+edges stay in the data, so a node's degree and strength (each self-link counted once) and the layout are unchanged.
+Removing the self-links from the edge list instead would change all three.
+
 A graph without self-links pays one scan of its edges, once per graph, and nothing per frame. With
 self-links, each frame that moves the nodes updates the loops in place, in time linear in the loops and
-the degree of their nodes; zoom and pan on WebGL cost nothing extra.
+the degree of their nodes; zoom and pan on WebGL cost nothing extra. With `selfLinks: false` the engine builds no
+loops at all, not even the scan, and does no loop work on any frame; each self-link edge keeps its slot among the
+links, as when its loop draws.
 
 <ExampleCard files={["self-links/draw.ts", "self-links/data.ts"]}>
   <SelfLinks client:visible slot="demo" />
@@ -497,10 +504,12 @@ The engine owns the hierarchy, not the LOD options, so every module feature read
 - the **LOD cut** draws it by default; `lod({ source: "structure" })` coarsens the graph structurally
   instead, `lod({ source: "spatial" })` groups by position, and `lod(false)` draws every node — all keep
   the hierarchy, so switching back reuses the tree it built (once) rather than rebuilding it;
-- **`layout({ nested: true })`** lays the module tree out top-down, each module's children inside its
-  own disc — with LOD on or off ([re-clustering](#re-clustering-warm-re-layout-and-transitions) re-lays
-  it out *warm*, from the current positions);
-- the **module-aware GPU seed** (`layout({ backend: "gpu" })`) seeds over the modules;
+- **the layout is nested by default**: `layout({ backend })` on `"force"`, `"worker"`, `"gpu"` or `"auto"`
+  lays the module tree out top-down, each module's children inside its own disc — with LOD on or off
+  ([re-clustering](#re-clustering-warm-re-layout-and-transitions) re-lays it out *warm*, from the current
+  positions). `"positions"` keeps the coordinates you pass;
+- the **module-aware GPU seed** (`layout({ backend: "gpu", nested: false })`) lays it out flat, seeded over
+  the modules;
 - every **pick** reports the target's Infomap `path` (`hit.datum.path`): a module's path for an
   aggregate, the node's own path for a leaf, LOD on or off.
 
@@ -639,8 +648,18 @@ net.labels({
 });
 ```
 
-Labels come **pre-styled** — a compact dark sans-serif with a white halo, readable over busy geometry
-with zero CSS. Pass `style` (an inline CSS-properties object, merged over the default) to tweak it —
+Labels come **pre-styled** — a compact dark sans-serif with a thin white halo, readable over busy geometry
+with zero CSS. The halo is one option for **every** backend: `halo` sets its colour and how far it reaches
+beyond the glyphs, in px (default `{ color: "#ffffff", width: 1 }`; `width: 0` turns it off), and the WebGL
+overlay, SVG, Canvas and every export draw the same halo:
+
+```ts
+net.labels({ labelOf: (id) => names[id], halo: { color: "#ffffff", width: 1.5 } });
+```
+
+`font` and `color` work the same way: one value for the overlay, SVG, Canvas and every export.
+
+Pass `style` (an inline CSS-properties object, merged over the default) to tweak the overlay's look —
 `style: { color: "#1f2937" }` recolours and keeps the rest — or take full control with `className`,
 which skips the built-in default so your class's CSS decides everything.
 
@@ -678,8 +697,8 @@ the same cut alpha).
 
 Labels are rendered by the **active backend**: on **WebGL** they're an HTML overlay (crisp + accessible,
 styled by the default + `style`/`className` above); on **SVG/Canvas** the backend draws them natively —
-SVG `<text>`, Canvas `fillText` (`font`/`color`/`halo` override the matching native defaults, since CSS
-can't reach backend-drawn text). On **every** backend the placed labels appear in `toSVG()`/`toPNG()`
+SVG `<text>`, Canvas `fillText`. `font`, `color` and `halo` style the overlay and the native text
+alike; CSS beyond them (`style`'s other properties, a `className`) reaches only the overlay. On **every** backend the placed labels appear in `toSVG()`/`toPNG()`
 **export** — WebGL composites them into the PNG and serializes them as `<text>` at export time, so a
 labelled export matches what you see regardless of the backend you happened to run. Switch this example
 to the SVG backend and Export SVG for publication-ready labelled vector output. GPU/MSDF text (to put
@@ -695,8 +714,10 @@ Flow then drives every channel: node **radius** ∝ visit rate, the **ring** ∝
 and the **half-arrow** width + colour ∝ link flow — so a reciprocal pair's two arrows carry genuinely
 different weight. The **Nodes** slider resizes the generated network (500 → 20,000).
 
-The layout is the **module-aware GPU seed**: the module hierarchy is supplied with the graph,
-`data(graph, { modules })`, so `layout({ backend: "gpu" })` seeds the WebGL2 Barnes-Hut solve
+The map opens on the **nested** module layout: with the module hierarchy supplied with the graph,
+`data(graph, { modules })`, a layout is nested by default (described below). The
+**Layout** control switches to the flat **Force** layout, the **module-aware GPU seed**:
+`layout({ backend: "gpu", nested: false })` seeds the WebGL2 Barnes-Hut solve
 **top-down over the module tree** in every LOD mode — modules (including the ragged, deeper-nested
 super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (the nodes'
 bounding box → the view), so the map opens framed and settles in place rather than piling at the
@@ -711,8 +732,8 @@ while it streams it is framed on a box the worker knows it will end inside — t
 depth's placed discs — and the camera only zooms in as depths land, ending on the nodes' own box like
 any other layout.
 
-The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
-children are laid out inside its own disc, arranged by their sibling links, so every module stays a
+The **nested** module layout (`layout({ nested })`, the default for a graph with a module hierarchy) lays each module's
+children out inside its own disc, arranged by their sibling links, so every module stays a
 compact region of its parent. The example runs it on the GPU (`backend: "gpu"`): every module at every
 depth is solved at once — one batched solve over the whole tree, not one per module — and a fresh map
 streams in as one animation of all depths converging together. On a 325,729-leaf map that takes about
@@ -831,8 +852,9 @@ solves:
 
 ```ts
 // Nested map → force layout: the force solve starts from the map on screen.
-net.layout({ backend: "gpu", warm: true, fit: true });
-// Force layout → nested map: the map streams from the force layout on screen.
+net.layout({ backend: "gpu", nested: false, warm: true, fit: true });
+// Force layout → nested map: the map streams from the force layout on screen (nested is the default
+// with a module hierarchy; `nested: true` says so).
 net.layout({ backend: "gpu", nested: true, warm: true, fit: true });
 ```
 
@@ -1118,12 +1140,12 @@ frame that lands in it, however fast the pointer moves:
 
 | `layout({ backend })` | While dragging | On release |
 | --- | --- | --- |
-| `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools until converged (at most a short tail), then stops |
-| `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools until converged |
-| `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools until converged |
+| `force` (main thread), flat | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools until converged (at most a short tail), then stops |
+| `worker` (off thread), flat | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools until converged |
+| `gpu` (on the GPU), flat | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools until converged |
 | `auto` | as `gpu` or `worker`, whichever it resolved to | as that backend |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
-| any of the above with `nested` (a [map of modules](#maps-of-networks-a-provided-module-hierarchy)) | the node follows the cursor freely; its **module**, and the modules above it as its disc moves, re-lay out around it, on the main thread (see below) | the node is let go and the module settles for a short tail (at most 90 frames), then stops |
+| any of the above with `nested` (a [map of modules](#maps-of-networks-a-provided-module-hierarchy) — the default with a module hierarchy) | the node follows the cursor freely; its **module**, and the modules above it as its disc moves, re-lay out around it, on the main thread (see below) | the node is let go and the module settles for a short tail (at most 90 frames), then stops |
 
 On the `worker`, `gpu` and `auto` backends the layout is kept **alive** (idle) after the initial layout converges, so
 a drag can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the backend's

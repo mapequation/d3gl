@@ -42,6 +42,7 @@ const style = (n: number, over: Partial<ResolvedNetworkStyle> = {}): ResolvedNet
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
+  selfLinks: true,
   selfLinkSpread: LOOP_SPREAD,
   selfLinkLength: LOOP_LEG,
   ...over,
@@ -344,6 +345,29 @@ describe("self-loop cache and layers (per-frame cost)", () => {
     expect(selfLoopStats.updates).toBe(before);
   });
 
+  it("selfLinks: false builds no loop index, cache or layer for a graph WITH self-links, and does no loop work per frame (#586)", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1, 1], target: [1, 2, 1], directed: true });
+    g.positions.set([0, 0, 10, 0, 20, 0]);
+    // Every read of the edge list: the hidden cache must not even scan it for self-links (the O(E) index).
+    let reads = 0;
+    const counted = { ...g, get source() { reads++; return g.source; }, get target() { reads++; return g.target; } };
+    const hidden = style(3, { directed: true, selfLinks: false });
+    expect(selfLoopCache(counted, hidden)).toBeNull();
+    expect(reads).toBe(0);
+    const cache = noLodStyleCache(g, hidden);
+    expect(cache.loops).toBeUndefined();
+    const before = selfLoopStats.updates;
+    for (let f = 0; f < 5; f++) {
+      const names = networkLayersFromCache(g, hidden, cache).map((l) => l.name);
+      expect(names).not.toContain(SELF_LOOP_LAYER);
+    }
+    expect(selfLoopStats.updates).toBe(before);
+    // Non-vacuity: the same graph draws its loop by default.
+    const shown = style(3, { directed: true });
+    expect(selfLoopCache(g, shown)?.loops.count).toBe(1);
+    expect(networkLayersFromCache(g, shown, noLodStyleCache(g, shown)).map((l) => l.name)).toContain(SELF_LOOP_LAYER);
+  });
+
   it("a position frame with loops does O(S) work in place: the same arrays every frame", () => {
     // 4 nodes, 3 of them looped (node 3 twice: one loop), plus a chain.
     const g = buildGraph({ nodeCount: 4, source: [0, 1, 2, 0, 3, 3], target: [1, 2, 3, 0, 3, 3], weight: [1, 1, 1, 2, 1, 1], directed: true });
@@ -480,7 +504,7 @@ describe("an LOD frame's loops on kept leaves", () => {
     directed: false,
   });
   g.positions.set(Array.from({ length: 20 }, (_, i) => (i % 2 ? 0 : 10 * (i / 2))));
-  const style = { nodeRadii: new Float32Array(10).fill(2), linkWidthOf: () => 1, linkColorOf: (): [number, number, number, number] => [255, 0, 0, 255], directed: false, arrowSize: 3, linkStyle: "line", sizeMode: "world" as const, selfLinkSpread: LOOP_SPREAD, selfLinkLength: LOOP_LEG };
+  const style = { nodeRadii: new Float32Array(10).fill(2), linkWidthOf: () => 1, linkColorOf: (): [number, number, number, number] => [255, 0, 0, 255], directed: false, arrowSize: 3, linkStyle: "line", sizeMode: "world" as const, selfLinks: true, selfLinkSpread: LOOP_SPREAD, selfLinkLength: LOOP_LEG };
 
   it("lists the loops of kept leaves in min(S, frontier) reads, by either pass", () => {
     const c = selfLoopCache(g, style);

@@ -70,26 +70,52 @@ export interface LabelGeometry {
 // y a native-text backend draws at — is derived from `writeExtents`, so they cannot drift apart
 // (the #58 lesson: two hand-written descriptions of the same orientation WILL disagree).
 
+/** Upright flip: an oriented `keepUpright` label whose reading direction points left (cos < 0) would
+ *  read upside down, so it turns by π and swaps its text side so it still radiates outward. */
+function flipped(box: LabelBox): boolean {
+  return box.rotation !== undefined && box.keepUpright === true && Math.cos(box.rotation) < 0;
+}
+
+function renderedAnchor(box: LabelBox, flip: boolean): TextAnchor {
+  const anchor = box.textAnchor ?? "start";
+  if (!flip) return anchor;
+  return anchor === "start" ? "end" : anchor === "end" ? "start" : "middle";
+}
+
+function renderedRotation(box: LabelBox, flip: boolean): number {
+  const rotation = box.rotation;
+  if (rotation === undefined) return 0;
+  return flip ? rotation + Math.PI : rotation;
+}
+
+/** The side of the anchor the text runs from, as rendered: the box's `textAnchor` (default
+ *  `"start"`), swapped by the upright flip. What a native-text backend aligns with (#580). */
+export function labelTextAnchor(box: LabelBox): TextAnchor {
+  return renderedAnchor(box, flipped(box));
+}
+
+/** The rotation the label is rendered at, in radians (CSS-clockwise, about its anchor): 0 for a
+ *  plain label, else its `rotation` with the upright flip folded in. What a native-text backend
+ *  rotates by (#580). */
+export function labelTextRotation(box: LabelBox): number {
+  return renderedRotation(box, flipped(box));
+}
+
 /** Local box extents in the label's own frame, origin at the anchor: `[lx0, lx1, ly0, ly1]`.
  *  Returns the effective rotation in radians (0 for a plain label; the upright flip folded in). */
 function writeExtents(box: LabelBox, out: Float64Array): number {
   const w = box.width ?? 0;
   const h = box.height ?? 0;
-  const rotation = box.rotation;
-  const oriented = rotation !== undefined;
-  // Upright flip: when the reading direction points left (cos < 0) the text would be upside
-  // down, so add π and swap the text side so it still radiates outward.
-  const flip = oriented && box.keepUpright === true && Math.cos(rotation) < 0;
-  let anchor: TextAnchor = box.textAnchor ?? "start";
-  if (flip) anchor = anchor === "start" ? "end" : anchor === "end" ? "start" : "middle";
+  const flip = flipped(box); // once per box: the cull runs this per candidate per frame
+  const anchor = renderedAnchor(box, flip);
   const lx0 = anchor === "start" ? 0 : anchor === "end" ? -w : -w / 2;
   // Oriented labels sit centred on their axis; plain labels honour `baseline` (default "top").
-  const ly0 = oriented || box.baseline === "middle" ? -h / 2 : 0;
+  const ly0 = box.rotation !== undefined || box.baseline === "middle" ? -h / 2 : 0;
   out[0] = lx0;
   out[1] = lx0 + w;
   out[2] = ly0;
   out[3] = ly0 + h;
-  return oriented ? (flip ? rotation + Math.PI : rotation) : 0;
+  return renderedRotation(box, flip);
 }
 
 /** Module-local scratch for the extent helpers below — written and consumed synchronously inside
@@ -123,7 +149,8 @@ export function labelTransform(box: LabelBox): string {
 /**
  * The `y` a backend drawing native text with a `"middle"` baseline must use — the vertical centre
  * of the same box. Mirrors {@link labelGeometry}'s vertical placement (a unit test pins the two
- * against each other), so overlay and native text sit on the same line.
+ * against each other), so overlay and native text sit on the same line. An oriented label is
+ * centred on its axis, so this is its anchor `y`, the point it rotates about.
  */
 export function labelTextY(box: LabelBox): number {
   writeExtents(box, EXTENTS);

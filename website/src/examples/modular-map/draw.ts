@@ -19,21 +19,22 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * `nodeFill: { by: "flow", scale }`: a collapsed module is then filled by its members' total flow.
  *
  * The module hierarchy is **data**: `net.data(graph, { modules })` hands it to the engine with the
- * graph (#326), so every module feature reads it whatever the LOD mode. The layout is the
- * **module-aware GPU seed** (#180 N8.2): the WebGL2 Barnes-Hut solve is seeded **top-down over the
- * module tree** — modules (including the ragged, deeper-nested **super-modules** in `data.ts`) lay out
+ * graph (#326), so every module feature reads it whatever the LOD mode — and the map opens on the **nested**
+ * module layout, the default for a graph with a module hierarchy (#566; see the Layout control below). The
+ * **Force** layout is the **module-aware GPU seed** (#180 N8.2, `nested: false`): the WebGL2 Barnes-Hut solve is
+ * seeded **top-down over the module tree** — modules (including the ragged, deeper-nested **super-modules** in `data.ts`) lay out
  * as coherent regions rather than an untangling disc. `fit: true` (#206) keeps the camera framed on the
  * layout as it converges — it opens centred and view-filling and settles in place, with no jump. (Falls
  * back to the CPU worker where float render targets are unavailable.)
  *
- * The **Layout** control switches to the **nested** module layout (#324): each module's children laid out
+ * The **Layout** control switches between it and the **nested** module layout (#324): each module's children laid out
  * inside its own disc — and with **Boundaries** on (`lod({ moduleBoundary })`, #329) every module the cut
  * has opened is ringed, on its disc under the nested layout. It runs on the GPU (`backend: "gpu"`, #355):
  * every module at every depth solves at once, and a fresh map streams in as one animation of all depths.
  * Switching goes on **warm**, from where the nodes are (#454): `layout({ backend: "gpu", nested: true, warm:
  * true, fit: true })` streams the map from the force layout on screen — the nodes glide into their modules'
  * discs as it forms, with no disc restart and no hidden solve first — and switching back,
- * `layout({ backend: "gpu", warm: true, fit: true })`, runs the force layout from the map: it spreads out to
+ * `layout({ backend: "gpu", nested: false, warm: true, fit: true })`, runs the force layout from the map: it spreads out to
  * the force model's own scale as it converges, the camera framing it as it grows. (Both fall back to the CPU
  * worker where the GPU layout cannot run.)
  *
@@ -159,7 +160,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // the camera framed on the layout as it converges (#206), so the map opens framed and settles in
         // place, no jump.
         // A switch goes on from where the nodes are (`warm`, #454): streamed from the map on screen.
-        if (layout === "Force") net.layout({ backend: "gpu", fit: true, iterations: 300, warm: !fresh });
+        // `nested: false`: a graph with a module hierarchy lays out nested by default (#566).
+        if (layout === "Force") net.layout({ backend: "gpu", nested: false, fit: true, iterations: 300, warm: !fresh });
         // The nested map solves on the GPU (#355). A fresh graph opens framed on it, streaming all depths
         // together; a switch streams it from the force layout on screen, the nodes gliding into their
         // modules' discs as it forms (#454).

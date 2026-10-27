@@ -6,7 +6,7 @@ import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingOptionsOf, lodSpacing, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, markHolders, type BoundaryDiscs, type CutBoundaries, type FillAggregate, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
-import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
+import { DEFAULT_LABEL_TEXT, resolveLabelText, type LabelAnchor, type LabelHalo, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./nested-layout.js";
@@ -172,15 +172,16 @@ export interface NetworkLabelOptions {
    *  (summed flow/strength) with LOD on, node strength with LOD off. */
   importanceOf?: (id: number, info: NetworkHit) => number;
   /** Class set on each label element — the **advanced** styling path for the HTML overlay (WebGL
-   *  backend): providing it SKIPS the built-in default style, so your class's CSS has full control
-   *  (combine with {@link style} for inline overrides). Backend-native text (SVG/Canvas) can't use
-   *  CSS; style it with the {@link font}/{@link color}/{@link halo} options below. */
+   *  backend): providing it SKIPS the built-in inline style (the {@link font}/{@link color}/{@link halo}
+   *  below included), so your class's CSS has full control on the overlay (combine with {@link style}
+   *  for inline overrides). Backend-native text (SVG/Canvas, exports) can't use CSS and still draws
+   *  {@link font}/{@link color}/{@link halo}, so keep the class in step with them. */
   className?: string;
   /** Inline CSS (camelCased property → value) for the **HTML overlay** label elements, merged over
-   *  the built-in default (a dark 11px sans-serif label with a white halo — `DEFAULT_LABEL_STYLE`),
-   *  so a partial override like `{ color: "#1f2937" }` keeps the rest. Applied ONCE per element at
-   *  creation — never per frame. Backend-native text (SVG/Canvas, incl. export) is styled with
-   *  {@link font}/{@link color}/{@link halo}, whose defaults match this look. */
+   *  the built-in look, so a partial override keeps the rest. Applied ONCE per element at creation —
+   *  never per frame. Its `font` and `color` style **every** backend when {@link font}/{@link color}
+   *  are not given (#577), and `textShadow: "none"` (without a {@link halo}) turns the halo off on
+   *  every backend; any other property styles the overlay only. */
   style?: LabelStyle;
   /** Longest a label is drawn, in **screen px** of text width (#496): longer text is cut and ends in an
    *  ellipsis (`…`), and placement (collision culling) uses the trimmed box. The full label shows in place
@@ -199,16 +200,17 @@ export interface NetworkLabelOptions {
    * (default 4). Ignored outside the `both` view. The primary {@link labelOf} still labels the state nodes.
    */
   physical?: { labelOf: (physicalId: number) => string | null | undefined; gap?: number };
-  /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, and `toSVG()`/`toPNG()`
-   *  export on every backend incl. WebGL — #105 N7b-2, #219) — a CSS font shorthand, e.g.
-   *  `"600 11px sans-serif"`. Defaults to the overlay default's font (`DEFAULT_LABEL_TEXT`), so
-   *  backends match with no options set. */
+  /** Label font on **every** backend (#577): the WebGL overlay, SVG `<text>` / Canvas `fillText`, and
+   *  every `toSVG()`/`toPNG()` — a CSS font shorthand with a px size, e.g. `"600 11px sans-serif"`. Also
+   *  the font label boxes are measured in. Defaults to {@link style}'s font, then `DEFAULT_LABEL_TEXT`'s. */
   font?: string;
-  /** Fill colour for backend-native text. Defaults to the overlay default's colour. */
+  /** Label fill colour on every backend (#577). Defaults to {@link style}'s colour, then the default. */
   color?: string;
-  /** A legibility halo stroked behind backend-native text — the export analogue of a CSS text-shadow.
-   *  `width` is the half-stroke in px. Defaults to the overlay default's white halo. */
-  halo?: { color: string; width: number };
+  /** A legibility halo stroked behind the label text on **every** backend (#571): the WebGL overlay (a
+   *  CSS text stroke), SVG/Canvas `<text>`/`strokeText`, and every `toSVG()`/`toPNG()`. `width` is the
+   *  half-stroke in px (how far the halo reaches beyond the glyphs); `0` draws none.
+   *  Default `{ color: "#ffffff", width: 1 }`. */
+  halo?: LabelHalo;
 }
 
 /** Visual style. Link appearance accessors arrive with the link pass (#100 N2.2). */
@@ -324,6 +326,13 @@ export interface NetworkStyle {
    */
   linkBend?: number;
   /**
+   * Draw self-links (#586): a node's self-links as one loop at its rim (#505, default `true`). `false` hides the loops
+   * on every backend and in every view (a state network's physical-view self-links too) and builds none of them: no loop
+   * work on any frame (each self-link edge keeps its slot in the link lane, as when it draws). Display-only: the
+   * self-links stay in the data, and count in degree, strength and the layout as before.
+   */
+  selfLinks?: boolean;
+  /**
    * Self-link loops (#542): the angle between a loop's two legs where they leave and re-enter the node, in degrees
    * (default `25`, clamped to [1, 179]). Wider spreads a rounder loop. A provisional name: it may change before it is settled.
    */
@@ -376,12 +385,14 @@ export interface NetworkLayoutOptions {
    * full heat to untangle. Every backend stops as soon as the layout has converged (nodes moving a small
    * fraction of the equilibrium spacing per tick, and no faster than the tick before), resolving
    * {@link Network.whenSettled}; the GPU solve (`"gpu"`, or `"auto"` resolved to it) decides that on the
-   * GPU, once per tick, so its stop tick does not depend on frame timing (#376).
+   * GPU, once per tick, so its stop tick does not depend on frame timing (#376). A {@link nested} layout — the
+   * default with a module hierarchy (#566) — takes its own `nested.iterations` instead.
    */
   iterations?: number;
   /**
    * Force parameters for the force backends. The layout settles into a disc of radius
-   * `√(repulsion·N/centering)` — node spacing `√(π·repulsion/centering)` — and is seeded at that scale.
+   * `√(repulsion·N/centering)` — node spacing `√(π·repulsion/centering)` — and is seeded at that scale. A
+   * {@link nested} layout (the default with a module hierarchy, #566) ignores them.
    */
   force?: Partial<ForceParams>;
   /**
@@ -394,7 +405,8 @@ export interface NetworkLayoutOptions {
    * budget, and the first frame it paints is the seed (paced by animation frames: on web-NotreDame about
    * 0.8 s after a disc start's first frame at 120 Hz, about twice that at 60 Hz). `false` starts the GPU
    * layout from the disc with or without a module hierarchy. Where `"gpu"` / `"auto"` resolve to the
-   * worker, it honours `multilevel` too. A {@link warm} start has no seed and ignores it.
+   * worker, it honours `multilevel` too. A {@link warm} start has no seed and ignores it, as does a
+   * {@link nested} layout (the default with a module hierarchy, #566).
    */
   multilevel?: boolean;
   /**
@@ -466,6 +478,14 @@ export interface NetworkLayoutOptions {
    * converging together; the worker when the device cannot run it, with a warning), and synchronously on
    * `"force"`. `"auto"` runs the same GPU solve wherever `"gpu"` would, and the worker elsewhere without a
    * warning (#375). Ignored without a hierarchy.
+   *
+   * **Default `true` with a module hierarchy** (#566) on the backends that compute the layout (`"force"`,
+   * `"worker"`, `"gpu"`, `"auto"`): a modular network opens as its map of modules. Pass `nested: false` for the flat
+   * layout (the module-aware force seed, N8.2). A state network keeps its own default (#182). The default is
+   * decided when `layout()` runs: give the hierarchy (`data(graph, { modules })` or `lod({ modules })`) first. Under
+   * it, `iterations`, `force` and `multilevel` do not apply, a `transition` does on every backend, a structure or
+   * spatial LOD tree is built on the main thread (a worker streams positions only), and a node drag reheats on the
+   * main thread (below).
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }` (or
@@ -1101,6 +1121,13 @@ const FOLLOW_FRAME_MS = 50;
 function layoutClass(backend: NetworkLayoutOptions["backend"]): "positions" | "force" | "streaming" | null {
   if (backend === "worker" || requestsGpu(backend)) return "streaming";
   return backend ?? null;
+}
+
+/** Whether `backend` computes the layout (`"force"`, `"worker"`, `"gpu"`, `"auto"`), rather than taking the caller's
+ *  `"positions"` or none: those lay a module hierarchy out nested by default (#566). */
+function computesLayout(backend: NetworkLayoutOptions["backend"]): boolean {
+  const c = layoutClass(backend);
+  return c === "force" || c === "streaming";
 }
 
 /**
@@ -2661,16 +2688,18 @@ export class Network extends BaseEngine {
     // One default look across backends (#224): backend-native text (SVG/Canvas, incl. export)
     // defaults to the overlay default's equivalent; explicit font/color/halo win. Normalized once
     // here, so refreshLabels() reads plain opts with no per-frame defaulting.
-    this.labelOpts = { ...DEFAULT_LABEL_TEXT, ...opts };
+    // One font/colour/halo for the overlay, the native text and the measurement (#577), resolved once here.
+    const text = resolveLabelText(opts);
+    this.labelOpts = { ...opts, ...text };
     if (this.labelMaxWidth(this.labelOpts) !== undefined) this.attachPointer(); // the full label on hover (#496): the vector backends have no hover lane to attach it
     // Measure label boxes in the font the labels actually render in (explicit `font`, else the
     // overlay's `style.font`, else the shared default) — one memoizing measurer per label set (#204).
-    this.labelMeasure = new TextMeasurer(canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font));
+    this.labelMeasure = new TextMeasurer(text.font);
     // (Re)create the shared overlay on every call: className/style land once per element at creation
     // (never on the per-transform path), so a styling change must rebuild the elements. Cheap and
     // flash-free — labels() is a call-path, and the synchronous refreshLabels() below repopulates
     // in the same task at O(visible labels), the same order one overlay update already costs.
-    this.createLabelOverlay(opts.className, opts.style, { font: this.labelOpts.font, color: this.labelOpts.color, halo: this.labelOpts.halo });
+    this.createLabelOverlay(opts.className, opts.style, text);
     this.refreshLabels();
     this.render(); // bake just-set labels into the frame (Canvas); no-op-ish for the live-DOM backends
     return this;
@@ -2902,8 +2931,14 @@ export class Network extends BaseEngine {
   /** {@link layout} without remembering `opts` in state-network mode: a view laid out on show runs this (#495). */
   private runLayout(input: NetworkLayoutOptions): this {
     const sg = this.stateData;
-    // A state network's layouts default to the main-thread force (#182), as they always have.
-    const opts: NetworkLayoutOptions = sg && input.backend === undefined ? { ...input, backend: "force" } : input;
+    // A state network's layouts default to the main-thread force (#182), as they always have. Any other network
+    // with a module hierarchy lays out as its map of modules by default (#566): nested, unless `nested` is given.
+    let opts: NetworkLayoutOptions = input;
+    if (sg) {
+      if (input.backend === undefined) opts = { ...input, backend: "force" };
+    } else if (input.nested === undefined && computesLayout(input.backend) && this.moduleSource()) {
+      opts = { ...input, nested: true };
+    }
     // The graph the layout places: the active view's, except the both view, which draws the physical layout.
     const graph = sg && this.activeView === "both" ? sg.physical : this.graph;
     if (sg && graph && opts.backend === "positions" && opts.positions && opts.positions.length !== 2 * graph.nodeCount) {
@@ -6611,6 +6646,7 @@ export class Network extends BaseEngine {
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
       constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,
+      selfLinks: this.styleOpts.selfLinks ?? true,
       // Clamped so a loop stays finite: a 0° spread puts its centre at infinity, a negative leg has no loop.
       selfLinkSpread: resolveLoopSpread(this.styleOpts.selfLinkSpread),
       selfLinkLength: resolveLoopLength(this.styleOpts.selfLinkLength),

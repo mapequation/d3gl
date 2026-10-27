@@ -62,6 +62,7 @@ function halfArrowStyle(n: number): ResolvedNetworkStyle {
     flowBorder: null,
     constBorder: null,
     linkBend: 0.15,
+    selfLinks: true,
     selfLinkSpread: LOOP_SPREAD,
     selfLinkLength: LOOP_LEG,
   };

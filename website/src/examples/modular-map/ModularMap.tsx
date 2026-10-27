@@ -25,7 +25,8 @@ export default function ModularMap() {
         },
         // ".ftree": the links between modules arrive as module links, as an Infomap .ftree has them (#199).
         { type: "segmented", key: "input", label: "Input", options: ["Network", ".ftree"], value: "Network" },
-        { type: "segmented", key: "layout", label: "Layout", options: ["Force", "Nested"], value: "Force" },
+        // Nested: the default layout of a graph with a module hierarchy (#566); Force: the flat module-aware seed.
+        { type: "segmented", key: "layout", label: "Layout", options: ["Nested", "Force"], value: "Nested" },
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "Standard", "Modules"], value: "Modules" },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"] },
         // Fill by module (categorical) or by flow (`nodeFill: { by: "flow", scale }`, #445).

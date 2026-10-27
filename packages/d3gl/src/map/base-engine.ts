@@ -1,7 +1,7 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance, type Backend, type GroupBuilder, type GroupOptions, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
-import { LabelLayer, placeLabels, anchorBox, labelCullScratch, labelTextY, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
+import { LabelLayer, placeLabels, anchorBox, labelCullScratch, labelTextY, labelTextAnchor, labelTextRotation, resolveLabelStyle, resolveLabelText, measureText, type LabelAnchor, type LabelHalo, type LabelStyle, type LabelText } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
@@ -173,8 +173,15 @@ export interface DataLabelOptions<D = unknown> {
   /** Constant screen-px offset `[dx, dy]` from the anchor, or a per-datum accessor. Default `[0, 0]`. */
   offset?: [number, number] | ((d: D, i: number) => [number, number]);
   /** Oriented labels: reading-direction angle (radians) per datum — switches to the rotated
-   *  collision/render model (text runs along the axis, vertically centred on the anchor). */
+   *  collision/render model (text runs along the axis, vertically centred on the anchor). Drawn at
+   *  that angle on every backend and in every export. */
   rotationOf?: (d: D, i: number) => number;
+  /** Oriented labels: round each {@link rotationOf} angle to a multiple of this many degrees (default 1;
+   *  0 keeps it exact). The browser rasterizes glyphs per angle, so labels that share an angle paint much
+   *  faster: 2,000 rotated labels at 1° paint 1.2–2.5× faster than at free angles, and the overlay ~6×
+   *  faster at 5°. A label then runs up to half a step off its angle (0.9 px at the end of a 100 px label
+   *  at 1°). Rounded once per `labels()` call, never per frame. */
+  rotationStep?: number;
   /** Which way text runs from the anchor (default `"start"`). Also places a PLAIN label's box —
    *  `"middle"` centres it on the anchor — with the CSS transform derived to match (#204). */
   textAnchor?: TextAnchor;
@@ -182,21 +189,25 @@ export interface DataLabelOptions<D = unknown> {
   keepUpright?: boolean;
   /** Cap the number of shown labels to the top-k by importance (default: no cap — collision thins). */
   max?: number;
-  /** Inline overlay CSS (camelCased property → value), merged over the built-in default label look
-   *  (a dark 11px sans-serif with a white halo) — a partial override like `{ color: "#333" }` keeps
-   *  the rest. Applied once per element at creation, never per frame. */
+  /** Inline overlay CSS (camelCased property → value), merged over the built-in label look — a partial
+   *  override keeps the rest. Applied once per element at creation, never per frame. Its `font` and
+   *  `color` style every backend when {@link font}/{@link color} are not given (#577); any other
+   *  property styles the overlay only. */
   style?: LabelStyle;
-  /** Advanced overlay styling: a CSS class that SKIPS the built-in default so the class's CSS has
-   *  full control (combine with {@link style} for inline overrides). */
+  /** Advanced overlay styling: a CSS class that SKIPS the built-in inline style ({@link font},
+   *  {@link color} and {@link halo} included) so the class's CSS has full control on the overlay (combine
+   *  with {@link style} for inline overrides). Native text and exports still draw font/color/halo. */
   className?: string;
-  /** Font for backend-native text (SVG/Canvas, incl. export). Defaults to {@link style}'s font, then
-   *  the built-in default. Also the font used to MEASURE label boxes. */
+  /** Label font on every backend (#577): the WebGL overlay, SVG/Canvas, and every export — a CSS font
+   *  shorthand with a px size. Also the font used to MEASURE label boxes. Defaults to {@link style}'s
+   *  font, then the built-in default. */
   font?: string;
-  /** Fill colour for backend-native text. Defaults to {@link style}'s colour, then the default. */
+  /** Label fill colour on every backend (#577). Defaults to {@link style}'s colour, then the default. */
   color?: string;
-  /** Legibility halo stroked behind backend-native text. Defaults to the built-in white halo unless
-   *  {@link style} sets `textShadow: "none"`. */
-  halo?: { color: string; width: number };
+  /** Legibility halo stroked behind the label text on every backend (#571): the WebGL overlay (a CSS
+   *  text stroke), SVG/Canvas, and every export. `width` is the half-stroke in px; `0` draws none.
+   *  Default `{ color: "#ffffff", width: 1 }`, or none when {@link style} sets `textShadow: "none"`. */
+  halo?: LabelHalo;
 }
 
 /**
@@ -349,7 +360,7 @@ export abstract class BaseEngine {
   protected labelLayer: LabelLayer | null = null;
   /** Backend-native text style (SVG/Canvas `<text>`/`fillText`, incl. export) for the current label
    *  set — set once by {@link createLabelOverlay}, read by {@link routeLabels}. Null when off. */
-  private labelText: { font?: string; color?: string; halo?: { color: string; width: number } } | null = null;
+  private labelText: LabelText | null = null;
   /** The last {@link routeLabels} anchor set, retained (reference only) for the export-only text
    *  backend push (#219): a WebGL toPNG()/toSVG() places these once at export time. Always current —
    *  the overlay branch of routeLabels runs on every transform/rebuild. Covers BOTH network frontier
@@ -1729,13 +1740,13 @@ export abstract class BaseEngine {
   protected createLabelOverlay(
     className: string | undefined,
     style: LabelStyle | undefined,
-    text: { font?: string; color?: string; halo?: { color: string; width: number } },
+    text: LabelText,
   ): void {
     if (typeof getComputedStyle === "function" && getComputedStyle(this.host).position === "static") {
       this.host.style.position = "relative";
     }
     this.labelLayer?.destroy();
-    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style));
+    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style, text));
     this.labelText = text;
   }
 
@@ -1803,14 +1814,17 @@ export abstract class BaseEngine {
    *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends.
    *  Position and alignment come from the box's declared placement: `x` IS the anchor for the box's
    *  own `textAnchor` (start ⇒ left edge, middle ⇒ centre, end ⇒ right edge) and `y` is the box's
-   *  vertical centre for the backends' "middle" baseline ({@link labelTextY}). */
+   *  vertical centre for the backends' "middle" baseline ({@link labelTextY}). An oriented box also
+   *  carries the rotation it renders at, and anchor and rotation both include the upright flip
+   *  ({@link labelTextAnchor}, {@link labelTextRotation}), as the overlay's transform does (#580). */
   private toTextData(survivors: readonly LabelBox[]): TextData[] {
     const text = this.labelText;
     return survivors.map((b) => ({
       x: b.x,
       y: labelTextY(b),
       text: String(b.text),
-      align: b.textAnchor ?? "start",
+      align: labelTextAnchor(b),
+      rotation: labelTextRotation(b),
       font: text?.font,
       color: text?.color,
       halo: text?.halo,
@@ -1867,14 +1881,14 @@ export abstract class BaseEngine {
       this.render();
       return;
     }
-    // Native-text (SVG/Canvas export) style — derived to match the overlay when explicit opts are
-    // absent, so one `style` object styles both. Also the font used to MEASURE the label boxes.
-    const font = canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font);
-    const color = opts.color ?? opts.style?.color ?? DEFAULT_LABEL_TEXT.color;
-    const halo = opts.halo ?? (opts.style?.textShadow === "none" ? undefined : DEFAULT_LABEL_TEXT.halo);
-    this.createLabelOverlay(opts.className, opts.style, { font, color, halo });
+    // One font/colour/halo for the overlay, the native text (SVG/Canvas, exports) and the label
+    // measurement (#577): the explicit opts, else `style`'s, else the default.
+    const text = resolveLabelText(opts);
+    const font = text.font;
+    this.createLabelOverlay(opts.className, opts.style, text);
 
     const offsetOf = typeof opts.offset === "function" ? opts.offset : (): [number, number] => (opts.offset as [number, number]) ?? [0, 0];
+    const step = ((opts.rotationStep ?? 1) * Math.PI) / 180; // radians; 0 (or not a finite step) keeps angles exact
     const measured = new Map<string, { width: number; height: number }>(); // dedupe repeated texts (once each)
     const anchors: LabelAnchor[] = [];
     for (let i = 0; i < data.length; i++) {
@@ -1885,7 +1899,8 @@ export abstract class BaseEngine {
       if (!anchor) continue; // e.g. a geoMap point off the projected globe
       let box = measured.get(text);
       if (!box) { box = measureText(text, font); measured.set(text, box); }
-      const rotation = opts.rotationOf?.(d, i);
+      const angle = opts.rotationOf?.(d, i);
+      const rotation = angle === undefined || !(Number.isFinite(step) && step > 0) ? angle : Math.round(angle / step) * step;
       const [ox, oy] = offsetOf(d, i);
       // Plain labels: the box is top-left, so shift up by height/2 to sit centred on the anchor+offset.
       // Oriented labels: labelGeometry already centres vertically, so the offset is used as given.
@@ -2782,7 +2797,12 @@ export abstract class BaseEngine {
     const paint = !this.skipPlaceholderPaint();
     if (paint) this.pushRenderLayers(next.backend);
     next.backend.setTransform(this.transform);
-    if (paint) next.backend.render();
+    if (paint) {
+      // Route the retained data labels to the new backend (#581) before its first frame, so native
+      // text bakes into this render and the overlay fills or empties now, not on the next pan/zoom.
+      this.refreshDataLabels();
+      next.backend.render();
+    }
     // Replay retained pass-through layers onto the freshly-installed backend (mirrors the
     // retained setLayers re-push above). A deferred/not-ready registration is activated here.
     if (this.ptSpecs.size > 0) {

@@ -18,7 +18,18 @@ describe("serializeTexts (#105 N7b-2)", () => {
     expect(svg).toContain('paint-order="stroke"');
     expect(svg).toContain('stroke="#fff"');
     expect(svg).toContain('stroke-width="4"'); // width * 2
+    expect(svg).toContain('stroke-linejoin="miter" stroke-miterlimit="4"'); // the overlay's joins (#571)
     expect(svg).toContain('opacity="0.500"');
+  });
+
+  it("draws no halo stroke at width 0", () => {
+    const svg = serializeTexts([{ x: 0, y: 0, text: "n", halo: { color: "#fff", width: 0 } }]);
+    expect(svg).not.toContain("stroke=");
+  });
+
+  it("rotates a label about its anchor, in clockwise degrees (#580)", () => {
+    expect(serializeTexts([{ x: 10, y: 20, text: "n", rotation: Math.PI / 6 }])).toContain('transform="rotate(30 10 20)"');
+    expect(serializeTexts([{ x: 10, y: 20, text: "n", rotation: 0 }])).not.toContain("transform=");
   });
 
   it("is empty for no labels", () => {
