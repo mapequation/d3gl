@@ -212,7 +212,8 @@ describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", ()
   it("switches between the worker-streamed coarsening tree and the module tree after a worker run", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
-    net.data(graph(), { modules: MODULES }).lod({ source: "structure" }).layout({ backend: "worker", iterations: 20 });
+    // A flat run (a hierarchy lays out nested by default, #566): the worker streams the coarsening tree.
+    net.data(graph(), { modules: MODULES }).lod({ source: "structure" }).layout({ backend: "worker", nested: false, iterations: 20 });
     await net.whenSettled();
     expect(net.lodSource).toBe("worker");
     // The worker's coarsening tree must not win over a requested module cut…
@@ -451,7 +452,8 @@ describe("the module tree is built off the main thread (#428)", () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = graph();
-    net.data(g, { modules: MODULES }).lod({ declutter: false }).layout({ backend: "gpu", iterations: 20 });
+    // The flat seed (a hierarchy lays out nested by default, #566).
+    net.data(g, { modules: MODULES }).lod({ declutter: false }).layout({ backend: "gpu", nested: false, iterations: 20 });
     expect(builds.count, "the GPU seed built the module tree on the main thread").toBe(0);
     await net.whenSettled();
     await frame();

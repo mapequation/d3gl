@@ -254,7 +254,7 @@ describe("network layout backend:'gpu' integration", () => {
     // The example's order: data → lod({ modules }) → layout({ backend: "gpu" }).
     net.data(g);
     net.lod({ modules });
-    net.layout({ backend: "gpu", iterations: 200 });
+    net.layout({ backend: "gpu", nested: false, iterations: 200 }); // the flat seed (a hierarchy lays out nested by default, #566)
     await net.whenSettled();
 
     expect(net.layoutTransport).toBe("gpu"); // the module-aware seed ran on the GPU path
@@ -311,7 +311,7 @@ describe("network layout backend:'gpu' integration", () => {
     net.data(g);
     net.lod({ modules });
     net.style({ sizeMode: "screen", nodeRadius: 4 });
-    net.layout({ backend, fit: true, iterations: 200 });
+    net.layout({ backend, nested: false, fit: true, iterations: 200 }); // the flat seed (nested by default, #566)
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
 

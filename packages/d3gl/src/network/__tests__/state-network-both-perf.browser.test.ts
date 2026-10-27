@@ -736,7 +736,7 @@ beforeAll(async () => {
       const statePositions = stateDragStart;
       const plainLeg = (): ReheatLeg => {
                 net.layout({ backend: "positions", positions: statePositions });
-        net.layout({ backend: "force", warm: true, iterations: 0 });
+        net.layout({ backend: "force", warm: true, iterations: 0, nested: false }); // the flat force drag, not the nested default (#566)
         net.setTransform({ k: K, x: 0, y: 0 });
         flush();
                 const pos = net.positions ?? new Float32Array(0);

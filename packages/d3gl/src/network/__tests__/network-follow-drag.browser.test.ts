@@ -85,7 +85,7 @@ async function flat(): Promise<{ net: Network; h: HTMLElement; g: NetworkGraph }
   await net.whenReady();
   const { graph: g, modules, links } = fixture();
   net.data(g, { modules, moduleLinks: links }).style({ nodeRadius: 3, sizeMode: "screen" }).lod(false);
-  net.layout({ backend: "worker", fit: true });
+  net.layout({ backend: "worker", nested: false, fit: true }); // flat: a hierarchy lays out nested by default (#566)
   await net.whenSettled();
   await frames(5);
   net.interactive({ draggable: true, selectable: true });

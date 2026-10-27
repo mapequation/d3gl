@@ -217,7 +217,7 @@ beforeAll(async () => {
         const clock = vi.spyOn(performance, "now").mockImplementation(() => virtual);
         try {
           if (stream === "nested") net.layout({ backend: "worker", nested: { warm: true, iterations: 1 }, fit: true });
-          else net.layout({ backend: "worker", warm: true, fit: true });
+          else net.layout({ backend: "worker", nested: false, warm: true, fit: true }); // the flat switch back (#566)
           const prev = a.slice();
           let view: ViewTransform = { k: 1, x: 0, y: 0 };
           const t0 = wallClock();
