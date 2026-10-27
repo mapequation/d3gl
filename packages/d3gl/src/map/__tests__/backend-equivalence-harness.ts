@@ -13,7 +13,8 @@
  */
 import type { Device } from "@luma.gl/core";
 import { Scene, type RenderLayer } from "../../core/index.js";
-import type { Backend, InstancedCirclesData, InstancedLayer, PathRecorder, TextData, ViewTransform } from "../../core/index.js";
+import { tracePieSector } from "../../core/index.js";
+import type { Backend, InstancedCirclesData, InstancedLayer, InstancedPieData, PathRecorder, TextData, ViewTransform } from "../../core/index.js";
 import { GroupRenderer } from "../../webgl/renderer.js";
 import { clipFromView } from "../../webgl/transform.js";
 import { CanvasBackend } from "../../canvas/canvas-backend.js";
@@ -46,6 +47,12 @@ export interface BackendRenderOptions {
   /** GPU-instanced primitive layers (WebGL only — Canvas/SVG render their Scene twins),
    *  drawn after the retained layers, mirroring the network lane. */
   instanced?: readonly InstancedLayer[];
+  /** Device px per CSS px of the raster backends' canvases (default 1): a HiDPI screen. The
+   *  buffers they return are device px, `width × pixelRatio` by `height × pixelRatio`. */
+  pixelRatio?: number;
+  /** WebGL only: create the backend at this size, push the layers, then `resize()` it to the render size
+   *  without pushing them again, as a chart whose retained layers outlive a resize. */
+  resizedFrom?: { width: number; height: number };
 }
 
 const IDENTITY: ViewTransform = { k: 1, x: 0, y: 0 };
@@ -56,11 +63,15 @@ function ctx2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   return ctx;
 }
 
-/** Decode an image data URL (PNG or SVG) into a top-left-origin RGBA buffer. */
-export async function decodeImage(url: string, width: number, height: number): Promise<PixelBuffer> {
+/** Decode an image data URL (PNG or SVG) into a top-left-origin RGBA buffer. `exact` requires the
+ *  image to be `width × height` already, rather than scaling it to that size. */
+export async function decodeImage(url: string, width: number, height: number, exact = false): Promise<PixelBuffer> {
   const img = new Image();
   img.src = url;
   await img.decode();
+  if (exact && (img.naturalWidth !== width || img.naturalHeight !== height)) {
+    throw new Error(`image is ${img.naturalWidth}x${img.naturalHeight}, expected ${width}x${height}`);
+  }
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -72,10 +83,9 @@ export async function decodeImage(url: string, width: number, height: number): P
 
 /**
  * Render layers through the full {@link WebGLBackend} (stencil clip + sizeMode orchestration,
- * instanced lane) and read the frame back via its `toPNG()` export — the offscreen target runs
- * the same `drawInto` composite as the live screen. Labels are pushed through the optional
- * `setTextLayer` seam — a no-op until the backend implements it (#219), after which the
- * export composites them like Canvas does.
+ * instanced lane) and read the frame back via its `toPNG()` export — the canvas as drawn (#569),
+ * so it must be the canvas's device-px size. Labels are pushed through the optional
+ * `setTextLayer` seam, and the export composites them like Canvas does (#219).
  */
 export async function renderWebGLBackend(
   layers: readonly RenderLayer[],
@@ -83,17 +93,37 @@ export async function renderWebGLBackend(
   height: number,
   opts: BackendRenderOptions = {},
 ): Promise<PixelBuffer> {
+  const ratio = opts.pixelRatio ?? 1;
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const backend: Backend = await WebGLBackend.create(canvas, { width, height });
-  backend.setLayers([...layers]);
-  for (const layer of opts.instanced ?? []) backend.setInstancedLayer?.(layer);
-  if (opts.texts) backend.setTextLayer?.(opts.texts);
-  backend.setTransform(opts.transform ?? IDENTITY);
-  const png = backend.toPNG();
-  backend.destroy();
-  return decodeImage(png, width, height);
+  const png = await withDevicePixelRatio(ratio, async () => {
+    const from = opts.resizedFrom ?? { width, height };
+    const backend: Backend = await WebGLBackend.create(canvas, from);
+    backend.setLayers([...layers]);
+    backend.resize(width, height);
+    for (const layer of opts.instanced ?? []) backend.setInstancedLayer?.(layer);
+    if (opts.texts) backend.setTextLayer?.(opts.texts);
+    backend.setTransform(opts.transform ?? IDENTITY);
+    const url = backend.toPNG();
+    backend.destroy();
+    return url;
+  });
+  return decodeImage(png, width * ratio, height * ratio, true);
+}
+
+/** Run `fn` with `window.devicePixelRatio` reading `ratio`: a HiDPI screen in the 1× headless browser.
+ *  luma reads it when it creates a canvas context, so create the backend inside `fn`. */
+export async function withDevicePixelRatio<T>(ratio: number, fn: () => Promise<T>): Promise<T> {
+  if (ratio === 1) return fn();
+  const own = Object.getOwnPropertyDescriptor(window, "devicePixelRatio");
+  Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => ratio });
+  try {
+    return await fn();
+  } finally {
+    if (own) Object.defineProperty(window, "devicePixelRatio", own);
+    else Reflect.deleteProperty(window, "devicePixelRatio");
+  }
 }
 
 /** Render layers (+ optional text labels) through the full {@link CanvasBackend} and read the
@@ -104,17 +134,18 @@ export function renderCanvasBackend(
   height: number,
   opts: BackendRenderOptions = {},
 ): PixelBuffer {
+  const ratio = opts.pixelRatio ?? 1;
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = width * ratio;
+  canvas.height = height * ratio;
   const backend = new CanvasBackend(canvas, width, height);
   backend.setLayers([...layers]);
   if (opts.texts) backend.setTextLayer(opts.texts);
   backend.setTransform(opts.transform ?? IDENTITY);
   backend.render();
-  const img = ctx2d(canvas).getImageData(0, 0, width, height);
+  const img = ctx2d(canvas).getImageData(0, 0, canvas.width, canvas.height);
   backend.destroy();
-  return { width, height, data: new Uint8Array(img.data.buffer.slice(0)) };
+  return { width: canvas.width, height: canvas.height, data: new Uint8Array(img.data.buffer.slice(0)) };
 }
 
 /**
@@ -281,6 +312,53 @@ export function diffPixels(a: PixelBuffer, b: PixelBuffer, opts: DiffOptions = {
     }
   }
   return { considered, mismatches, fraction: considered ? mismatches / considered : 0, samples };
+}
+
+export interface EdgeError {
+  /** Pixels on an edge of `ref`: where it differs from a 4-neighbour. */
+  pixels: number;
+  /** Mean per-pixel colour error there: the max over the premultiplied RGBA channels. */
+  mean: number;
+  /** Edge pixels that `ref` covers in part (alpha 32-223: antialiased against the background), and
+   *  how many of those same pixels `a` covers in part too (alpha 1-254). */
+  partial: number;
+  partialInA: number;
+}
+
+/**
+ * Exact-position error of `a` along the edges of `ref` (#570). The position-tolerant {@link diffPixels}
+ * accepts a hard-edged render of an antialiased one, since each stair-step pixel has a match a pixel
+ * away; this compares each edge pixel with the same pixel, premultiplied (a transparent pixel's colour
+ * is irrelevant), so a stair-stepped edge reads ~half the colour range where an antialiased one reads
+ * a few units.
+ */
+export function edgeError(a: PixelBuffer, ref: PixelBuffer): EdgeError {
+  if (a.width !== ref.width || a.height !== ref.height) {
+    throw new Error(`size mismatch: ${a.width}x${a.height} vs ${ref.width}x${ref.height}`);
+  }
+  const { width: W, height: H } = ref;
+  const pm = (d: Uint8Array, o: number, c: number): number => (c === 3 ? d[o + 3]! : (d[o + c]! * d[o + 3]!) / 255);
+  let pixels = 0, sum = 0, partial = 0, partialInA = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const o = (y * W + x) * 4;
+      let edge = false;
+      for (const n of [o - 4, o + 4, o - W * 4, o + W * 4]) {
+        for (let c = 0; c < 4 && !edge; c++) if (Math.abs(pm(ref.data, o, c) - pm(ref.data, n, c)) > 2) edge = true;
+      }
+      if (!edge) continue;
+      pixels++;
+      let e = 0;
+      for (let c = 0; c < 4; c++) e = Math.max(e, Math.abs(pm(a.data, o, c) - pm(ref.data, o, c)));
+      sum += e;
+      const ra = ref.data[o + 3]!, aa = a.data[o + 3]!;
+      if (ra >= 32 && ra <= 223) {
+        partial++;
+        if (aa > 0 && aa < 255) partialInA++;
+      }
+    }
+  }
+  return { pixels, mean: pixels ? sum / pixels : 0, partial, partialInA };
 }
 
 /**
@@ -674,6 +752,80 @@ export function translucentBorderedGlyphs(width: number, height: number): { circ
   const circles: InstancedCirclesData = { centers, radii, colors, borders, borderColors, count };
   return { circles, scene: glyphScene(circles) };
 }
+
+/**
+ * Disc edges to compare exactly (#570), on a transparent background so alpha is coverage: a plain
+ * disc, a disc with a dark ring over a light fill (the fill-to-ring edge), a module-boundary-style ring
+ * (a transparent fill), and a small disc. Centres and radii are off the pixel grid, so no edge lands
+ * on pixel boundaries by luck.
+ */
+export function edgeGlyphs(width: number, height: number): { circles: InstancedCirclesData; scene: Scene } {
+  const s = Math.min(width, height);
+  const nodes = [
+    { x: 0.27, y: 0.3, r: 0.17 * s, fill: [31, 119, 180, 255], border: 0, ring: [0, 0, 0, 0] },
+    { x: 0.71, y: 0.32, r: 0.19 * s, fill: [250, 220, 120, 255], border: 0.27, ring: [40, 40, 60, 255] },
+    { x: 0.33, y: 0.73, r: 0.16 * s, fill: [0, 0, 0, 0], border: 0.14, ring: [214, 39, 40, 255] },
+    { x: 0.72, y: 0.74, r: 3.3, fill: [44, 160, 44, 255], border: 0, ring: [0, 0, 0, 0] },
+  ];
+  const count = nodes.length;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const colors = new Uint8Array(count * 4);
+  const borders = new Float32Array(count);
+  const borderColors = new Uint8Array(count * 4);
+  nodes.forEach((n, i) => {
+    centers[i * 2] = width * n.x + 0.37;
+    centers[i * 2 + 1] = height * n.y + 0.21;
+    radii[i] = n.r + 0.29;
+    borders[i] = n.border;
+    colors.set(n.fill, i * 4);
+    borderColors.set(n.ring, i * 4);
+  });
+  const circles: InstancedCirclesData = { centers, radii, colors, borders, borderColors, count };
+  return { circles, scene: glyphScene(circles) };
+}
+
+/**
+ * Pie edges to compare exactly (#570), on a transparent background: three wedges, a thin wedge, a single
+ * whole-disc wedge, two half turns, and a near-full wedge with a sliver in its gap, as instanced wedges
+ * (WebGL) and as their Scene twin, one `tracePieSector`
+ * drawable per wedge (what `tracePieWedges` traces for Canvas/SVG). Off the pixel grid, as `edgeGlyphs`.
+ * The twin flattens its arcs to 0.02 px rather than the default 0.25, whose facets (0.5 device px at
+ * devicePixelRatio 2) would be most of the error measured along the arcs.
+ */
+export function edgePies(width: number, height: number): { pie: InstancedPieData; scene: Scene } {
+  const s = Math.min(width, height);
+  const pies = [
+    { x: 0.3, y: 0.32, r: 0.2 * s, ends: [0.2, 0.55, 1] },
+    { x: 0.68, y: 0.66, r: 0.22 * s, ends: [0.04, 1] },
+    { x: 0.8, y: 0.18, r: 0.11 * s, ends: [1] }, // one wedge, the whole disc: no seam
+    { x: 0.18, y: 0.8, r: 0.11 * s, ends: [0.5, 1] }, // two half turns: their edges are one line
+    { x: 0.55, y: 0.12, r: 0.09 * s, ends: [0.985, 1] }, // a near-full wedge and the sliver in its gap
+  ];
+  const palette = [[31, 119, 180], [255, 127, 14], [44, 160, 44]];
+  const wedges = pies.flatMap((p) => p.ends.map((end, k) => ({ p, start: k ? p.ends[k - 1]! : 0, end, color: palette[k]! })));
+  const count = wedges.length;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const angles = new Float32Array(count * 2);
+  const colors = new Uint8Array(count * 4);
+  const scene = new Scene(0.02);
+  scene.group(PIE_GROUP, (g) => {
+    wedges.forEach((w, i) => {
+      const cx = width * w.p.x + 0.37, cy = height * w.p.y + 0.21, r = w.p.r + 0.29;
+      centers.set([cx, cy], i * 2);
+      radii[i] = r;
+      angles.set([w.start, w.end], i * 2);
+      colors.set([...w.color, 255], i * 4);
+      g.drawable(i, (ctx) => tracePieSector(ctx, cx, cy, 0, r, w.start * 2 * Math.PI, w.end * 2 * Math.PI));
+    });
+  });
+  wedges.forEach((w, i) => scene.setFill(PIE_GROUP, i, `rgb(${w.color.join(",")})`));
+  return { pie: { centers, radii, angles, colors, count }, scene };
+}
+
+/** The group {@link edgePies} draws its Scene twin in. */
+export const PIE_GROUP = "pies";
 
 /** The Scene twin of an instanced-circle layer: exactly what the network's LOD frontier traces
  *  into the retained Scene for Canvas/SVG (`traceFrontierGlyphs` — one ring-encoded circle per

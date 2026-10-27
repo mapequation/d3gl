@@ -62,6 +62,11 @@ const BLEND = {
   blendAlphaDstFactor: "one-minus-src-alpha",
 } as const;
 
+// The composite blends the surface onto the target premultiplied: BLEND left the surface's RGB already
+// multiplied by its alpha, and multiplying it again darkens every pixel the surface covers only in part
+// (a translucent point, an antialiased edge, #570).
+const BLIT_BLEND = { ...BLEND, blendColorSrcFactor: "one" } as const;
+
 /** Expanded quad attributes for a PointBatch (4 verts + 6 indices per point). */
 interface Expanded {
   center: Float32Array;
@@ -253,6 +258,7 @@ export class PassThroughGL {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width, height),
       u_pointScreen: 0,
       u_viewport: new Float32Array([width, height]),
+      u_pixelRatio: 1, // #570: the surface is CSS px (#300), so the edge ramp is one CSS px wide
     };
     this.pointModel = new Model(device, {
       vs: PT_POINT_VS,
@@ -327,7 +333,7 @@ export class PassThroughGL {
       topology: "triangle-list" as const,
       bindings: { u_tex: this.colorTexture() },
       uniforms: this.blitUniforms,
-      parameters: BLEND,
+      parameters: BLIT_BLEND,
       vertexCount: 6,
     });
   }

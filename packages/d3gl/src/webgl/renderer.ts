@@ -340,6 +340,8 @@ const POINT_CORNERS: [number, number][] = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
  */
 export class GroupRenderer {
   private transform = identity();
+  /** The target's device px per CSS px (#570): the point discs' edge ramp is one device px wide. */
+  private pixelRatio = 1;
   /** Combined fill+stroke pass (interleaved per drawable). Null when the group is points-only. */
   private shape: Pass | null;
   private point: PointPass | null;
@@ -568,6 +570,7 @@ export class GroupRenderer {
       u_transform: this.transform,
       u_pointScreen: 0,
       u_viewport: new Float32Array([this.viewportWidth, this.viewportHeight]),
+      u_pixelRatio: this.pixelRatio,
     };
 
     const model = new Model(device, {
@@ -892,6 +895,15 @@ export class GroupRenderer {
   setViewport(width: number, height: number): void {
     this.viewportWidth = width;
     this.viewportHeight = height;
+    // The passes read it at draw time: screen-mode sizing, and the point discs' edge ramp in either mode (#570).
+    if (this.shape) this.shape.uniforms["u_viewport"] = new Float32Array([width, height]);
+    if (this.point) this.point.uniforms["u_viewport"] = new Float32Array([width, height]);
+  }
+
+  /** Set the target's device px per CSS px (#570), for the point discs' edge ramp. */
+  setPixelRatio(ratio: number): void {
+    this.pixelRatio = ratio;
+    if (this.point) this.point.uniforms["u_pixelRatio"] = ratio;
   }
 
   /** Set the view transform (column-major mat3) for pan/zoom. */

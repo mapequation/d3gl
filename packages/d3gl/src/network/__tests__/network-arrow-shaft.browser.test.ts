@@ -59,6 +59,11 @@ const dist = (a: number[], b: number[]): number => Math.max(...a.map((v, i) => M
 
 type Link = (typeof LINKS)[number];
 
+/** How far off the head's axis the shaft may read (px). WebGL's export is its screen (#569), whose 4× MSAA
+ *  grades a thin diagonal edge in quarter steps where Canvas and SVG grade it exactly, and the 40-unit ink
+ *  test reads one side up to a quarter px wider (1.25 measured on the bent thin link at k = 3). */
+const stepTolerance = (backend: (typeof BACKENDS)[number]): number => (backend === "webgl" ? 1.5 : 1);
+
 /** The one-shape assertions on a rendered link from POS[0] to the target, read from its pixels. */
 function expectOneShape(
   px: PixelBuffer,
@@ -93,8 +98,8 @@ function expectOneShape(
 
   // The tip sits on the target's rim: ink just inside it, none just past it.
   expect(Math.hypot(tx - 210, ty - 100)).toBeCloseTo(RADIUS * s, 3);
-  // 4px back the thinnest head is ~1.3px wide: enough to cover a pixel centre without AA (WebGL's
-  // toPNG has none, so a 1px sliver on a diagonal tip can fall between two pixel centres).
+  // 4px back the thinnest head is ~1.3px wide: enough to cover a pixel centre whatever the antialiasing
+  // (a 1px sliver on a diagonal tip can fall between two pixel centres).
   expect(ink(tx - 4 * ux, ty - 4 * uy), "no ink just behind the tip").toBe(true);
   expect(ink(tx + 2 * ux, ty + 2 * uy), "ink past the tip (inside the target)").toBe(false);
   // No shaft pixel beside the tip: the line's edges never reach the tip region.
@@ -108,7 +113,7 @@ function expectOneShape(
   // A bent link's shaft runs into the head along the head's axis, so it stays on the axis behind the base.
   const back = opts.back ?? -8;
   // Sampled at pixel centres: `at` rounds, so a coordinate c reads the pixel covering [c − 0.5, c + 0.5);
-  // shift by half (WebGL's toPNG has no AA, so a thin diagonal line can miss a half-pixel-off sample).
+  // shift by half (a thin diagonal line can miss a half-pixel-off sample).
   const inkAt = (x: number, y: number): boolean => ink(x - 0.5, y - 0.5);
   for (let d = back; d <= len - 3; d += 1) expect(inkAt(mx + d * ux, my + d * uy), `gap on the axis at ${d.toFixed(0)}px from the base`).toBe(true);
   if (wpx >= 4)
@@ -150,7 +155,7 @@ describe("network: a directed line link is one shape, shaft + head (#542, LOD of
                 arrowSize: link.size,
                 linkStroke: link.stroke,
               };
-              expectOneShape(await render(backend, style, k), k, sizeMode, bend, link);
+              expectOneShape(await render(backend, style, k), k, sizeMode, bend, link, { stepTolerance: stepTolerance(backend) });
             });
 });
 
@@ -199,7 +204,7 @@ describe("network: LOD on, a directed line link is the same one shape (#542)", (
                 linkStroke: link.stroke,
               };
               const lod = await renderLod(backend, style, k, kind);
-              expectOneShape(lod, k, sizeMode, bend, link);
+              expectOneShape(lod, k, sizeMode, bend, link, { stepTolerance: stepTolerance(backend) });
               // The same pixels as the LOD-off link, right of the source end (a collapsed module's glyph sits there).
               const off = await render(backend, style, k);
               let differ = 0;

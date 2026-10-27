@@ -298,7 +298,9 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     expect([...(last(flags) ?? [])], "container flags").toEqual([0, 1, 0]);
     expect(spy.emitted().filter((n) => n === "nodes" || n === "phys-container"), "a selection re-emitted geometry").toEqual([]);
     const after = await frame(net);
-    expect(rgbaAt(after, x, y), "the selected container changed").toEqual(rgbaAt(before, x, y));
+    // Kept, to a unit or two: what dims around it (links, the other state nodes) reaches this pixel through the
+    // translucent container by its antialiased edges, as on screen (#569). Dimmed, its alpha would drop by 70%.
+    expect(near(rgbaAt(after, x, y), rgbaAt(before, x, y), 2), "the selected container changed").toBe(true);
     expect(rgbaAt(after, ox, oy)[3], "another container did not dim").toBeLessThan(rgbaAt(before, ox, oy)[3]);
 
     // Selecting one state node keeps its own container lit, dims the others (#315's acceptance).
@@ -307,7 +309,7 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     expect([...(last(spy.styled("phys-container").map((u) => u.selected).filter((s): s is Uint8Array => !!s)) ?? [])]).toEqual([0, 0, 1]);
     expect(spy.emitted().filter((n) => n === "nodes" || n === "phys-container"), "a selection re-emitted geometry").toEqual([]);
     const one = await frame(net);
-    expect(rgbaAt(one, ox, oy), "the selected state node's container changed").toEqual(rgbaAt(before, ox, oy));
+    expect(near(rgbaAt(one, ox, oy), rgbaAt(before, ox, oy), 2), "the selected state node's container changed").toBe(true);
     expect(rgbaAt(one, x, y)[3], "another container did not dim").toBeLessThan(rgbaAt(before, x, y)[3]);
     net.destroy();
   });

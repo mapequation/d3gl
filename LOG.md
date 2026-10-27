@@ -134,6 +134,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | hover overlay **slot** (#519): a hover change repaints only the highlight — zero `clearRect`, ≤ 8 `fill`+`stroke` per change (Canvas); scene groups untouched, ≤ 8 elements written per change (SVG); median ms per change | Canvas, SVG | `network/__tests__/network-hover-slot-perf.browser.test.ts` | 50k nodes + links, LOD off, 120 hover changes | `perfN` (max 200k) |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
+| instanced disc edges (#570): the coverage ramp and the half-device-px quad growth of plain discs, ringed discs and pie wedges, through a `setTransform` zoom sweep into a 4× MSAA canvas; no buffer created during the sweep everywhere; GPU ms per frame (synced by a one-pixel `readPixels`: on ANGLE/Metal `finish()` returns at once and the timer query reads 0) under `c0 + c1·N` only on a hardware GPU. Count-only at 2k under software GL (#557: a drawn instance costs ≈10 µs per frame there) | **WebGL** | `webgl/__tests__/instanced-disc-aa-perf.browser.test.ts` | 2k (count) | only on a hardware GPU: `PERF_REAL_GPU=1` runs 1M (max 2M) |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band — on a flat **and** a `multilevel` solver (#353: every seeded run ticks the graph's level on the latter), whose graph-level ticks are also pinned bitwise equal to the flat solver's (pyramid with hub rows, and all-pairs) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU module-link springs (#455): exactly `reduce levels + 4` extra draws per tick (never one per module or link), zero texture / framebuffer / buffer creation per tick; tick with vs without within 1.5× | **WebGL** | `network/gpu/__tests__/gpu-module-springs-perf.browser.test.ts` | 30k leaves / 13k links | `PERF_BROWSER_N` (max 200k) |
@@ -1065,6 +1066,30 @@ and `arrowsToDrawables`). Stacked, a translucent link double-blends where the he
 backends disagree there. Self-link loops follow the same rule: each loop is ONE instance of the `loops` layer, its
 `head` (`none`, `arrow` or `half`) part of the same strip, and ONE outline on Canvas/SVG (core/loop-drop.ts). Do not
 reintroduce a separate head primitive drawn over a line.
+
+**A disc's edge is a coverage ramp, never a `discard` (#570).** Every disc shader (`POINT_FS`, `INSTANCED_CIRCLE_FS`,
+`INSTANCED_PIE_FS`, webgl/shaders.ts) covers its edge over one *device* px from `v_radiusPx`, and its quad grows by
+half a device px (`discGrow`) so the ramp's outer half is rasterized. MSAA cannot do it: it smooths triangle edges,
+and a disc's quad edges lie outside the disc, so a `discard` keeps or drops whole pixels at any devicePixelRatio. A
+new disc shader takes `DISC_VS` / `DISC_FS` or it stair-steps again. The ramp's width needs the target's device px
+per CSS px (`u_pixelRatio`; `u_viewport` is CSS px), which `WebGLBackend.syncPixelRatio` pushes only when the drawn
+target's ratio changes (the screen, the `readPixel` FBO, the globe bake). A ring and its fill meet over the same
+ramp, mixed premultiplied (a transparent fill must not darken a module ring). A pie's straight edges use the signed
+distance to the *nearer* edge, capped by the wedge's (and the gap's) width: half-plane min/max seams a single-wedge
+pie and is wrong near a half-turn wedge. The pass-through surface holds premultiplied colour, so its blit adds it
+with source factor ONE (`BLIT_BLEND`); `src-alpha` darkened every partly covered pixel.
+
+**The WebGL export is its screen (#569).** `toPNG()` renders and copies the canvas in the same task (`canvasToPNG`,
+webgl/png.ts): device-px size, the screen's MSAA, straight colours (`drawImage` un-premultiplies). For tests: the
+export's triangle edges carry 4× MSAA's levels (64/128/191) where Canvas grades exactly, so WebGL-vs-Canvas stroke
+and clip diffs take `colorTolerance: 64` (`MSAA_EDGES`) rather than a looser fraction, which would let a bevelled
+round join through (it scores 0.7%). Exact-position edge comparisons use `edgeError` and bound the mean: headless
+Canvas draws a circle ~0.1 px small and 0.05 px low while WebGL's is exact, and Scene arcs flatten at 0.25 CSS px
+(0.5 device px at dpr 2) unless the twin is built finer. A canvas with no layout box (hidden, or not in the
+document) gets a 1×1 drawing buffer from luma's ResizeObserver a frame after creation, so `toPNG()` sizes the buffer
+to CSS × devicePixelRatio first, as `resize()` does. Emulate HiDPI in a test by overriding `window.devicePixelRatio`
+(`withDevicePixelRatio` in the equivalence harness), never by pre-sizing `canvas.width`, which that step undoes; and
+read a detached canvas's screen in the same task as the render that drew it.
 
 ## LOD declutter can hide a non-overlapping module aggregate in a small graph, by design (#512)
 

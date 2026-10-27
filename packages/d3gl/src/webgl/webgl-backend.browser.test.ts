@@ -5,6 +5,9 @@ import { groupRendererConstructions } from "./renderer.js";
 import type { DrawableVector } from "../core/index.js";
 import { GlSurfaceSpy } from "../__tests__/engine-sweep.js";
 import type { GlTexStorage } from "../__tests__/engine-sweep.js";
+import { CanvasBackend } from "../canvas/canvas-backend.js";
+import { decodeImage, edgeError } from "../map/__tests__/backend-equivalence-harness.js";
+import type { DrawBatch } from "../core/index.js";
 
 function rectLayer(name: string, x: number, y: number, w: number, h: number, color: string, clipTo?: string) {
   const scene = new Scene();
@@ -135,6 +138,42 @@ describe("WebGLBackend", () => {
     expect(away[1]).toBeGreaterThan(80);    // green base still there
     expect(away[0]).toBeLessThan(60);       // not red (no point here)
     backend.destroy();
+  });
+
+  it("a translucent pass-through point keeps its colour and an antialiased edge, as on Canvas (#570)", async () => {
+    // The surface accumulates premultiplied colour; composited with src-alpha it was multiplied by alpha twice.
+    const size = 64;
+    const batch: DrawBatch = {
+      points: { positions: new Float32Array([31.4, 32.3]), radii: new Float32Array([14.6]), colors: new Uint8Array([255, 0, 0, 128]), count: 1 },
+      paths: null,
+    };
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    const gl = await WebGLBackend.create(canvas, { width: size, height: size });
+    gl.setTransform({ k: 1, x: 0, y: 0 });
+    gl.setPassThroughLayer({ name: "pts" });
+    gl.drawPassThrough("pts", batch, "replace-first");
+    const glPx = await decodeImage(gl.toPNG(), size, size, true);
+    gl.destroy();
+    const cvCanvas = document.createElement("canvas");
+    cvCanvas.width = size; cvCanvas.height = size;
+    const cv = new CanvasBackend(cvCanvas, size, size);
+    cv.setTransform({ k: 1, x: 0, y: 0 });
+    cv.setPassThroughLayer({ name: "pts" });
+    cv.drawPassThrough("pts", batch, "replace-first");
+    // Read the canvas itself: the Canvas backend's toPNG() re-renders, and the engine repaints pass-through after.
+    const ctx = cvCanvas.getContext("2d");
+    if (!ctx) throw new Error("no 2d context");
+    const cvPx = { width: size, height: size, data: new Uint8Array(ctx.getImageData(0, 0, size, size).data.buffer) };
+    cv.destroy();
+
+    const o = (32 * size + 31) * 4;
+    // The point's own colour at its centre: (255, 0, 0, 128), where the double multiply read (127, 0, 0, 64).
+    expect([...glPx.data.slice(o, o + 4)].map((v, i) => Math.abs(v - [255, 0, 0, 128][i]!) <= 2)).toEqual([true, true, true, true]);
+    const e = edgeError(glPx, cvPx);
+    expect(e.pixels).toBeGreaterThan(60);
+    expect(e.partialInA / e.partial, JSON.stringify(e)).toBeGreaterThan(0.95);
+    expect(e.mean, JSON.stringify(e)).toBeLessThan(12);
   });
 
   it("globe is not vertically flipped: north content renders at the top of the disc", async () => {
@@ -342,13 +381,13 @@ describe("WebGLBackend updateLayer in-place replace (#218)", () => {
  * singleton shared by every device on the page, so an absolute number there says nothing about
  * this backend.
  */
-describe("WebGLBackend export framebuffer is lazy (#88)", () => {
+describe("WebGLBackend readback framebuffer is lazy (#88); toPNG() needs none (#569)", () => {
   const W = 120;
   const H = 80;
   const W2 = 160;
   const H2 = 100;
 
-  /** What one export target reserves at a CSS size: an RGBA8 colour attachment plus the
+  /** What the readPixel() target reserves at a CSS size: an RGBA8 colour attachment plus the
    *  depth24-stencil8 one `clipTo` needs. Both formats are 4 B/texel ⇒ width × height × 8 bytes. */
   const exportTarget = (width: number, height: number): GlTexStorage[] => [
     { internalformat: WebGL2RenderingContext.RGBA8, width, height },
@@ -361,7 +400,7 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     canvas.width = width; canvas.height = height;
     document.body.appendChild(canvas);
     const backend = await WebGLBackend.create(canvas, { width, height });
-    // A clipTo pair, so the stencil attachment the export keeps is exercised, not just allocated.
+    // A clipTo pair, so the stencil attachment the readback target keeps is exercised, not just allocated.
     backend.setLayers([
       rectLayer("mask", 0, 0, width / 2, height, "rgb(0,0,0)"),
       rectLayer("red", 0, 0, width, height, "rgb(255,0,0)", "mask"),
@@ -377,7 +416,7 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     return { width: img.naturalWidth, height: img.naturalHeight };
   }
 
-  it("create → clipped layers → transform → render → resize allocate NO export framebuffer", async () => {
+  it("create → clipped layers → transform → render → resize allocate NO readback framebuffer", async () => {
     const spy = new GlSurfaceSpy();
     let backend: WebGLBackend | undefined;
     try {
@@ -407,17 +446,34 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     }
   });
 
-  it("the first toPNG() allocates it once at CSS size; later exports and readPixel reuse it", async () => {
+  it("toPNG() allocates no framebuffer: it exports the canvas at its size (#569)", async () => {
+    const backend = await clippedBackend();
+    const spy = new GlSurfaceSpy();
+    try {
+      const at = spy.mark();
+      const png = backend.toPNG();
+      backend.toPNG();
+      const onExport = spy.since(at);
+      expect(onExport.framebuffers).toBe(0);
+      expect(onExport.textures).toBe(0);
+      expect(onExport.storage).toEqual([]);
+      expect(await pngSize(png)).toEqual({ width: W, height: H });
+    } finally {
+      spy.restore();
+      backend.destroy();
+    }
+  });
+
+  it("the first readPixel() allocates it once at CSS size; later reads reuse it", async () => {
     const backend = await clippedBackend();
     const spy = new GlSurfaceSpy();
     try {
       const first = spy.mark();
-      const png = backend.toPNG();
+      backend.readPixel(10, 10);
       const onFirst = spy.since(first);
       expect(onFirst.framebuffers).toBe(1);
       // Exactly the two attachments and nothing else: W×H×8 bytes, measured.
       expect(onFirst.storage).toEqual(exportTarget(W, H));
-      expect(await pngSize(png)).toEqual({ width: W, height: H });
 
       const again = spy.mark();
       backend.toPNG();
@@ -436,11 +492,11 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     }
   });
 
-  it("resize() frees it without reallocating; the next export recreates it at the new size", async () => {
+  it("resize() frees it without reallocating; the next read recreates it at the new size", async () => {
     const backend = await clippedBackend();
     const spy = new GlSurfaceSpy();
     try {
-      backend.toPNG(); // allocate at W×H
+      backend.readPixel(10, 10); // allocate at W×H
       const resize = spy.mark();
       backend.resize(W2, H2);
       const onResize = spy.since(resize);
@@ -450,16 +506,16 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
       expect(onResize.texturesDeleted).toBe(2);
 
       const next = spy.mark();
-      const png = backend.toPNG();
+      backend.readPixel(10, 10);
       expect(spy.since(next).storage).toEqual(exportTarget(W2, H2));
-      expect(await pngSize(png)).toEqual({ width: W2, height: H2 });
+      expect(await pngSize(backend.toPNG())).toEqual({ width: W2, height: H2 });
     } finally {
       spy.restore();
       backend.destroy();
     }
   });
 
-  it("stays CSS width×height at devicePixelRatio 2 (toPNG/readPixel read exactly that; pick is device px)", async () => {
+  it("stays CSS width×height at devicePixelRatio 2 (readPixel reads exactly that), while toPNG() is the 2× canvas (#569)", async () => {
     const own = Object.getOwnPropertyDescriptor(window, "devicePixelRatio");
     Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => 2 });
     const spy = new GlSurfaceSpy();
@@ -468,10 +524,11 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
       backend = await clippedBackend();
       // Non-vacuity: luma really is rendering at 2×, so a device-px target would show as 2W×2H.
       expect(backend.gpuDevice.getDefaultCanvasContext().devicePixelRatio).toBe(2);
+      backend.resize(W2, H2); // sizes the drawing buffer to CSS × 2 now (luma's own observer is a frame late)
       const at = spy.mark();
-      const png = backend.toPNG();
-      expect(spy.since(at).storage).toEqual(exportTarget(W, H));
-      expect(await pngSize(png)).toEqual({ width: W, height: H });
+      backend.readPixel(10, 10);
+      expect(spy.since(at).storage).toEqual(exportTarget(W2, H2));
+      expect(await pngSize(backend.toPNG())).toEqual({ width: 2 * W2, height: 2 * H2 });
     } finally {
       spy.restore();
       backend?.destroy();
@@ -480,17 +537,17 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     }
   });
 
-  it("globe-mode toPNG() allocates it lazily too, at CSS size", async () => {
+  it("globe-mode toPNG() allocates no framebuffer either, and exports the canvas", async () => {
     const backend = await clippedBackend(128, 128);
     const spy = new GlSurfaceSpy();
     try {
       backend.setGlobeMode(true, 256, 128);
-      backend.render(); // bake now, so the export window holds only the export target
+      backend.render(); // bake now, so the export window holds only the export
       const at = spy.mark();
       const png = backend.toPNG();
       const onExport = spy.since(at);
-      expect(onExport.framebuffers).toBe(1);
-      expect(onExport.storage).toEqual(exportTarget(128, 128));
+      expect(onExport.framebuffers).toBe(0);
+      expect(onExport.storage).toEqual([]);
       expect(await pngSize(png)).toEqual({ width: 128, height: 128 });
     } finally {
       spy.restore();
@@ -498,24 +555,24 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     }
   });
 
-  it("destroy() releases it: an exported chart frees exactly its two attachments more than a twin that never did", async () => {
+  it("destroy() releases it: a read chart frees exactly its two attachments more than a twin that never read", async () => {
     // luma's device.destroy() frees no resources, so destroy() is the ONLY teardown of the target.
     // Twins with identical layers free identical renderer textures (style tables), so the delta
-    // isolates the export target's colour + depth-stencil attachments.
-    const exported = await clippedBackend();
+    // isolates the readback target's colour + depth-stencil attachments.
+    const read = await clippedBackend();
     const idle = await clippedBackend();
     const spy = new GlSurfaceSpy();
     try {
-      exported.toPNG();
-      exported.render();
+      read.readPixel(10, 10);
+      read.render();
       idle.render();
       const a = spy.mark();
-      exported.destroy();
-      const freedExported = spy.since(a).texturesDeleted;
+      read.destroy();
+      const freedRead = spy.since(a).texturesDeleted;
       const b = spy.mark();
       idle.destroy();
       const freedIdle = spy.since(b).texturesDeleted;
-      expect(freedExported - freedIdle).toBe(2);
+      expect(freedRead - freedIdle).toBe(2);
     } finally {
       spy.restore();
     }

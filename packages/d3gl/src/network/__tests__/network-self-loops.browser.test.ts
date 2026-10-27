@@ -46,8 +46,9 @@ function host(): HTMLElement {
 }
 
 /** How many pixels of the rendered frame in the box are the link colour (red) — the loop sits there alone. Each
- *  counts by its alpha: over the frame's transparent background an edge pixel is pure red at partial coverage. */
-async function redPixels(png: string, x0: number, y0: number, x1: number, y1: number): Promise<number> {
+ *  counts by its alpha: over the frame's transparent background an edge pixel is pure red at partial coverage.
+ *  `anyColour` counts every pixel by its alpha. */
+async function redPixels(png: string, x0: number, y0: number, x1: number, y1: number, anyColour = false): Promise<number> {
   const img = new Image();
   img.src = png;
   await img.decode();
@@ -60,7 +61,7 @@ async function redPixels(png: string, x0: number, y0: number, x1: number, y1: nu
   const s = img.width / W;
   const d = ctx.getImageData(Math.round(x0 * s), Math.round(y0 * s), Math.round((x1 - x0) * s), Math.round((y1 - y0) * s)).data;
   let n = 0;
-  for (let i = 0; i < d.length; i += 4) if ((d[i] ?? 0) > 180 && (d[i + 1] ?? 0) < 90 && (d[i + 2] ?? 0) < 90) n += (d[i + 3] ?? 255) / 255;
+  for (let i = 0; i < d.length; i += 4) if (anyColour || ((d[i] ?? 0) > 180 && (d[i + 1] ?? 0) < 90 && (d[i + 2] ?? 0) < 90)) n += (d[i + 3] ?? 255) / 255;
   return n / (s * s);
 }
 
@@ -105,6 +106,8 @@ function frame(net: Awaited<ReturnType<typeof draw>>, backend: Case["backend"]):
 
 /** The loop's box: left of node 0, beyond its rim. */
 const loopRed = (png: string): Promise<number> => redPixels(png, APEX_X - 4, CY - 14, CX - R - 1, CY + 14);
+/** The loop's ink in the same box, in any colour: each pixel counts by its alpha. */
+const loopInk = (png: string): Promise<number> => redPixels(png, APEX_X - 4, CY - 14, CX - R - 1, CY + 14, true);
 
 describe("self-link loops (#505)", () => {
 
@@ -150,13 +153,18 @@ describe("self-link loops (#505)", () => {
   it("webgl: selection keeps the selected node's loop and dims another node's loop (selection.others)", async () => {
     const net = await draw({ backend: "webgl", sizeMode: "world", directed: false });
     net.interactive({ selectable: true }); // default selection.others: opacity 0.3
+    const full = await loopInk(net.toPNG());
     net.select("nodes", [0]);
-    const kept = await loopRed(net.toPNG());
+    const kept = await loopInk(net.toPNG());
     net.select("nodes", [1]);
-    const dimmed = await loopRed(net.toPNG());
+    const dimmed = await loopInk(net.toPNG());
     net.destroy();
-    expect(kept).toBeGreaterThan(20);
-    expect(dimmed).toBeLessThan(kept / 4); // the dimmed loop is no longer full red
+    expect(full).toBeGreaterThan(20);
+    // Kept at full opacity (the highlight tints it), dimmed to the others' 0.3. Counted by alpha whatever the
+    // colour: until #569 the export darkened a translucent pixel, so a count of red read a dimmed loop as gone.
+    expect(kept / full).toBeGreaterThan(0.9);
+    expect(dimmed / full).toBeGreaterThan(0.2);
+    expect(dimmed / full).toBeLessThan(0.4);
   });
 
   for (const backend of ["canvas", "svg"] as const)

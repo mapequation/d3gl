@@ -11,7 +11,7 @@ import { PickReadback } from "./pick-readback.js";
 /** A link layer's renderer: by instance (attribute arrays) or by edge id (#447, per-edge tables). */
 type LinkRenderer = InstancedLines | InstancedHalfArrows | InstancedLoops | IndexedLines | IndexedHalfArrows;
 import { clipFromView } from "./transform.js";
-import { toPNG } from "./png.js";
+import { canvasToPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
 import { GlobeRenderer } from "./globe.js";
 import { PassThroughGL } from "./passthrough-gl.js";
@@ -62,13 +62,17 @@ export class WebGLBackend implements Backend {
    *  Never rendered (the GPU already drew it) — appended after the retained layers in {@link toSVG}. */
   private exportLayers: readonly VectorLayer[] = [];
   /**
-   * The export/readback target behind {@link toPNG} and {@link readPixel} — and nothing else: the
-   * live view renders into the canvas's own stencil-backed drawing buffer (that is where `clipTo`
-   * clips), pass-through accumulates in {@link pt}, pick in {@link pickFbo}. Created by the first
-   * reader ({@link ensureOffscreen}) and kept until {@link resize} or {@link destroy} (#88), so a
-   * chart that never exports never pays its width×height×8 bytes (RGBA8 + depth24-stencil8).
+   * The readback target behind {@link readPixel} — and nothing else: the live view and its
+   * {@link toPNG} export render into the canvas's own stencil-backed drawing buffer (that is where
+   * `clipTo` clips), pass-through accumulates in {@link pt}, pick in {@link pickFbo}. Created by the
+   * first reader ({@link ensureOffscreen}) and kept until {@link resize} or {@link destroy} (#88), so a
+   * chart that never reads a pixel never pays its width×height×8 bytes (RGBA8 + depth24-stencil8).
    */
   private offscreen: Framebuffer | null = null;
+  /** Device px per CSS px of the target last drawn into (#570), as pushed to the disc renderers (their
+   *  edge ramp is one device px wide). {@link syncPixelRatio} pushes it only when a draw's target differs:
+   *  a resize to another devicePixelRatio, the CSS-px readback target, the globe's bake target. */
+  private pixelRatio = 1;
 
   private constructor(
     private readonly device: Device,
@@ -107,6 +111,7 @@ export class WebGLBackend implements Backend {
     for (const layer of newLayers) {
       const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
       renderer.setTransform(this.clipMatrix);
+      renderer.setPixelRatio(this.pixelRatio);
       this.renderers.set(layer.name, renderer);
       this.layers.set(layer.name, layer);
       this.order.push(layer.name);
@@ -138,6 +143,7 @@ export class WebGLBackend implements Backend {
     existing?.destroy();
     const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
     renderer.setTransform(this.clipMatrix);
+    renderer.setPixelRatio(this.pixelRatio);
     this.renderers.set(name, renderer);
     this.layers.set(name, layer);
     this.layerFlags.delete(name); // drawable set may have changed; a retained view is stale
@@ -208,6 +214,7 @@ export class WebGLBackend implements Backend {
         renderer.destroy();
         const fresh = new GroupRenderer(this.device, deltaToBuffers(delta.buffers), this.width, this.height);
         fresh.setTransform(this.clipMatrix);
+        fresh.setPixelRatio(this.pixelRatio);
         this.renderers.set(delta.name, fresh);
       }
     }
@@ -278,7 +285,9 @@ export class WebGLBackend implements Backend {
       r = new InstancedLoops(this.device, layer.loops, this.width, this.height, pick);
       r.setPickBase(layer.pickBase ?? 0);
     } else {
-      r = layer.primitive === "pie" ? new InstancedPie(this.device, layer.pie, this.width, this.height) : new InstancedCircles(this.device, layer.circles, this.width, this.height);
+      const glyphs = layer.primitive === "pie" ? new InstancedPie(this.device, layer.pie, this.width, this.height) : new InstancedCircles(this.device, layer.circles, this.width, this.height);
+      glyphs.setPixelRatio(this.pixelRatio);
+      r = glyphs;
     }
     r.setTransform(this.clipMatrix);
     r.setViewport(this.width, this.height);
@@ -390,13 +399,10 @@ export class WebGLBackend implements Backend {
     if (width === this.width && height === this.height) return;
     this.width = width;
     this.height = height;
-    const cc = this.device.getDefaultCanvasContext();
-    const canvas = cc.canvas as HTMLCanvasElement;
+    const canvas = this.device.getDefaultCanvasContext().canvas as HTMLCanvasElement;
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
-    // Drive luma's drawing buffer to the new CSS size × dpr deterministically (its own
-    // ResizeObserver would otherwise reconcile asynchronously, one frame late).
-    cc.setDrawingBufferSize(Math.round(width * cc.devicePixelRatio), Math.round(height * cc.devicePixelRatio));
+    this.sizeDrawingBuffer();
     this.clipMatrix = clipFromView(this.viewTransform, width, height);
     for (const r of this.renderers.values()) {
       r.setTransform(this.clipMatrix);
@@ -462,6 +468,7 @@ export class WebGLBackend implements Backend {
   private bakeLayers(fb: Framebuffer): void {
     const texMatrix = clipFromView({ k: 1, x: 0, y: 0 }, this.bakeW, this.bakeH);
     for (const r of this.renderers.values()) r.setTransform(texMatrix);
+    this.syncPixelRatio(fb.width);
     const clipSources = new Set<string>();
     for (const name of this.order) { const ct = this.layers.get(name)?.clipTo; if (ct) clipSources.add(ct); }
     const pass = this.device.beginRenderPass({ framebuffer: fb, clearColor: [0, 0, 0, 0], clearStencil: 0, clearDepth: 1 });
@@ -478,7 +485,18 @@ export class WebGLBackend implements Backend {
     for (const r of this.renderers.values()) r.setTransform(this.clipMatrix);
   }
 
+  /** Push the device px per CSS px of a target `targetWidth` device px wide to the disc renderers (#570),
+   *  only when it differs from the last target's: O(1) on a frame drawn into the same target as the last. */
+  private syncPixelRatio(targetWidth: number): void {
+    const ratio = this.width > 0 ? targetWidth / this.width : 1;
+    if (ratio === this.pixelRatio) return;
+    this.pixelRatio = ratio;
+    for (const r of this.renderers.values()) r.setPixelRatio(ratio);
+    for (const r of this.instanced.values()) if (r instanceof InstancedCircles || r instanceof InstancedPie) r.setPixelRatio(ratio);
+  }
+
   private drawInto(framebuffer: Framebuffer): void {
+    this.syncPixelRatio(framebuffer.width);
     const clipSources = new Set<string>();
     for (const name of this.order) {
       const ct = this.layers.get(name)?.clipTo;
@@ -502,9 +520,9 @@ export class WebGLBackend implements Backend {
     // render pass that PRESERVES the retained pixels just drawn (clearColor:false = no
     // load-clear, confirmed luma semantics). During interaction this.viewTransform differs
     // from the FBO's reference transform, so the blit applies the snapshot-pan delta while
-    // the retained base above is re-rendered crisp at the current transform. This shared
-    // drawInto path also runs for toPNG()/readPixel() (offscreen target), so PNG export
-    // gets the pass-through points for free.
+    // the retained base above is re-rendered crisp at the current transform. toPNG() copies
+    // the canvas this draws (#569) and readPixel() draws into its offscreen target through
+    // this same path, so both get the pass-through points for free.
     if (this.pt && this.ptLayers.size > 0) {
       const pass2 = this.device.beginRenderPass({ framebuffer, clearColor: false });
       this.pt.composite(pass2, this.pt.fboTransform ?? this.viewTransform, this.viewTransform);
@@ -513,21 +531,29 @@ export class WebGLBackend implements Backend {
     }
   }
 
+  /** Drive luma's drawing buffer to the CSS size × dpr now. Its own ResizeObserver reconciles one frame
+   *  late, and sizes a canvas with no layout box (hidden, or not in the document) to 1×1. A no-op when
+   *  the buffer already has that size. */
+  private sizeDrawingBuffer(): void {
+    const cc = this.device.getDefaultCanvasContext();
+    cc.setDrawingBufferSize(Math.round(this.width * cc.devicePixelRatio), Math.round(this.height * cc.devicePixelRatio));
+  }
+
   toPNG(): string {
-    // The stashed labels (#219) are composited onto the readback by png.ts's 2D pass, so the
-    // export shows what the screen shows (canvas + HTML overlay). Export-time cost only.
-    const fb = this.ensureOffscreen();
-    if (this.globe) this.drawGlobeInto(fb);
-    else this.drawInto(fb);
-    return toPNG(this.device, fb, this.width, this.height, this.textData);
+    // The export is the canvas as drawn (#569): the same render as the screen, copied in the same task,
+    // so it has the screen's device-px size, antialiasing and colours. The stashed labels (#219) are
+    // painted on top, where the HTML overlay shows them. Export-time cost only. A hidden chart's canvas
+    // has a 1×1 buffer, so the buffer is sized first.
+    this.sizeDrawingBuffer();
+    this.render();
+    return canvasToPNG(this.device.getDefaultCanvasContext().canvas, this.width, this.height, this.textData);
   }
 
   /**
-   * The export/readback target, created on first use (#88). CSS px, deliberately NOT device px like
-   * {@link ensurePickFbo}: `toPNG()` (png.ts) reads back exactly `width × height` and `readPixel()`
-   * addresses it in CSS px from a bottom-left origin, so a dpr-scaled target would crop the PNG and
-   * shift readPixel. The depth24-stencil8 attachment is what `clipTo` layers clip against in export.
-   * Only {@link resize} and {@link destroy} release it, so it is always at the current size.
+   * The readback target, created on first use (#88). CSS px, deliberately NOT device px like
+   * {@link ensurePickFbo}: `readPixel()` addresses it in CSS px from a bottom-left origin. The
+   * depth24-stencil8 attachment is what `clipTo` layers clip against in it. Only {@link resize} and
+   * {@link destroy} release it, so it is always at the current size.
    */
   private ensureOffscreen(): Framebuffer {
     this.offscreen ??= this.device.createFramebuffer({
