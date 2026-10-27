@@ -23,6 +23,7 @@ const style = (n: number): ResolvedNetworkStyle => ({
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
+  selfLinks: true,
   selfLinkSpread: LOOP_SPREAD,
   selfLinkLength: LOOP_LEG,
 });

@@ -324,6 +324,13 @@ export interface NetworkStyle {
    */
   linkBend?: number;
   /**
+   * Draw self-links (#586): a node's self-links as one loop at its rim (#505, default `true`). `false` hides the loops
+   * on every backend and in every view (a state network's physical-view self-links too) and builds none of them: no loop
+   * work on any frame (each self-link edge keeps its slot in the link lane, as when it draws). Display-only: the
+   * self-links stay in the data, and count in degree, strength and the layout as before.
+   */
+  selfLinks?: boolean;
+  /**
    * Self-link loops (#542): the angle between a loop's two legs where they leave and re-enter the node, in degrees
    * (default `25`, clamped to [1, 179]). Wider spreads a rounder loop. A provisional name: it may change before it is settled.
    */
@@ -6635,6 +6642,7 @@ export class Network extends BaseEngine {
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
       constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,
+      selfLinks: this.styleOpts.selfLinks ?? true,
       // Clamped so a loop stays finite: a 0° spread puts its centre at infinity, a negative leg has no loop.
       selfLinkSpread: resolveLoopSpread(this.styleOpts.selfLinkSpread),
       selfLinkLength: resolveLoopLength(this.styleOpts.selfLinkLength),

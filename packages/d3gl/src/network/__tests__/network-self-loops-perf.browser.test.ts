@@ -109,7 +109,8 @@ interface Leg {
   registered: number;
 }
 
-async function runLeg(n: number, loops: boolean, lod: boolean): Promise<Leg> {
+/** `selfLinks: false` (#586) hides the fixture's loops: the leg then measures what hidden loops cost. */
+async function runLeg(n: number, loops: boolean, lod: boolean, selfLinks = true): Promise<Leg> {
   const host = perfHost(W, H);
   const net: Network = network(host, { width: W, height: H, backend: "webgl" });
   const spy = new GlBufferSpy();
@@ -117,9 +118,10 @@ async function runLeg(n: number, loops: boolean, lod: boolean): Promise<Leg> {
     await net.whenReady();
     const { graph, positions } = fixture(n, loops);
     const atStart = spy.mark();
+    // The style goes in before data(), which draws at once with the style it finds: registration uploads one style's layers.
     net
+      .style({ nodeRadius: 3, sizeMode: "screen", linkStroke: "rgb(100,116,139)", selfLinks })
       .data(graph)
-      .style({ nodeRadius: 3, sizeMode: "screen", linkStroke: "rgb(100,116,139)" })
       .lod(lod ? {} : false)
       .layout({ backend: "positions", positions });
     net.setTransform({ k: 1, x: 0, y: 0 }); // settle the registration's first frame outside the sweep
@@ -280,8 +282,9 @@ interface FrameWork {
   instances: number;
 }
 
-/** The draw work and loop instances of one LOD-off position frame at `n` nodes (mean of POSITION_FRAMES). */
-async function positionFrameWork(n: number, loops: boolean): Promise<FrameWork> {
+/** The draw work and loop instances of one LOD-off position frame at `n` nodes (mean of POSITION_FRAMES); `selfLinks`
+ *  is the style's (#586). */
+async function positionFrameWork(n: number, loops: boolean, selfLinks = true): Promise<FrameWork> {
   const host = perfHost(W, H);
   const net: Network = network(host, { width: W, height: H, backend: "webgl" });
   const spy = new GlDrawSpy();
@@ -289,8 +292,8 @@ async function positionFrameWork(n: number, loops: boolean): Promise<FrameWork> 
     await net.whenReady();
     const { graph, positions } = fixture(n, loops);
     net
+      .style({ nodeRadius: 3, sizeMode: "screen", linkStroke: "rgb(100,116,139)", selfLinks })
       .data(graph)
-      .style({ nodeRadius: 3, sizeMode: "screen", linkStroke: "rgb(100,116,139)" })
       .lod(false)
       .layout({ backend: "positions", positions });
     net.setTransform({ k: 1, x: 0, y: 0 });
@@ -372,6 +375,44 @@ describe(`self-link loops per frame (#505): LOD off at N=${N_OFF.toLocaleString(
       expect(large.calls, `loop draw calls per frame grew with S: ${small.calls} at S=${sSmall}, ${large.calls} at S=${sLarge}`).toBe(small.calls);
       expect(large.vertices / sLarge, `vertices drawn per loop grew with S: ${small.vertices / sSmall} at S=${sSmall}`).toBeLessThanOrEqual(small.vertices / sSmall);
       console.log(`  LOD off, per position frame the loops add ${small.calls} draws, ${small.vertices / sSmall} vertices per loop`);
+    },
+    perfBudget(180_000),
+  );
+
+  it(
+    "LOD off and on, S self-links hidden (selfLinks: false, #586): no loop work on any frame, and no loop bytes",
+    async () => {
+      const none = await runLeg(N_OFF, false, false);
+      const hidden = await runLeg(N_OFF, true, false, false);
+      const shown = await runLeg(N_OFF, true, false);
+      expect(hidden.registered, "registration uploaded nothing — the spy is not observing the live context").toBeGreaterThan(0);
+      expect(hidden.zoomLoopUpdates + hidden.zoomLoopInstances + hidden.listedFrames, "loop work on a zoom frame").toBe(0);
+      expect(hidden.positionUpdates + hidden.positionInstances, "loop work on a position frame").toBe(0);
+      expect(hidden.zoomUploaded, "a static zoom frame uploaded buffer bytes").toBe(0);
+      // Registration: the loops' layer is gone; the S self-link edges stay in the link lane, as when they draw.
+      expect(shown.positionInstances, "the shown leg wrote no loop (non-vacuity)").toBeGreaterThan(0);
+      expect(hidden.registered, "hidden loops uploaded as much as shown ones").toBeLessThan(shown.registered);
+      const lodHidden = await runLeg(N_OFF, true, true, false);
+      const lodShown = await runLeg(N_OFF, true, true);
+      expect(lodShown.listedFrames, "no LOD frame listed the shown loops (non-vacuity)").toBeGreaterThan(0);
+      expect(lodHidden.listedFrames, "an LOD frame listed hidden loops").toBe(0);
+      expect(lodHidden.zoomLoopInstances + lodHidden.positionInstances).toBe(0);
+      console.log(`  S=${S_OFF} loops at N=${N_OFF}: registration uploads ${none.registered} B without self-links, ${hidden.registered} B hidden (${((hidden.registered - none.registered) / S_OFF).toFixed(1)} B per hidden self-link, its link-lane slot), ${shown.registered} B shown (${((shown.registered - hidden.registered) / S_OFF).toFixed(1)} B per loop saved)`);
+    },
+    timeout(N_OFF),
+  );
+
+  it(
+    "LOD off, S self-links hidden (#586): a position frame draws what a graph without self-links draws, in as many draw calls",
+    async () => {
+      const none = await positionFrameWork(1_000, false);
+      const hidden = await positionFrameWork(1_000, true, false);
+      const shown = await positionFrameWork(1_000, true);
+      expect(hidden.instances, "a hidden loop was written").toBe(0);
+      expect(hidden.calls, `draw calls: ${hidden.calls} hidden, ${none.calls} without self-links`).toBe(none.calls);
+      expect(shown.calls, "the shown loops added no draw call (non-vacuity)").toBeGreaterThan(none.calls);
+      expect(hidden.vertices, "hidden loops drew as many vertices as shown ones").toBeLessThan(shown.vertices);
+      console.log(`  per position frame at N=1,000 (S=${loopsOf(1_000)}): ${none.calls} draws / ${none.vertices} vertices without self-links, ${hidden.calls} / ${hidden.vertices} hidden, ${shown.calls} / ${shown.vertices} shown`);
     },
     perfBudget(180_000),
   );

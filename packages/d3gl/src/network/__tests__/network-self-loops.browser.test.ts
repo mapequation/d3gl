@@ -1,7 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { network, Network, type NetworkLinkHit } from "../network.js";
+import { network, Network, type NetworkLinkHit, type NetworkStyle } from "../network.js";
 import { buildGraph } from "../graph.js";
+import { keptLoopStats, selfLoopStats, SELF_LOOP_LAYER } from "../self-loops.js";
 import { DROP_HALF_SPREAD, LOOP_LEG, loopPieceLength } from "../../core/loop-drop.js";
+import type { Backend, RenderDelta, RenderLayer } from "../../core/backend.js";
+import type { InstancedLayer } from "../../core/index.js";
+import { CanvasBackend } from "../../canvas/canvas-backend.js";
+import { SvgBackend } from "../../svg/svg-backend.js";
+import { WebGLBackend } from "../../webgl/webgl-backend.js";
 
 /**
  * #505: a self-link draws as a loop at its node, on WebGL, Canvas and SVG, in both size modes; a directed one
@@ -72,6 +78,8 @@ interface Case {
   /** The loop's spread (degrees) and leg length (radii); absent ⇒ the defaults. */
   selfLinkSpread?: number;
   selfLinkLength?: number;
+  /** Style overrides, applied last (#586: `selfLinks`, a metric-sized `nodeRadius`). */
+  style?: NetworkStyle;
 }
 
 async function draw(c: Case) {
@@ -79,9 +87,11 @@ async function draw(c: Case) {
   await net.whenReady();
   const self = c.selfWeights ?? [1];
   const g = buildGraph({ nodeCount: 2, source: [0, ...self.map(() => 0)], target: [1, ...self.map(() => 0)], weight: [1, ...self], directed: c.directed });
+  // The overrides go in before data() too: data() draws at once, with the style it finds.
+  if (c.style) net.style(c.style);
   net
     .data(g)
-    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: c.linkWidth ?? 3, arrowSize: ARROW_SIZE, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode, selfLinkSpread: c.selfLinkSpread, selfLinkLength: c.selfLinkLength })
+    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: c.linkWidth ?? 3, arrowSize: ARROW_SIZE, directed: c.directed, linkStyle: c.linkStyle ?? "line", sizeMode: c.sizeMode, selfLinkSpread: c.selfLinkSpread, selfLinkLength: c.selfLinkLength, ...c.style })
     .lod(c.lod ? { expandPx: 1, declutter: false } : false)
     .layout({ backend: "positions", positions: POSITIONS });
   net.setTransform({ k: 1, x: 0, y: 0 });
@@ -425,4 +435,196 @@ describe("self-link loops: the LOD angle cache follows every position change (#5
     });
     net.destroy();
   });
+});
+
+/** How many pixels of the rendered frame in the box are the node fill (black, opaque). */
+async function blackPixels(png: string, x0: number, y0: number, x1: number, y1: number): Promise<number> {
+  const img = new Image();
+  img.src = png;
+  await img.decode();
+  const c = document.createElement("canvas");
+  c.width = img.width;
+  c.height = img.height;
+  const ctx = c.getContext("2d");
+  if (!ctx) throw new Error("no 2d context");
+  ctx.drawImage(img, 0, 0);
+  const s = img.width / W;
+  const d = ctx.getImageData(Math.round(x0 * s), Math.round(y0 * s), Math.round((x1 - x0) * s), Math.round((y1 - y0) * s)).data;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) if ((d[i] ?? 255) < 60 && (d[i + 1] ?? 255) < 60 && (d[i + 2] ?? 255) < 60 && (d[i + 3] ?? 0) > 200) n++;
+  return n / (s * s);
+}
+
+/**
+ * What the backends are handed while it is on: every drawable of the `links` Scene layer, on any backend (Canvas and
+ * SVG draw the loop there, #505; WebGL's Scene only for an export), and every instanced layer WebGL is handed, by
+ * name. Patches the prototypes, so the network's own backend is observed.
+ */
+function watchBackends(): { linkDrawables: () => number; instanced: string[]; restore: () => void } {
+  let n = 0;
+  const instanced: string[] = [];
+  const protos: Backend[] = [CanvasBackend.prototype, SvgBackend.prototype, WebGLBackend.prototype];
+  const saved = protos.map((p) => ({ setLayers: p.setLayers, updateLayer: p.updateLayer, appendToLayer: p.appendToLayer }));
+  for (const [k, p] of protos.entries()) {
+    const was = saved[k];
+    if (!was) continue;
+    p.setLayers = function (this: Backend, layers: RenderLayer[]): void {
+      for (const l of layers) if (l.name === "links") n += l.drawables.length;
+      was.setLayers.call(this, layers);
+    };
+    p.updateLayer = function (this: Backend, name: string, layer: RenderLayer): void {
+      if (name === "links") n += layer.drawables.length;
+      was.updateLayer.call(this, name, layer);
+    };
+    p.appendToLayer = function (this: Backend, delta: RenderDelta): void {
+      if (delta.name === "links") n += delta.drawables.length;
+      was.appendToLayer?.call(this, delta);
+    };
+  }
+  const gl = WebGLBackend.prototype;
+  const { setInstancedLayer, updateInstancedLayer } = gl;
+  gl.setInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+    instanced.push(layer.name);
+    setInstancedLayer.call(this, layer);
+  };
+  gl.updateInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+    instanced.push(layer.name);
+    updateInstancedLayer.call(this, layer);
+  };
+  return {
+    linkDrawables: () => n,
+    instanced,
+    restore: () => {
+      for (const [k, p] of protos.entries()) {
+        const was = saved[k];
+        if (!was) continue;
+        p.setLayers = was.setLayers;
+        p.updateLayer = was.updateLayer;
+        p.appendToLayer = was.appendToLayer;
+      }
+      gl.setInstancedLayer = setInstancedLayer;
+      gl.updateInstancedLayer = updateInstancedLayer;
+    },
+  };
+}
+
+/** One draw under the watch, with a zoom and a position frame after it, then an export: what it handed the backend
+ *  and what loop work it did. */
+async function watchedDraw(c: Case): Promise<{ linkDrawables: number; loopLayers: number; loopUpdates: number; loopInstances: number; listed: number }> {
+  const watch = watchBackends();
+  const u0 = selfLoopStats.updates;
+  const i0 = selfLoopStats.instances;
+  const f0 = keptLoopStats.frames;
+  try {
+    const net = await draw(c);
+    net.setTransform({ k: 1.5, x: -20, y: -20 });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.layout({ backend: "positions", positions: POSITIONS.map((v) => v + 1) });
+    net.render();
+    net.toSVG();
+    net.destroy();
+    return {
+      linkDrawables: watch.linkDrawables(),
+      loopLayers: watch.instanced.filter((name) => name === SELF_LOOP_LAYER).length,
+      loopUpdates: selfLoopStats.updates - u0,
+      loopInstances: selfLoopStats.instances - i0,
+      listed: keptLoopStats.frames - f0,
+    };
+  } finally {
+    watch.restore();
+  }
+}
+
+const HIDDEN: NetworkStyle = { selfLinks: false };
+
+describe("selfLinks: false hides the self-link loops (#586)", () => {
+  for (const backend of BACKENDS)
+    for (const sizeMode of SIZE_MODES)
+      it(`${backend} / ${sizeMode}: no loop pixels in any style, LOD off or on; the default draws them`, async () => {
+        for (const lod of [false, true])
+          for (const [directed, linkStyle] of [[false, "line"], [true, "line"], [true, "half-arrow"]] as const) {
+            const label = `${lod ? "LOD" : "no LOD"}, ${directed ? "directed" : "undirected"} ${linkStyle}`;
+            const shown = await draw({ backend, sizeMode, directed, linkStyle, lod });
+            const on = await loopRed(frame(shown, backend));
+            shown.destroy();
+            const hidden = await draw({ backend, sizeMode, directed, linkStyle, lod, style: HIDDEN });
+            const off = await loopRed(frame(hidden, backend));
+            // The node-to-node link still draws: red between the two nodes.
+            const link = await redPixels(frame(hidden, backend), CX + R + 4, CY - 3, 140 - R - 8, CY + 3);
+            // WebGL's export (toSVG) draws no loop either.
+            const exported = backend === "webgl" ? await loopRed(frame(hidden, "svg")) : 0;
+            hidden.destroy();
+            expect(on, `${label}: the default drew no loop (non-vacuity)`).toBeGreaterThan(10);
+            expect(off, `${label}: loop pixels with selfLinks: false`).toBe(0);
+            expect(exported, `${label}: loop pixels in WebGL's toSVG()`).toBe(0);
+            expect(link, `${label}: the 0–1 link`).toBeGreaterThan(10);
+          }
+      });
+
+  for (const backend of BACKENDS)
+    it(`${backend}: hidden loops cost what no self-links cost — no loop drawable, layer, update or LOD listing`, async () => {
+      for (const lod of [false, true]) {
+        const label = lod ? "LOD" : "no LOD";
+        const none = await watchedDraw({ backend, sizeMode: "screen", directed: true, lod, selfWeights: [] });
+        const hidden = await watchedDraw({ backend, sizeMode: "screen", directed: true, lod, style: HIDDEN });
+        const shown = await watchedDraw({ backend, sizeMode: "screen", directed: true, lod });
+        // The same drawables and layers as the graph without self-links, on the same frames.
+        expect(hidden, label).toEqual(none);
+        expect(hidden.loopUpdates + hidden.loopInstances + hidden.listed + hidden.loopLayers, label).toBe(0);
+        // Non-vacuity: the watch sees the loop when it is drawn (a Scene drawable on Canvas/SVG, a layer on WebGL).
+        if (backend === "webgl") expect(shown.loopLayers, `${label}: the default handed no loop layer`).toBeGreaterThan(0);
+        else expect(shown.linkDrawables, `${label}: the default handed no loop drawable`).toBeGreaterThan(none.linkDrawables);
+        expect(shown.loopInstances, `${label}: the default wrote no loop`).toBeGreaterThan(0);
+      }
+    });
+
+  for (const backend of BACKENDS)
+    it(`${backend}: a hidden loop is not picked; the node and the 0–1 link still are`, async () => {
+      const net = await draw({ backend, sizeMode: "world", directed: false, style: HIDDEN });
+      net.interactive({ hover: true });
+      net.pickLinks(true);
+      expect(net.pick(APEX_X + 1, CY)?.layer, "the loop's place picked something").toBeUndefined();
+      expect(net.pick(CX, CY)?.layer).toBe("nodes");
+      expect(net.pick(100, CY)?.id).toBe(0);
+      net.destroy();
+    });
+
+  for (const backend of BACKENDS)
+    it(`${backend}: style({ selfLinks }) toggles the loops on a drawn network, LOD off and on`, async () => {
+      for (const lod of [false, true]) {
+        const label = lod ? "LOD" : "no LOD";
+        const net = await draw({ backend, sizeMode: "screen", directed: true, lod });
+        const on = await loopRed(frame(net, backend));
+        net.style({ selfLinks: false });
+        const off = await loopRed(frame(net, backend));
+        net.style({ selfLinks: true });
+        const back = await loopRed(frame(net, backend));
+        net.destroy();
+        expect(on, label).toBeGreaterThan(20);
+        expect(off, label).toBe(0);
+        expect(back, label).toBeCloseTo(on, 0);
+      }
+    });
+
+  for (const backend of BACKENDS)
+    it(`${backend}: hiding changes no degree or strength — a metric-sized node keeps its size`, async () => {
+      // Node 0: the 0–1 link (weight 1) and self-links of weight 1 + 3. Degree 3 and strength 5 count each self-link
+      // once (#535); dropping them from the data would give degree 1 and strength 1, a node 1/9 or 1/25 the area.
+      const sizes = async (nodeRadius: NetworkStyle["nodeRadius"]): Promise<number[]> => {
+        const out: number[] = [];
+        for (const style of [{}, HIDDEN]) {
+          const net = await draw({ backend, sizeMode: "world", directed: false, selfWeights: [1, 3], style: { ...style, nodeRadius } });
+          out.push(await blackPixels(frame(net, backend), CX - 14, CY - 14, CX + 14, CY + 14));
+          net.destroy();
+        }
+        return out;
+      };
+      const area = Math.PI * R * R;
+      for (const [metric, nodeRadius] of [["degree", { by: "degree", scale: (d: number) => (R / 3) * d }], ["strength", { by: "strength", scale: (s: number) => (R / 5) * s }]] as const) {
+        const [shown = 0, hidden = 0] = await sizes(nodeRadius);
+        expect(shown, `${metric}: the node is r = ${R}`).toBeGreaterThan(area * 0.85);
+        expect(shown, `${metric}: the node is r = ${R}`).toBeLessThan(area * 1.15);
+        expect(Math.abs(hidden - shown), `${metric}: ${hidden} vs ${shown} px`).toBeLessThanOrEqual(area * 0.03);
+      }
+    });
 });

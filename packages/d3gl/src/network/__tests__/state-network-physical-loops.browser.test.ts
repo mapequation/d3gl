@@ -56,8 +56,9 @@ async function redPixels(png: string, x0: number, y0: number, x1: number, y1: nu
   return n / (s * s);
 }
 
-/** The state network in its physical view, A and B placed; `inside` adds the state link 0 → 1 inside A. */
-async function draw(backend: (typeof BACKENDS)[number], inside: boolean) {
+/** The state network in its physical view, A and B placed; `inside` adds the state link 0 → 1 inside A; `selfLinks`
+ *  is the style's (#586). */
+async function draw(backend: (typeof BACKENDS)[number], inside: boolean, selfLinks?: boolean) {
   const net = network(host(), { width: W, height: W, backend });
   await net.whenReady();
   const graph = buildStateGraph({
@@ -70,7 +71,7 @@ async function draw(backend: (typeof BACKENDS)[number], inside: boolean) {
     directed: true,
   });
   net
-    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: LINK_WIDTH, arrowSize: ARROW_SIZE, directed: true, sizeMode: "screen" })
+    .style({ nodeRadius: R, nodeFill: "#000000", linkStroke: "#ff0000", linkWidth: LINK_WIDTH, arrowSize: ARROW_SIZE, directed: true, sizeMode: "screen", selfLinks })
     .stateNetwork(graph, { view: "physical" });
   net.layout({ backend: "positions", positions: POSITIONS });
   net.setTransform({ k: 1, x: 0, y: 0 });
@@ -98,5 +99,14 @@ describe("state network: the physical view draws a loop for flow that stays in a
       expect(pastApex).toBe(0);
       expect(atB).toBe(0);
       expect(without).toBe(0);
+    });
+
+  for (const backend of BACKENDS)
+    it(`${backend}: selfLinks: false hides that loop (#586); the cross links still draw`, async () => {
+      const png = await draw(backend, true, false);
+      const loop = await loopRed(png);
+      const between = await redPixels(png, CX + R + 4, CY - 6, 140 - R - 8, CY + 6);
+      expect(loop).toBe(0);
+      expect(between, "the A → B links (non-vacuity)").toBeGreaterThan(10);
     });
 });
