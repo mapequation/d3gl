@@ -1118,9 +1118,11 @@ the font, colour and halo; the box gives the position, anchor and rotation (`lab
 everywhere but the WebGL screen.
 
 **Measured browser facts** (Chromium, Oct 2026):
-- Chromium ignores `stroke-linejoin` on HTML text: a `-webkit-text-stroke` halo always has miter joins, and matches
-  Canvas `lineJoin = "miter"` with `miterLimit = 4` (mean difference 0.0001); Canvas and SVG with round joins
-  differ from it by about 0.001, visible at V, W and A. SVG `<text>` does honour `stroke-linejoin`.
+- Chromium ignores `stroke-linejoin` on HTML text: a `-webkit-text-stroke` halo always has miter joins at a miter
+  limit of 4. So every halo uses those joins (`TEXT_HALO_MITER_LIMIT`), and the overlay, Canvas and SVG are then
+  pixel-identical; round joins on Canvas or SVG differed by about 0.001–0.0035, visible at V, W, M and A. SVG
+  `<text>` does honour `stroke-linejoin`, so round joins would need an SVG overlay (cost below). The joins of
+  shape strokes (tree branches, links) are the drawable's own `lineJoin`, default bevel, and unaffected.
 - Canvas ignores `lineWidth = 0` and keeps the previous width, so a 0-width halo must skip `strokeText` (#571).
 - Rotated text is far slower to paint than flat text, on every backend: each distinct angle rasterizes its own
   glyphs. 2,000 labels at random angles took 311 ms to fill (1,092 ms with the halo) against 13 ms flat (18 ms) on

@@ -1,4 +1,5 @@
 import type { ViewTransform } from "../webgl/index.js";
+import { TEXT_HALO_MITER_LIMIT } from "../core/index.js";
 import { cullLabels, labelCullScratch, labelTransform } from "./cull.js";
 import type { LabelBaseline, LabelBox, LabelCullScratch, TextAnchor } from "./cull.js";
 import { canvasFont } from "./measure.js";
@@ -135,13 +136,14 @@ export function overlayFont(font: string): string {
 
 /**
  * The overlay CSS for a {@link LabelHalo} (#571): a text stroke twice the halo width, painted under
- * the fill (`paint-order`), so it reaches `width` px beyond the glyphs as the Canvas/SVG stroke does.
- * `stroke-linejoin: round` matches their round joins where the browser applies it to HTML text
- * (Chromium strokes HTML text with miter joins regardless). Empty for no halo or width 0.
+ * the fill (`paint-order`), so it reaches `width` px beyond the glyphs as the Canvas/SVG stroke does,
+ * with the same miter joins. Chromium strokes HTML text that way whatever `stroke-linejoin` says; the
+ * join properties keep a browser that honours them on HTML text to the same stroke. Empty for no halo
+ * or width 0.
  */
 export function haloStyle(halo: LabelHalo | undefined): LabelStyle {
   if (!halo || halo.width <= 0) return {};
-  return { webkitTextStroke: `${halo.width * 2}px ${halo.color}`, paintOrder: "stroke", strokeLinejoin: "round" };
+  return { webkitTextStroke: `${halo.width * 2}px ${halo.color}`, paintOrder: "stroke", strokeLinejoin: "miter", strokeMiterlimit: String(TEXT_HALO_MITER_LIMIT) };
 }
 
 /**

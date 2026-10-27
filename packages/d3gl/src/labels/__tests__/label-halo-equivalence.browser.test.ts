@@ -2,54 +2,67 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { page } from "vitest/browser";
 import { LabelLayer, resolveLabelStyle, DEFAULT_LABEL_TEXT, type LabelStyle, type LabelText } from "../label-layer.js";
 import { paintTexts } from "../../canvas/draw-texts.js";
+import { serializeTexts } from "../../svg/serialize.js";
+import type { TextData } from "../../core/index.js";
 
-// #571: the WebGL overlay (an HTML label with a CSS text stroke) and Canvas/SVG/export (`paintTexts`) draw
-// the same halo. Both are rasterized by the browser and captured in ONE screenshot, so the comparison sees
-// what a user sees. DOM text and fillText can land a pixel apart, so the panels are compared at their best
-// alignment (a shift of up to SHIFT px), and by their total halo coverage.
+// #571: the WebGL overlay (an HTML label with a CSS text stroke), Canvas (`paintTexts`, also every export) and
+// SVG (`serializeTexts`) draw the same halo, miter joins included. All three are rasterized by the browser and
+// captured in ONE screenshot, so the comparison sees what a user sees. DOM text, fillText and SVG text can land
+// a pixel apart, so each panel is compared with Canvas at their best alignment (a shift of up to SHIFT px), and
+// by their total halo coverage.
 
 const W = 120;
 const H = 40;
 const BG: [number, number, number] = [37, 99, 235]; // a saturated fill, so the white halo stands out
-const TEXT = "169 23 114";
+const DIGITS = "169 23 114";
+const SHARP = "MVW AVAW"; // acute glyph corners, where miter and round joins differ most
 const SHIFT = 2;
 const MARGIN = 4; // ignore the panel borders: only the label matters
-// Measured in headless Chromium: the stroke differs from Canvas by 0.0012 (width 1) and 0.0033 (width 2),
-// the old text-shadow glow by 0.0149. The threshold sits between them with margin on both sides.
-const MAX_DIFF = 0.005;
-const MAX_MASS = 0.1;
+// Measured in headless Chromium: with miter joins at TEXT_HALO_MITER_LIMIT, the three panels are pixel-identical
+// (difference 0, coverage equal) for both labels at widths 1-3. Round joins on Canvas differ from them by 0.0035
+// with 5% less coverage ("MVW AVAW", width 2), the old text-shadow glow by 0.015 with 6% more. The thresholds sit
+// below both.
+const MAX_DIFF = 0.001;
+const MAX_MASS = 0.02;
 
-/** One row: the overlay label on the left, the Canvas-painted label on the right, on the same background. */
-function row(overlayStyle: LabelStyle | undefined, text: LabelText): { el: HTMLElement; destroy: () => void } {
+type Panels = { overlay: Uint8ClampedArray; canvas: Uint8ClampedArray; svg: Uint8ClampedArray };
+
+/** One row: the overlay label, the Canvas-painted label and the SVG label, on the same background. `paint`
+ *  replaces `paintTexts` in the Canvas panel (for a negative control). */
+function row(overlayStyle: LabelStyle | undefined, text: LabelText, label: string, paint = paintTexts): { el: HTMLElement; destroy: () => void } {
   const bg = `rgb(${BG.join(",")})`;
   const el = document.createElement("div");
-  el.style.cssText = `display:flex;width:${2 * W}px;height:${H}px;background:${bg}`;
+  el.style.cssText = `display:flex;width:${3 * W}px;height:${H}px;background:${bg}`;
   const host = document.createElement("div");
   host.style.cssText = `position:relative;flex:none;width:${W}px;height:${H}px;overflow:hidden`;
   const canvas = document.createElement("canvas");
   canvas.width = W;
   canvas.height = H;
   canvas.style.cssText = `display:block;flex:none;width:${W}px;height:${H}px`;
-  el.append(host, canvas);
+  const td: TextData = { x: 20, y: 20, text: label, font: text.font, color: text.color, halo: text.halo };
+  const svg = document.createElement("div");
+  svg.style.cssText = `flex:none;width:${W}px;height:${H}px`;
+  svg.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" style="display:block"><rect width="${W}" height="${H}" fill="${bg}"/>${serializeTexts([td])}</svg>`;
+  el.append(host, canvas, svg);
   document.body.appendChild(el);
 
   const layer = new LabelLayer(host, (a) => a.text, undefined, overlayStyle);
-  layer.update([{ id: 1, refX: 20, refY: 14, text: TEXT }], { k: 1, x: 0, y: 0 }, { width: W, height: H });
+  layer.update([{ id: 1, refX: 20, refY: 14, text: label }], { k: 1, x: 0, y: 0 }, { width: W, height: H });
   const ctx = canvas.getContext("2d")!;
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, W, H);
-  paintTexts(ctx, [{ x: 20, y: 20, text: TEXT, font: text.font, color: text.color, halo: text.halo }]);
+  paint(ctx, [td]);
   return { el, destroy: () => { layer.destroy(); el.remove(); } };
 }
 
-/** The two panels of a {@link row} as RGB pixel arrays, captured in one screenshot. */
-async function capture(el: HTMLElement): Promise<{ overlay: Uint8ClampedArray; canvas: Uint8ClampedArray }> {
+/** The three panels of a {@link row} as RGB pixel arrays, captured in one screenshot. */
+async function capture(el: HTMLElement): Promise<Panels> {
   const base64 = await page.screenshot({ element: el, save: false });
   const bitmap = await createImageBitmap(await (await fetch(`data:image/png;base64,${base64}`)).blob());
-  expect([bitmap.width, bitmap.height]).toEqual([2 * W, H]); // captured 1:1, not rescaled
+  expect([bitmap.width, bitmap.height]).toEqual([3 * W, H]); // captured 1:1, not rescaled
   const ctx = new OffscreenCanvas(bitmap.width, bitmap.height).getContext("2d")!;
   ctx.drawImage(bitmap, 0, 0);
-  return { overlay: ctx.getImageData(0, 0, W, H).data, canvas: ctx.getImageData(W, 0, W, H).data };
+  return { overlay: ctx.getImageData(0, 0, W, H).data, canvas: ctx.getImageData(W, 0, W, H).data, svg: ctx.getImageData(2 * W, 0, W, H).data };
 }
 
 /** How white a pixel is relative to the background, 0..1: the halo's coverage (the dark text counts 0). */
@@ -84,44 +97,69 @@ function alignedDiff(a: Uint8ClampedArray, b: Uint8ClampedArray): number {
   return best;
 }
 
-async function compare(overlayStyle: LabelStyle | undefined, text: LabelText): Promise<{ mass: [number, number]; diff: number }> {
-  const r = row(overlayStyle, text);
-  const { overlay, canvas } = await capture(r.el);
+interface Comparison { mass: { overlay: number; canvas: number; svg: number }; diff: { overlay: number; svg: number } }
+
+async function compare(overlayStyle: LabelStyle | undefined, text: LabelText, label: string, paint = paintTexts): Promise<Comparison> {
+  const r = row(overlayStyle, text, label, paint);
+  const p = await capture(r.el);
   r.destroy();
-  return { mass: [haloMass(overlay), haloMass(canvas)], diff: alignedDiff(overlay, canvas) };
+  return {
+    mass: { overlay: haloMass(p.overlay), canvas: haloMass(p.canvas), svg: haloMass(p.svg) },
+    diff: { overlay: alignedDiff(p.overlay, p.canvas), svg: alignedDiff(p.svg, p.canvas) },
+  };
+}
+
+/** The overlay and SVG panels both match Canvas. */
+function expectSame(c: Comparison): void {
+  expect(c.mass.canvas).toBeGreaterThan(20);
+  for (const k of ["overlay", "svg"] as const) {
+    expect(Math.abs(c.mass[k] - c.mass.canvas) / c.mass.canvas).toBeLessThan(MAX_MASS);
+    expect(c.diff[k]).toBeLessThan(MAX_DIFF);
+  }
 }
 
 describe("label halo equivalence (#571)", () => {
   beforeAll(async () => {
-    await page.viewport(2 * W + 40, H + 40); // small enough that the test frame is not scaled down
+    await page.viewport(3 * W + 40, H + 40); // small enough that the test frame is not scaled down
   });
 
-  it.each([1, 2])("the overlay strokes the same halo as Canvas at width %d", async (width) => {
-    const text = { ...DEFAULT_LABEL_TEXT, halo: { color: "#ffffff", width } };
-    const { mass, diff } = await compare(resolveLabelStyle(undefined, undefined, text), text);
-    expect(mass[1]).toBeGreaterThan(20);
-    expect(Math.abs(mass[0] - mass[1]) / mass[1]).toBeLessThan(MAX_MASS);
-    expect(diff).toBeLessThan(MAX_DIFF);
-  });
+  for (const label of [DIGITS, SHARP]) {
+    it.each([1, 2, 3])(`the overlay and SVG stroke the same halo as Canvas, "${label}" at width %d`, async (width) => {
+      const text = { ...DEFAULT_LABEL_TEXT, halo: { color: "#ffffff", width } };
+      expectSame(await compare(resolveLabelStyle(undefined, undefined, text), text, label));
+    });
+  }
 
-  it("draws a custom font and colour the same on the overlay as on Canvas (#577)", async () => {
+  it("draws a custom font and colour the same on every backend (#577)", async () => {
     const text = { font: "700 13px Georgia, serif", color: "#7f1d1d", halo: { color: "#ffffff", width: 1 } };
-    const { mass, diff } = await compare(resolveLabelStyle(undefined, undefined, text), text);
-    expect(mass[1]).toBeGreaterThan(20);
-    expect(Math.abs(mass[0] - mass[1]) / mass[1]).toBeLessThan(MAX_MASS);
-    expect(diff).toBeLessThan(MAX_DIFF);
+    expectSame(await compare(resolveLabelStyle(undefined, undefined, text), text, DIGITS));
   });
 
-  it("draws no halo on either at width 0", async () => {
+  it("draws no halo on any at width 0", async () => {
     const text = { ...DEFAULT_LABEL_TEXT, halo: { color: "#ffffff", width: 0 } };
-    const { mass } = await compare(resolveLabelStyle(undefined, undefined, text), text);
-    expect(mass[0]).toBeLessThan(1);
-    expect(mass[1]).toBeLessThan(1);
+    const { mass } = await compare(resolveLabelStyle(undefined, undefined, text), text, DIGITS);
+    expect(Math.max(mass.overlay, mass.canvas, mass.svg)).toBeLessThan(1);
   });
 
   it("is not vacuous: the old text-shadow glow does not pass as the width-1 stroke", async () => {
     const glow = { ...resolveLabelStyle(undefined, undefined, { ...DEFAULT_LABEL_TEXT, halo: undefined }), textShadow: "0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff" };
-    const { diff } = await compare(glow, DEFAULT_LABEL_TEXT);
-    expect(diff).toBeGreaterThanOrEqual(MAX_DIFF);
+    const { diff } = await compare(glow, DEFAULT_LABEL_TEXT, DIGITS);
+    expect(diff.overlay).toBeGreaterThanOrEqual(MAX_DIFF);
+  });
+
+  it("is not vacuous: round joins on Canvas do not pass as the overlay's miter joins", async () => {
+    const text = { ...DEFAULT_LABEL_TEXT, halo: { color: "#ffffff", width: 2 } };
+    const round = (ctx: CanvasRenderingContext2D, texts: readonly TextData[]) => {
+      paintTexts(ctx, texts.map((t) => ({ ...t, halo: undefined }))); // the fill only, for the font setup
+      const td = texts[0]!;
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 4;
+      ctx.lineJoin = "round";
+      ctx.strokeText(td.text, td.x, td.y);
+      ctx.fillStyle = td.color ?? "#000";
+      ctx.fillText(td.text, td.x, td.y);
+    };
+    const { diff } = await compare(resolveLabelStyle(undefined, undefined, text), text, SHARP, round);
+    expect(diff.overlay).toBeGreaterThanOrEqual(MAX_DIFF);
   });
 });

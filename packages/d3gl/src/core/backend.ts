@@ -416,9 +416,17 @@ export interface TextData {
    *  the WebGL overlay draws an oriented label. Defaults to 0 (horizontal). */
   rotation?: number;
   /** A halo stroked behind the fill for legibility on busy backgrounds — the same halo the WebGL
-   *  overlay strokes in CSS (#571). `width` is the half-stroke in px; 0 draws none. */
+   *  overlay strokes in CSS (#571). `width` is the half-stroke in px; 0 draws none. Joins are miter,
+   *  limited to {@link TEXT_HALO_MITER_LIMIT}. */
   halo?: { color: string; width: number };
 }
+
+/**
+ * The miter limit of every label halo: Canvas `miterLimit`, SVG `stroke-miterlimit` and the WebGL
+ * overlay's CSS. Halos join miter on every backend because Chromium strokes HTML text with miter joins
+ * at this limit and ignores `stroke-linejoin` there, so the overlay can't draw any other join (#571).
+ */
+export const TEXT_HALO_MITER_LIMIT = 4;
 
 /**
  * The one label shown in full while its glyph is hovered (#496): a {@link TextData} on a solid chip of

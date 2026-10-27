@@ -1,4 +1,4 @@
-import type { TextData } from "../core/index.js";
+import { TEXT_HALO_MITER_LIMIT, type TextData } from "../core/index.js";
 
 /**
  * Paint screen-space text labels (#105 N7b-2) onto a 2D context: per label an optional halo stroked
@@ -29,7 +29,8 @@ export function paintTexts(ctx: CanvasRenderingContext2D, texts: readonly TextDa
     if (td.halo && td.halo.width > 0) {
       ctx.strokeStyle = td.halo.color;
       ctx.lineWidth = td.halo.width * 2;
-      ctx.lineJoin = "round";
+      ctx.lineJoin = "miter";
+      ctx.miterLimit = TEXT_HALO_MITER_LIMIT;
       ctx.strokeText(td.text, x, y);
     }
     ctx.fillStyle = td.color ?? "#000";

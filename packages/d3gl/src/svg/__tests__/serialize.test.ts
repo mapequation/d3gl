@@ -18,6 +18,7 @@ describe("serializeTexts (#105 N7b-2)", () => {
     expect(svg).toContain('paint-order="stroke"');
     expect(svg).toContain('stroke="#fff"');
     expect(svg).toContain('stroke-width="4"'); // width * 2
+    expect(svg).toContain('stroke-linejoin="miter" stroke-miterlimit="4"'); // the overlay's joins (#571)
     expect(svg).toContain('opacity="0.500"');
   });
 

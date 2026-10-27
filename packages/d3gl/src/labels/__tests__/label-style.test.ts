@@ -30,7 +30,7 @@ describe("label halo (#571)", () => {
   });
 
   it("strokes the halo under the fill at twice its width, with round joins", () => {
-    expect(haloStyle(halo)).toEqual({ webkitTextStroke: "2px #ffffff", paintOrder: "stroke", strokeLinejoin: "round" });
+    expect(haloStyle(halo)).toEqual({ webkitTextStroke: "2px #ffffff", paintOrder: "stroke", strokeLinejoin: "miter", strokeMiterlimit: "4" });
     expect(haloStyle({ color: "red", width: 1.5 }).webkitTextStroke).toBe("3px red");
   });
 

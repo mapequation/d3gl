@@ -1,4 +1,4 @@
-import type { VectorLayer, ViewTransform, DrawableVector, TextData, HoverText } from "../core/index.js";
+import { TEXT_HALO_MITER_LIMIT, type VectorLayer, type ViewTransform, type DrawableVector, type TextData, type HoverText } from "../core/index.js";
 import { SvgPathContext } from "./svg-context.js";
 
 function rgba([r, g, b, a]: readonly [number, number, number, number]): string {
@@ -17,7 +17,7 @@ export function serializeTexts(texts: readonly TextData[]): string {
     const anchor = td.align === "middle" ? "middle" : td.align === "end" ? "end" : "start";
     const fill = td.color ?? "#000";
     const op = td.opacity != null && td.opacity < 1 ? ` opacity="${td.opacity.toFixed(3)}"` : "";
-    const halo = td.halo && td.halo.width > 0 ? ` stroke="${td.halo.color}" stroke-width="${td.halo.width * 2}" stroke-linejoin="round" paint-order="stroke"` : "";
+    const halo = td.halo && td.halo.width > 0 ? ` stroke="${td.halo.color}" stroke-width="${td.halo.width * 2}" stroke-linejoin="miter" stroke-miterlimit="${TEXT_HALO_MITER_LIMIT}" paint-order="stroke"` : "";
     // A rotated label (#580) turns about its anchor; SVG's rotate() takes clockwise degrees.
     const rotate = td.rotation ? ` transform="rotate(${Number(((td.rotation * 180) / Math.PI).toFixed(3))} ${td.x} ${td.y})"` : "";
     return `<text x="${td.x}" y="${td.y}" text-anchor="${anchor}" dominant-baseline="central"${rotate} style="font:${td.font ?? "12px sans-serif"}" fill="${fill}"${halo}${op}>${escapeXml(td.text)}</text>`;
