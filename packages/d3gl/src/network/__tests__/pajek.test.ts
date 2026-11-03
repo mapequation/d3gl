@@ -97,12 +97,55 @@ describe("parsePajek", () => {
     expect(Array.from(p.target)).toEqual([1]);
   });
 
+  it("orders ids above the lookup table's cap after the others, up to 4294967295", () => {
+    // A few lines cap the table at a few ids, so 5000000 and 4294967295 take the Map path.
+    const p = parsePajek(
+      [
+        "*Vertices",
+        '4294967295 "max"',
+        '0 "zero"',
+        '5000000 "big"',
+        '3 "small"',
+        "*Arcs",
+        "4294967295 0",
+        "5000000 3",
+        "3 4294967295",
+      ].join("\n"),
+    );
+
+    expect(Array.from(p.ids!)).toEqual([0, 3, 5000000, 4294967295]);
+    expect(p.labels).toEqual(["zero", "small", "big", "max"]);
+    expect(Array.from(p.source)).toEqual([3, 2, 1]);
+    expect(Array.from(p.target)).toEqual([0, 1, 3]);
+  });
+
+  it("names and places vertices whose lines come after the links that use them", () => {
+    const p = parsePajek(["*Edges", "3 1", "*Vertices", '3 "three" 5 5', '1 "one"'].join("\n"));
+
+    expect(Array.from(p.ids!)).toEqual([1, 3]);
+    expect(p.labels).toEqual(["one", "three"]);
+    expect(Array.from(p.source)).toEqual([1]);
+    expect(Array.from(p.target)).toEqual([0]);
+    expect(Array.from(p.positions!)).toEqual([0, 0, 5, 5]);
+  });
+
+  it("reads CRLF line endings and a leading + on ids, as Infomap does", () => {
+    const p = parsePajek('*Vertices 2\r\n+1 "a"\r\n2 "b"\r\n*Edges\r\n+1 2\r\n');
+
+    expect(p.labels).toEqual(["a", "b"]);
+    expect(Array.from(p.ids!)).toEqual([1, 2]);
+    expect(Array.from(p.source)).toEqual([0]);
+  });
+
   it("throws on a line without valid vertex ids, naming it, as Infomap refuses it", () => {
     expect(() => parsePajek("*Edges\n1 2\na b")).toThrow('line 3 ("a b")');
     expect(() => parsePajek("*Edges\n-1 2")).toThrow("line 2");
     expect(() => parsePajek("*Edges\n1")).toThrow("line 2");
+    expect(() => parsePajek("*Edges\n4294967296 1")).toThrow("line 2");
     expect(() => parsePajek('*Vertices 1\n5000000000 "big"')).toThrow("line 2");
     expect(() => parsePajek('*Vertices 1\n"no id"')).toThrow("line 2");
+    expect(() => parsePajek("*Vertices 1\n12abc")).toThrow("line 2");
+    expect(() => parsePajek('*Vertices 1\n1"a"')).toThrow("line 2");
     expect(() => parsePajek("*Edgeslist\n1 2 x")).toThrow("line 2");
   });
 });

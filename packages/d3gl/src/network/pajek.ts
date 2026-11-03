@@ -39,11 +39,13 @@ type Section = "vertices" | "arcs" | "edges" | "arcslist" | "edgeslist" | "ignor
 /** The largest vertex id: Infomap reads ids as unsigned 32-bit integers. */
 const MAX_ID = 0xffffffff;
 
-/** A token as a vertex id: digits only, at most {@link MAX_ID}; -1 for anything else. */
+/** A token as a vertex id, as Infomap reads one: digits after an optional `+`, at most {@link MAX_ID}; else -1. */
 function vertexId(token: string | undefined): number {
   if (!token) return -1;
+  const start = token.charCodeAt(0) === 43 ? 1 : 0; // "+"
+  if (start === token.length) return -1;
   let id = 0;
-  for (let i = 0; i < token.length; i++) {
+  for (let i = start; i < token.length; i++) {
     const digit = token.charCodeAt(i) - 48;
     if (digit < 0 || digit > 9) return -1;
     id = id * 10 + digit;
@@ -53,7 +55,8 @@ function vertexId(token: string | undefined): number {
 
 /**
  * Vertex id → slot, in order of first appearance. As the edge-list parser's `LabelIndex`: ids below
- * `cap` (distinct ids never exceed twice the lines) are looked up in a typed array, the rest in a Map.
+ * `cap` are looked up in a typed array, the rest in a Map. The cap comes from the line count, so the
+ * table's memory stays O(lines) whatever the ids.
  */
 class VertexSlots {
   readonly ids: number[] = [];
@@ -80,9 +83,27 @@ class VertexSlots {
     return this.ids.length - 1;
   }
 
-  /** The slot of an id already added. */
-  get(id: number): number {
-    return id < this.cap ? (this.table[id] ?? 0) - 1 : (this.sparse?.get(id) ?? -1);
+  /**
+   * Each slot's dense index, by ascending id; undefined when the ids first appeared in ascending order
+   * (each slot is then its index). Ids in the table are ranked by scanning it in id order, O(table),
+   * with no sort; only the ids above the cap, which rank after all of the table's, are sorted.
+   */
+  ranks(): Uint32Array | undefined {
+    const ids = this.ids;
+    let ascending = true;
+    for (let s = 1; s < ids.length && ascending; s++) ascending = (ids[s - 1] ?? 0) < (ids[s] ?? 0);
+    if (ascending) return undefined;
+    const rank = new Uint32Array(ids.length);
+    let k = 0;
+    for (let id = 0; id < this.table.length; id++) {
+      const seen = this.table[id] ?? 0;
+      if (seen !== 0) rank[seen - 1] = k++;
+    }
+    const sparse = this.sparse;
+    if (sparse) {
+      for (const id of Uint32Array.from(sparse.keys()).sort()) rank[sparse.get(id) ?? 0] = k++;
+    }
+    return rank;
   }
 
   private grow(id: number): void {
@@ -143,7 +164,8 @@ export function parsePajek(text: string): ParsedPajek {
     }
 
     if (section === "vertices") {
-      const m = /^(\d+)\s*(.*)$/.exec(line);
+      // The id is the whole first token: Infomap refuses `12abc` and `1"a"`.
+      const m = /^(\S+)\s*(.*)$/.exec(line);
       const id = vertexId(m?.[1]);
       if (id < 0) throw invalid(n, line, "a vertex id (a non-negative integer up to 4294967295)");
       const s = slots.slot(id);
@@ -203,21 +225,16 @@ export function parsePajek(text: string): ParsedPajek {
   }
 
   const nodeCount = slots.ids.length;
-  const ids = Uint32Array.from(slots.ids);
-  // Slot → dense index, needed only when the ids did not first appear in ascending order.
-  let rank: Uint32Array | undefined;
-  if (!ids.every((id, s) => s === 0 || (ids[s - 1] ?? 0) < id)) {
-    ids.sort(); // typed-array sort: numeric
-    const r = new Uint32Array(nodeCount);
-    ids.forEach((id, k) => {
-      r[slots.get(id)] = k;
-    });
-    rank = r;
-  }
+  // Slot → dense index (ascending id); undefined when the slots already ascend.
+  const rank = slots.ranks();
   const indexOf = (s: number): number => (rank ? (rank[s] ?? s) : s);
 
+  const ids = new Uint32Array(nodeCount);
   const labels = new Array<string>(nodeCount);
-  for (let s = 0; s < nodeCount; s++) labels[indexOf(s)] = slotLabels[s] ?? String(ids[indexOf(s)]);
+  slots.ids.forEach((id, s) => {
+    ids[indexOf(s)] = id;
+    labels[indexOf(s)] = slotLabels[s] ?? String(id);
+  });
 
   let positions: Float32Array | undefined;
   if (coords.size > 0) {
