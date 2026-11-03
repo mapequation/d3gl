@@ -75,7 +75,7 @@ const ZERO = 48; // "0"
 /** Longest canonical integer id indexed by value: 9 digits stay exact in an int32. */
 const MAX_ID_DIGITS = 9;
 /** Largest by-value table (entries, 4 bytes each); sparser ids fall back to a number-keyed Map. */
-const MAX_ID_TABLE = 1 << 22;
+export const MAX_ID_TABLE = 1 << 22;
 
 /**
  * Label → dense index, in first-seen order. A label that is a canonical decimal integer (`0`, or
