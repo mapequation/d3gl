@@ -123,7 +123,9 @@ describe("parseEdgeList", () => {
     expect(Array.from(p.weight)).toEqual([1, 2, 1]);
   });
 
-  it("throws on a line without two node ids, naming the line and why, as Infomap refuses it", () => {
+  // Infomap refuses these lines too, except junk in the target column (`1 2.0`), which its stream
+  // reader takes as a link with a weight; refusing it here is the safer reading.
+  it("throws on a line without two node ids, naming the line and why", () => {
     expect(() => parseEdgeList("1 2\na b")).toThrow(
       'parseEdgeList: line 2 ("a b"): "a" is not a node id (a non-negative integer up to 4294967295)',
     );
