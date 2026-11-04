@@ -1086,8 +1086,8 @@ gives the positions of the view on screen (in the both view the drawn state node
 
 The same engine renders a network parsed from a file. `parseNetwork(text, filename)` dispatches on
 the name: a **`.net`** file is read as **Pajek** (vertex labels and coordinates, `*Arcs`/`*Edges`),
-and anything else as a plain **edge list** (`source target [weight]`, one edge per line, `#`
-comments). Pick your own file or load a built-in sample of each format. Nodes are **sized by degree**
+and anything else as a plain **edge list** (`source target [weight]`, one edge per line, with
+integer node ids as Infomap reads them, `#` comments). Pick your own file or load a built-in sample of each format. Nodes are **sized by degree**
 (`scaleSqrt`) so hubs stand out, and vertex **labels** are engine-managed
 [frontier labels](#frontier-labels) — one `net.labels({ labelOf, offset, maxWidth })` call, and they're culled
 against each other and re-placed on every pan/zoom **and every layout frame**, with the default label

@@ -10,7 +10,7 @@ let loaded = { text: SAMPLE_PAJEK, name: "sample.net" };
 /**
  * Load a network from a file and render it with the `network()` engine. `parseNetwork` dispatches
  * on the filename — `.net` → Pajek (vertex labels, `*Arcs`/`*Edges`), anything else → the plain
- * edge-list parser (`source target [weight]`, `#` comments). The off-thread worker lays it out with
+ * edge-list parser (`source target [weight]` with integer node ids, `#` comments). The off-thread worker lays it out with
  * `layout({ fit: true })`, so it opens **framed** and converges live; nodes are **sized by degree** (a
  * d3 `scaleSqrt`) so hubs stand out. Vertex names are drawn with engine-managed **frontier labels**
  * (`net.labels({ labelOf, maxWidth })`) — they track pan/zoom (and the fit reframe) with no overlay bookkeeping;

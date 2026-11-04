@@ -40,16 +40,16 @@ export const SAMPLE_PAJEK = `*Vertices 12
 12 1
 `;
 
-/** Plain edge list: `source target [weight]`, `#` comments, whitespace-separated. */
+/** Plain edge list: `source target [weight]` with integer node ids, `#` comments, whitespace-separated. */
 export const SAMPLE_EDGELIST = `# tiny weighted edge list — source target weight
-core hub 5
-hub a 2
-hub b 2
-hub c 2
-a b 1
-b c 1
-c a 1
-core leaf1 3
-core leaf2 3
-leaf1 leaf2 1
+1 2 5
+2 3 2
+2 4 2
+2 5 2
+3 4 1
+4 5 1
+5 3 1
+1 6 3
+1 7 3
+6 7 1
 `;

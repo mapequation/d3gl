@@ -159,10 +159,11 @@ describe("detectFormat / parseNetwork", () => {
   });
 
   it("parses an edge list (the non-Pajek path) as undirected dense indices", () => {
-    const p = parseNetwork("# comment\nalice bob 2\nbob carol", "friends.txt");
+    const p = parseNetwork("# comment\n7 3 2\n3 9", "friends.txt");
 
     expect(p.directed).toBe(false);
-    expect(p.labels).toEqual(["alice", "bob", "carol"]);
+    expect(p.labels).toEqual(["7", "3", "9"]);
+    expect(Array.from(p.ids)).toEqual([7, 3, 9]);
     expect(Array.from(p.source)).toEqual([0, 1]);
     expect(Array.from(p.target)).toEqual([1, 2]);
     expect(Array.from(p.weight)).toEqual([2, 1]);
