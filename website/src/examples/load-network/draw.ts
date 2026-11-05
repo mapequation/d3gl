@@ -24,8 +24,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let disposed = false;
   const load = (text: string, filename: string): void => {
     if (disposed) return;
-    loaded = { text, name: filename };
     const { nodeCount, source, target, weight, labels: names, directed } = parseNetwork(text, filename);
+    loaded = { text, name: filename }; // only once it parses, so a re-run of setup() never re-throws
     const graph = buildGraph({ nodeCount, source, target, weight, directed });
     // Size nodes by degree so hubs stand out: a d3 `scaleSqrt` (area-proportional) over the degree
     // range, handed straight to `nodeRadius` via { by: "degree", scale }. Resolved once, no draw cost.

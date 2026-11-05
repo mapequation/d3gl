@@ -108,9 +108,11 @@ describe("parseEdgeList", () => {
   });
 
   it("gives ids only when every label is a plain integer id, as Infomap writes them (#408)", () => {
-    expect(Array.from(parseEdgeList("7 3\n3 4294967295\n0 9").ids ?? [])).toEqual([7, 3, 4294967295, 0, 9]);
+    const p = parseEdgeList("7 3\n3 4294967295\n0 9");
+    expect(Array.from(p.ids ?? [])).toEqual([7, 3, 4294967295, 0, 9]);
     expect(parseEdgeList("1 2\n2 alice").ids).toBeUndefined();
-    expect(parseEdgeList("1 2\n01 2").ids).toBeUndefined(); // "01" and "1" are two nodes here, one in Infomap
+    // "01" and "1" are two nodes here, one in Infomap.
+    expect(parseEdgeList("1 2\n01 2").ids).toBeUndefined();
     expect(parseEdgeList("+1 2").ids).toBeUndefined();
     expect(parseEdgeList("1 4294967296").ids).toBeUndefined();
     expect(Array.from(parseEdgeList("").ids ?? [-1])).toEqual([]);
@@ -120,6 +122,7 @@ describe("parseEdgeList", () => {
     expect(() => parseEdgeList("a b\n\n# c\n  lonely  \nc d")).toThrow(
       'parseEdgeList: line 4 ("lonely"): expected a source and a target node',
     );
+    expect(() => parseEdgeList("a b\r\n\r\n# c\r\nlonely\r\nc d")).toThrow('line 4 ("lonely"):');
   });
 });
 

@@ -76,18 +76,23 @@ export function parseEdgeList(text: string): ParsedEdges {
     target = target.slice(0, count);
     weight = weight.slice(0, count);
   }
-  const parsed: ParsedEdges = { nodeCount: index.labels.length, source, target, weight, labels: index.labels };
-  const ids = plainIds(index.labels);
+  const { labels } = index;
+  const parsed: ParsedEdges = { nodeCount: labels.length, source, target, weight, labels };
+  const ids = plainIds(labels);
   if (ids) parsed.ids = ids;
   return parsed;
 }
 
-/** The error for a line with a single column, at `text[at, eol)`. The line number is counted here, off the hot loop. */
+/**
+ * The error for a line with a single column, at `text[at, eol)`. The line number is counted here, off
+ * the hot loop.
+ */
 function singleColumn(text: string, at: number, eol: number): Error {
   let line = 1;
   for (let nl = text.indexOf("\n"); nl !== -1 && nl < at; nl = text.indexOf("\n", nl + 1)) line++;
   const bol = text.lastIndexOf("\n", at) + 1;
-  return new Error(`parseEdgeList: line ${line} ("${text.slice(bol, eol).trim()}"): expected a source and a target node`);
+  const quoted = text.slice(bol, eol).trim();
+  return new Error(`parseEdgeList: line ${line} ("${quoted}"): expected a source and a target node`);
 }
 
 const HASH = 35; // "#"
@@ -178,7 +183,7 @@ function canonicalInt(text: string, start: number, end: number): number {
   return value;
 }
 
-/** Each label's value when every label is a plain integer id ({@link ParsedEdges.ids}), else undefined. */
+/** Each label's value when every label is a plain integer id; else undefined. */
 function plainIds(labels: readonly string[]): Uint32Array | undefined {
   const ids = new Uint32Array(labels.length);
   for (let i = 0; i < labels.length; i++) {
@@ -189,7 +194,7 @@ function plainIds(labels: readonly string[]): Uint32Array | undefined {
   return ids;
 }
 
-/** The value of a label that is a plain integer id (canonical decimal, at most {@link MAX_ID}), else -1. */
+/** A plain integer id's value (canonical decimal, at most {@link MAX_ID}); else -1. */
 function plainId(label: string): number {
   const length = label.length;
   if (length === 0 || length > MAX_ID_DIGITS + 1) return -1;
