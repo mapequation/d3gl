@@ -1,5 +1,12 @@
 # @d3gl/website
 
+## 0.0.22
+
+### Patch Changes
+
+- Updated dependencies [[`230067b`](https://github.com/mapequation/d3gl/commit/230067bead8f3ca379f1535eb7715ad6126606b7)]:
+  - @mapequation/d3gl@0.15.0
+
 ## 0.0.21
 
 ### Patch Changes
