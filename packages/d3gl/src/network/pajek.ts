@@ -7,7 +7,7 @@
  * indices in ascending id order, so the result drops straight into {@link ./graph.js}'s `buildGraph`.
  * Unknown sections (e.g. `*Matrix`) are skipped.
  */
-import { IdSlots, MAX_ID_TABLE, parseEdgeList, parseId, type ParsedEdges } from "./parse.js";
+import { MAX_ID, MAX_ID_TABLE, parseEdgeList, type ParsedEdges } from "./parse.js";
 
 export interface ParsedPajek extends ParsedEdges {
   /** True when the file declared `*Arcs` / `*Arcslist` (directed edges). */
@@ -31,7 +31,80 @@ export function detectFormat(text: string, filename?: string): NetworkFormat {
 
 type Section = "vertices" | "arcs" | "edges" | "arcslist" | "edgeslist" | "ignore";
 
-const vertexId = (token: string | undefined): number => (token === undefined ? -1 : parseId(token));
+/** A token as a vertex id, as Infomap reads one: digits after an optional `+`, at most {@link MAX_ID}; else -1. */
+function vertexId(token: string | undefined): number {
+  if (!token) return -1;
+  const start = token.charCodeAt(0) === 43 ? 1 : 0; // "+"
+  if (start === token.length) return -1;
+  let id = 0;
+  for (let i = start; i < token.length; i++) {
+    const digit = token.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return -1;
+    id = id * 10 + digit;
+  }
+  return id <= MAX_ID ? id : -1;
+}
+
+/**
+ * Vertex id → slot, in order of first appearance. As the edge-list parser's `LabelIndex`: ids below
+ * `cap` are looked up in a typed array, the rest in a Map. The cap comes from the line count, so the
+ * table's memory stays O(lines) whatever the ids.
+ */
+class VertexSlots {
+  readonly ids: number[] = [];
+  /** Id → slot + 1 (0 = unseen), for ids below {@link cap}. */
+  private table = new Int32Array(0);
+  private sparse: Map<number, number> | null = null;
+
+  constructor(private readonly cap: number) {}
+
+  /** The id's slot, added if new. */
+  slot(id: number): number {
+    if (id < this.cap) {
+      if (id >= this.table.length) this.grow(id);
+      const seen = this.table[id] ?? 0;
+      if (seen !== 0) return seen - 1;
+      this.table[id] = this.ids.length + 1;
+    } else {
+      const sparse = this.sparse ?? (this.sparse = new Map());
+      const seen = sparse.get(id);
+      if (seen !== undefined) return seen;
+      sparse.set(id, this.ids.length);
+    }
+    this.ids.push(id);
+    return this.ids.length - 1;
+  }
+
+  /**
+   * Each slot's dense index, by ascending id; undefined when the ids first appeared in ascending order
+   * (each slot is then its index). Ids in the table are ranked by scanning it in id order, O(table),
+   * with no sort; only the ids above the cap, which rank after all of the table's, are sorted.
+   */
+  ranks(): Uint32Array | undefined {
+    const ids = this.ids;
+    let ascending = true;
+    for (let s = 1; s < ids.length && ascending; s++) ascending = (ids[s - 1] ?? 0) < (ids[s] ?? 0);
+    if (ascending) return undefined;
+    const rank = new Uint32Array(ids.length);
+    let k = 0;
+    for (let id = 0; id < this.table.length; id++) {
+      const seen = this.table[id] ?? 0;
+      if (seen !== 0) rank[seen - 1] = k++;
+    }
+    const sparse = this.sparse;
+    if (sparse) {
+      for (const id of Uint32Array.from(sparse.keys()).sort()) rank[sparse.get(id) ?? 0] = k++;
+    }
+    return rank;
+  }
+
+  private grow(id: number): void {
+    const size = Math.min(this.cap, Math.max(id + 1, 2 * this.table.length, 1024));
+    const grown = new Int32Array(size);
+    grown.set(this.table);
+    this.table = grown;
+  }
+}
 
 const invalid = (lineIndex: number, line: string, expected: string): Error =>
   new Error(`parsePajek: line ${lineIndex + 1} ("${line}"): expected ${expected}`);
@@ -48,7 +121,7 @@ const invalid = (lineIndex: number, line: string, expected: string): Error =>
 export function parsePajek(text: string): ParsedPajek {
   const lines = text.split("\n");
   // Nodes get a slot as their id first appears; slots are reordered by id at the end.
-  const slots = new IdSlots(Math.min(MAX_ID_TABLE, 2 * lines.length + 2));
+  const slots = new VertexSlots(Math.min(MAX_ID_TABLE, 2 * lines.length + 2));
   const slotLabels: (string | undefined)[] = [];
   const coords = new Map<number, [number, number]>();
   const source: number[] = [];
