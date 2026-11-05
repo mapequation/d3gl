@@ -167,6 +167,8 @@ describe("detectFormat / parseNetwork", () => {
     expect(Array.from(p.target)).toEqual([1, 2]);
     expect(Array.from(p.weight)).toEqual([2, 1]);
     expect(p.positions).toBeUndefined();
+    expect(p.ids).toBeUndefined(); // names: no Infomap ids
+    expect(Array.from(parseNetwork("7 3\n3 9", "ids.txt").ids ?? [])).toEqual([7, 3, 9]);
   });
 
   it("routes a .net document through the Pajek parser", () => {

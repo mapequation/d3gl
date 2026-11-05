@@ -7,18 +7,13 @@
  * indices in ascending id order, so the result drops straight into {@link ./graph.js}'s `buildGraph`.
  * Unknown sections (e.g. `*Matrix`) are skipped.
  */
-import { MAX_ID_TABLE, parseEdgeList, type ParsedEdges } from "./parse.js";
+import { MAX_ID, MAX_ID_TABLE, parseEdgeList, type ParsedEdges } from "./parse.js";
 
 export interface ParsedPajek extends ParsedEdges {
   /** True when the file declared `*Arcs` / `*Arcslist` (directed edges). */
   directed: boolean;
   /** Interleaved `[x, y, …]` layout coordinates from `*Vertices`, present only if any were given. */
   positions?: Float32Array;
-  /**
-   * Each dense index's Pajek vertex id, ascending: the id Infomap keys the node by. Absent for an
-   * edge list (#408).
-   */
-  ids?: Uint32Array;
 }
 
 /** Network text formats {@link parseNetwork} can read. */
@@ -35,9 +30,6 @@ export function detectFormat(text: string, filename?: string): NetworkFormat {
 }
 
 type Section = "vertices" | "arcs" | "edges" | "arcslist" | "edgeslist" | "ignore";
-
-/** The largest vertex id: Infomap reads ids as unsigned 32-bit integers. */
-const MAX_ID = 0xffffffff;
 
 /** A token as a vertex id, as Infomap reads one: digits after an optional `+`, at most {@link MAX_ID}; else -1. */
 function vertexId(token: string | undefined): number {

@@ -13,9 +13,9 @@ let loaded = { text: SAMPLE_PAJEK, name: "sample.net" };
  * edge-list parser (`source target [weight]`, `#` comments). The off-thread worker lays it out with
  * `layout({ fit: true })`, so it opens **framed** and converges live; nodes are **sized by degree** (a
  * d3 `scaleSqrt`) so hubs stand out. Vertex names are drawn with engine-managed **frontier labels**
- * (`net.labels({ labelOf, maxWidth })`) — they track pan/zoom (and the fit reframe) with no overlay bookkeeping;
- * a long name is trimmed with an ellipsis and shows in full on hover.
- * Pick a file, or load a built-in sample.
+ * (`net.labels({ labelOf, maxWidth })`) — they track pan/zoom (and the fit reframe) with no overlay
+ * bookkeeping; a long name is trimmed with an ellipsis and shows in full on hover.
+ * Pick a file, or load a built-in sample; a file the parser refuses shows why, naming the line.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -24,8 +24,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let disposed = false;
   const load = (text: string, filename: string): void => {
     if (disposed) return;
-    loaded = { text, name: filename };
     const { nodeCount, source, target, weight, labels: names, directed } = parseNetwork(text, filename);
+    loaded = { text, name: filename }; // only once it parses, so a re-run of setup() never re-throws
     const graph = buildGraph({ nodeCount, source, target, weight, directed });
     // Size nodes by degree so hubs stand out: a d3 `scaleSqrt` (area-proportional) over the degree
     // range, handed straight to `nodeRadius` via { by: "degree", scale }. Resolved once, no draw cost.

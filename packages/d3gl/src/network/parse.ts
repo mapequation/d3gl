@@ -14,6 +14,14 @@ export interface ParsedEdges {
   weight: Float32Array;
   /** Dense index → original node label. */
   labels: string[];
+  /**
+   * Dense index → the integer id Infomap keys the node by, so an app can match Infomap's output to
+   * the nodes (#408). For Pajek, the vertex id. For an edge list, each label's value, present only
+   * when every label is a plain integer id: `0`, or digits without a leading zero, up to
+   * {@link MAX_ID}, which is how Infomap writes ids back. A name, or a label such as `01` or `+1`,
+   * leaves it out.
+   */
+  ids?: Uint32Array;
 }
 
 /**
@@ -21,9 +29,10 @@ export interface ParsedEdges {
  * Blank lines and `#` comment lines are ignored.
  *
  * Lines are split on `"\n"` and columns on the characters `/\s/` matches; a line with a single
- * column is skipped. Labels are exact strings (`"1"` and `"01"` are two nodes), indexed in
- * first-seen order, source before target; duplicate edges and self-loops are kept. The weight is
- * `Number(column 3)`, so it can be `NaN`. Columns past the third are ignored.
+ * column throws, naming the line. Labels are exact strings (`"1"` and `"01"` are two nodes), indexed
+ * in first-seen order, source before target; duplicate edges and self-loops are kept. The weight is
+ * `Number(column 3)`, so it can be `NaN`. Columns past the third are ignored. `ids` is set when every
+ * label is a plain integer id.
  *
  * O(characters) — a newline count to size the columns, then one scan — with no per-line or
  * per-column strings: a label string is sliced once, when its node is first seen. Integer ids (the
@@ -50,7 +59,7 @@ export function parseEdgeList(text: string): ParsedEdges {
     i = columnEnd(text, i, eol);
     const e1 = i;
     i = skipSpace(text, i, eol);
-    if (i === eol) continue; // a single column is not an edge (and its label is not a node)
+    if (i === eol) throw singleColumn(text, s1, eol);
     const s2 = i;
     i = columnEnd(text, i, eol);
     const e2 = i;
@@ -67,11 +76,29 @@ export function parseEdgeList(text: string): ParsedEdges {
     target = target.slice(0, count);
     weight = weight.slice(0, count);
   }
-  return { nodeCount: index.labels.length, source, target, weight, labels: index.labels };
+  const { labels } = index;
+  const parsed: ParsedEdges = { nodeCount: labels.length, source, target, weight, labels };
+  const ids = plainIds(labels);
+  if (ids) parsed.ids = ids;
+  return parsed;
+}
+
+/**
+ * The error for a line with a single column, at `text[at, eol)`. The line number is counted here, off
+ * the hot loop.
+ */
+function singleColumn(text: string, at: number, eol: number): Error {
+  let line = 1;
+  for (let nl = text.indexOf("\n"); nl !== -1 && nl < at; nl = text.indexOf("\n", nl + 1)) line++;
+  const bol = text.lastIndexOf("\n", at) + 1;
+  const quoted = text.slice(bol, eol).trim();
+  return new Error(`parseEdgeList: line ${line} ("${quoted}"): expected a source and a target node`);
 }
 
 const HASH = 35; // "#"
 const ZERO = 48; // "0"
+/** The largest node id: Infomap reads ids as unsigned 32-bit integers. */
+export const MAX_ID = 0xffffffff;
 /** Longest canonical integer id indexed by value: 9 digits stay exact in an int32. */
 const MAX_ID_DIGITS = 9;
 /** Largest by-value table (entries, 4 bytes each); sparser ids fall back to a number-keyed Map. */
@@ -154,6 +181,31 @@ function canonicalInt(text: string, start: number, end: number): number {
     value = value * 10 + digit;
   }
   return value;
+}
+
+/** Each label's value when every label is a plain integer id; else undefined. */
+function plainIds(labels: readonly string[]): Uint32Array | undefined {
+  const ids = new Uint32Array(labels.length);
+  for (let i = 0; i < labels.length; i++) {
+    const id = plainId(labels[i] ?? "");
+    if (id < 0) return undefined;
+    ids[i] = id;
+  }
+  return ids;
+}
+
+/** A plain integer id's value (canonical decimal, at most {@link MAX_ID}); else -1. */
+function plainId(label: string): number {
+  const length = label.length;
+  if (length === 0 || length > MAX_ID_DIGITS + 1) return -1;
+  if (label.charCodeAt(0) === ZERO && length > 1) return -1;
+  let value = 0;
+  for (let i = 0; i < length; i++) {
+    const digit = label.charCodeAt(i) - ZERO;
+    if (digit < 0 || digit > 9) return -1;
+    value = value * 10 + digit;
+  }
+  return value <= MAX_ID ? value : -1;
 }
 
 /** `Number(text[start, end))`, without the slice when the column is plain digits (exact below 2^53). */
