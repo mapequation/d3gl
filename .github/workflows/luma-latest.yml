@@ -41,31 +41,45 @@ jobs:
         id: luma
         run: |
           pnpm --filter @mapequation/d3gl update "@luma.gl/*" --latest
-          version=$(npm view @luma.gl/core version)
+          version=$(pnpm --filter @mapequation/d3gl list @luma.gl/core --json | jq -r '.[0].dependencies["@luma.gl/core"].version')
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Testing on luma.gl $version"
 
       - name: Build
-        run: pnpm --filter @mapequation/d3gl build
+        id: build
+        run: pnpm -r build
 
       - name: Typecheck (library and test files)
+        id: typecheck
         run: pnpm --filter @mapequation/d3gl typecheck && pnpm --filter @mapequation/d3gl typecheck:test
 
       - name: Node unit tests
+        id: node
         run: pnpm test
+
+      - name: Build website (smoke)
+        id: website
+        run: pnpm --filter @d3gl/website build
 
       - name: Install Playwright Chromium
         run: pnpm --filter @mapequation/d3gl exec playwright install --with-deps chromium
 
-      # Every browser test except the wall-clock perf guards, which ci.yml runs on their own shards.
+      # Every browser test except the wall-clock perf guards (named as scripts/run-browser-perf-tier.mjs
+      # finds them), which ci.yml runs on their own shards with a budget scale for these runners.
       - name: Browser tests (headless Chromium, software GL)
-        run: pnpm --filter @mapequation/d3gl test:browser --exclude "**/*-perf.browser.test.ts"
+        id: browser
+        run: pnpm --filter @mapequation/d3gl test:browser --exclude "**/{*-,}perf.browser.test.{ts,tsx}"
         env:
           # The whole suite outlasts the runner's default 180 s watchdog, which suits single files.
           D3GL_BROWSER_TEST_TIMEOUT: "1800000"
 
+      # Only a failing build or check is reported: a failed install or Playwright download is not luma.gl's.
       - name: Report the failure as an issue
-        if: failure() && github.event_name != 'pull_request'
+        if: >-
+          !cancelled() && github.event_name != 'pull_request' &&
+          (steps.build.outcome == 'failure' || steps.typecheck.outcome == 'failure' ||
+          steps.node.outcome == 'failure' || steps.website.outcome == 'failure' ||
+          steps.browser.outcome == 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
           LUMA: ${{ steps.luma.outputs.version }}
