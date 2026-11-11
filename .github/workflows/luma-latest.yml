@@ -1,0 +1,81 @@
+name: luma.gl latest
+
+# d3gl declares luma.gl ~9.4.2, patch releases only (#598): luma.gl broke d3gl in a minor release
+# (9.3 -> 9.4), and apps installed it without d3gl ever testing it. So a new luma.gl minor reaches apps
+# only through a d3gl release that moves to it. This job runs d3gl's checks on the newest luma.gl every
+# week, so a luma.gl release that breaks d3gl is known before d3gl moves to it. When it fails on a
+# schedule, it opens an issue (or comments on the open one for that version).
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays, 05:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/luma-latest.yml
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  luma-latest:
+    runs-on: ubuntu-24.04 # Playwright 1.60 cannot install Chromium on ubuntu-26.04 (#567)
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Move to the newest luma.gl
+        id: luma
+        run: |
+          pnpm --filter @mapequation/d3gl update "@luma.gl/*" --latest
+          version=$(npm view @luma.gl/core version)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Testing on luma.gl $version"
+
+      - name: Build
+        run: pnpm --filter @mapequation/d3gl build
+
+      - name: Typecheck (library and test files)
+        run: pnpm --filter @mapequation/d3gl typecheck && pnpm --filter @mapequation/d3gl typecheck:test
+
+      - name: Node unit tests
+        run: pnpm test
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter @mapequation/d3gl exec playwright install --with-deps chromium
+
+      # Every browser test except the wall-clock perf guards, which ci.yml runs on their own shards.
+      - name: Browser tests (headless Chromium, software GL)
+        run: pnpm --filter @mapequation/d3gl test:browser --exclude "**/*-perf.browser.test.ts"
+        env:
+          # The whole suite outlasts the runner's default 180 s watchdog, which suits single files.
+          D3GL_BROWSER_TEST_TIMEOUT: "1800000"
+
+      - name: Report the failure as an issue
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LUMA: ${{ steps.luma.outputs.version }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="d3gl fails on luma.gl ${LUMA:-(version unknown)}"
+          body="The weekly luma.gl check failed on luma.gl ${LUMA:-(version unknown)}: $RUN"
+          open=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

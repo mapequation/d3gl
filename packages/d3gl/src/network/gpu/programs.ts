@@ -93,7 +93,7 @@ export function assembleProgram(device: Device, program: LayoutProgram): LayoutP
     gpu: device.info.gpu,
     features: new Set<string>(device.features),
   };
-  const { vs, fs } = ShaderAssembler.getDefaultShaderAssembler().assembleGLSLShaderPair({
+  const { vs, fs } = ShaderAssembler.getDefaultShaderAssembler("glsl").assembleGLSLShaderPair({
     platformInfo,
     vs: program.vs,
     fs: program.fs,
