@@ -595,6 +595,13 @@ it frees its textures and fences, then continues warm on the next backend's devi
   (`gl.isContextLost()`) before anything that draws or creates, calls `preventDefault()` on the event (Chrome
   refuses `restoreContext()` otherwise), and the engine redraws on `webglcontextrestored` through a backend
   swap on a new canvas, not on the restored one: luma's device state no longer matches the restored context.
+  The backend it replaces calls `loseContext()` on that restored context (`releaseContext`): luma's
+  `device.destroy()` leaves it alive until GC, holding one of Chrome's ~16 context slots. While lost, the
+  backend keeps its CPU stash (`layers`, `order`, flags) current so `toSVG()` exports the latest state, and
+  `toPNG()` throws. `dropGpuObjects()` forgets objects without destroying them, so luma's "GPU Resource
+  Counts" stay high for a lost backend's objects. **In a test, Chrome refuses a `restoreContext()` called right
+  after the loss event** (`INVALID_OPERATION`, nothing restored; it took ~1 s under load): retry until
+  `getError()` no longer reports it (`restoreNow` in `network-context-loss.browser.test.ts`).
 
 ## GPU nested layout: dead passes hide behind complete fallbacks; fence what you time (#355)
 

@@ -112,9 +112,12 @@ A browser can take a page's WebGL context away at any time, for example when its
 WebGL backend then stops drawing and builds nothing until the context is back, so nothing throws. When
 the browser gives the context back, the engine redraws on a fresh WebGL backend, as it does after a
 `setBackend` swap: the same layers, view and selection. A running GPU layout continues on the CPU worker.
+Changes made while the context is gone (new data, styles, the view) are kept: `toSVG()` exports them, and
+the redraw shows them. `toPNG()` throws while the context is gone, since there is no drawn image to copy.
 
-If the context has not come back after 10 s, the engine calls `onContextUnrestored` once, so you can tell
-the user, for example to reload the page:
+If the context has not come back after 10 s, or it came back but building the new WebGL backend failed,
+the engine calls `onContextUnrestored` once, so you can tell the user, for example to reload the page, or
+switch to Canvas with `setBackend("canvas")`. `setBackend("webgl")` rebuilds at once without waiting.
 
 ```ts
 const net = network(host, {

@@ -8,7 +8,9 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { Network, type NetworkOptions } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
-import type { ViewTransform } from "../../core/index.js";
+import { Plot, type PlotOptions } from "../../map/plot.js";
+import { gpuCaps, deviceReadsRG } from "../gpu/device-probe.js";
+import type { PathContext, ViewTransform } from "../../core/index.js";
 
 const W = 400;
 const H = 300;
@@ -211,3 +213,267 @@ describe("a lost WebGL context (#599)", () => {
     expect(watch.errors).toEqual([]);
   });
 });
+
+class PlotProbe extends Plot {
+  constructor(host: HTMLElement, opts: PlotOptions, private readonly restoreWaitMs = 60_000) {
+    super(host, opts);
+  }
+  protected override contextRestoreWaitMs(): number { return this.restoreWaitMs; }
+  /** The live WebGL backend's screen pixel at CSS px (x, y), or null on another backend. */
+  screenPixel(x: number, y: number): number[] | null {
+    const b = this.backend();
+    return b instanceof WebGLBackend ? b.readScreenPixel(x, y) : null;
+  }
+}
+
+/** A filled axis-aligned square, centred on (cx, cy). */
+function square(cx: number, cy: number, r: number): (ctx: PathContext) => void {
+  return (ctx) => {
+    ctx.moveTo(cx - r, cy - r);
+    ctx.lineTo(cx + r, cy - r);
+    ctx.lineTo(cx + r, cy + r);
+    ctx.lineTo(cx - r, cy + r);
+    ctx.closePath();
+  };
+}
+
+/** A WebGL plot with one square layer, its canvas, and the canvas's lose-context extension. */
+async function lostPlot(
+  host: HTMLElement,
+  opts: PlotOptions,
+  waitMs?: number,
+): Promise<{ chart: PlotProbe; canvas: HTMLCanvasElement; lose: WEBGL_lose_context }> {
+  const chart = new PlotProbe(host, { width: W, height: H, backend: "webgl", ...opts }, waitMs);
+  await chart.whenReady();
+  chart.layer("a", [0], { draw: square(100, 100, 30), fill: "#ff0000", id: () => "a0" });
+  const canvas = host.querySelector("canvas");
+  if (!canvas) throw new Error("no canvas");
+  const lose = loseExtension(canvas);
+  await loseNow(canvas, lose);
+  return { chart, canvas, lose };
+}
+
+/** Lose `canvas`'s context and wait for the (queued) loss event, so the backend has seen it. */
+async function loseNow(canvas: HTMLCanvasElement, lose: WEBGL_lose_context): Promise<void> {
+  const seen = new Promise((resolve) => canvas.addEventListener("webglcontextlost", resolve, { once: true }));
+  lose.loseContext();
+  await seen;
+}
+
+/**
+ * Give `canvas`'s lost context back. Chrome refuses a `restoreContext()` that comes right after the loss
+ * (INVALID_OPERATION, nothing restored), so retry until it is taken.
+ */
+async function restoreNow(canvas: HTMLCanvasElement, lose: WEBGL_lose_context): Promise<void> {
+  const gl = canvas.getContext("webgl2");
+  if (!gl) throw new Error("no WebGL2 context");
+  for (let i = 0; i < 100; i++) {
+    gl.getError(); // clear CONTEXT_LOST_WEBGL
+    lose.restoreContext();
+    if (gl.getError() !== gl.INVALID_OPERATION) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("restoreContext() was refused");
+}
+
+/** The fills of an SVG export's paths, in order. */
+function fills(svg: string): string[] {
+  return [...svg.matchAll(/<path[^>]* fill="([^"]+)"/g)].map((m) => m[1] ?? "");
+}
+
+describe("an engine whose WebGL context is lost (#599)", () => {
+  it("keeps toSVG() current through a data and a style change made while lost, and redraws them on restore", async () => {
+    const watch = watchErrors();
+    const host = makeHost();
+    const { chart, canvas, lose } = await lostPlot(host, {});
+    try {
+      chart.layer("b", [0], { draw: square(250, 150, 20), fill: "#00ff00", id: () => "b0" }); // data while lost
+      chart.setStyle("a", "a0", { fill: "#0000ff" }); // style while lost
+      const svg = chart.toSVG();
+      expect(fills(svg)).toEqual(["rgba(0, 0, 255, 1.0000)", "rgba(0, 255, 0, 1.0000)"]);
+
+      await restoreNow(canvas, lose);
+      await until(() => host.querySelector("canvas") !== canvas, "the redraw on a new canvas");
+      await chart.whenReady();
+      expect(chart.toSVG()).toBe(svg);
+      expect(chart.screenPixel(250, 150)?.slice(0, 3)).toEqual([0, 255, 0]);
+      expect(chart.screenPixel(100, 100)?.slice(0, 3)).toEqual([0, 0, 255]);
+      expect(watch.errors).toEqual([]);
+    } finally {
+      watch.dispose();
+      chart.destroy();
+    }
+  });
+
+  it("throws a clear error from toPNG() while lost, and exports again once restored", async () => {
+    const host = makeHost();
+    const { chart, canvas, lose } = await lostPlot(host, {});
+    try {
+      expect(() => chart.toPNG()).toThrow(/WebGL context is lost/);
+      await restoreNow(canvas, lose);
+      await until(() => host.querySelector("canvas") !== canvas, "the redraw on a new canvas");
+      await chart.whenReady();
+      expect(chart.toPNG()).toMatch(/^data:image\/png/);
+    } finally {
+      chart.destroy();
+    }
+  });
+
+  it("rebuilds on setBackend(\"webgl\") while lost, without waiting for the browser", async () => {
+    const reports: number[] = [];
+    const host = makeHost();
+    const { chart, canvas } = await lostPlot(host, { onContextUnrestored: () => reports.push(1) }, 100);
+    try {
+      chart.setBackend("webgl");
+      await chart.whenReady();
+      expect(host.querySelector("canvas")).not.toBe(canvas);
+      expect(host.querySelectorAll("canvas")).toHaveLength(1);
+      expect(chart.screenPixel(100, 100)?.slice(0, 3)).toEqual([255, 0, 0]);
+      await new Promise((resolve) => setTimeout(resolve, 250)); // past the (cleared) wait
+      expect(reports).toEqual([]);
+    } finally {
+      chart.destroy();
+    }
+  });
+
+  it("switches to Canvas from onContextUnrestored", async () => {
+    const watch = watchErrors();
+    const host = makeHost();
+    let chart: PlotProbe | null = null;
+    const switched = { done: false };
+    const lost = await lostPlot(host, {
+      onContextUnrestored: () => {
+        chart?.setBackend("canvas");
+        void chart?.whenReady().then(() => { switched.done = true; });
+      },
+    }, 50);
+    chart = lost.chart;
+    try {
+      await until(() => switched.done, "the switch to Canvas");
+      const now = host.querySelector("canvas");
+      expect(now).not.toBe(lost.canvas);
+      expect(now?.getContext("2d")).not.toBeNull();
+      expect(chart.toPNG()).toMatch(/^data:image\/png/);
+      expect(watch.errors).toEqual([]);
+    } finally {
+      watch.dispose();
+      chart.destroy();
+    }
+  });
+
+  it("never reports a loss after destroy() during the wait", async () => {
+    const reports: number[] = [];
+    const host = makeHost();
+    const { chart } = await lostPlot(host, { onContextUnrestored: () => reports.push(1) }, 50);
+    chart.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(reports).toEqual([]);
+  });
+
+  it("restores again after a second loss of the restored backend", async () => {
+    const reports: number[] = [];
+    const host = makeHost();
+    const { chart, canvas, lose } = await lostPlot(host, { onContextUnrestored: () => reports.push(1) });
+    try {
+      await restoreNow(canvas, lose);
+      await until(() => host.querySelector("canvas") !== canvas, "the first redraw");
+      await chart.whenReady();
+      const second = host.querySelector("canvas");
+      if (!second) throw new Error("no canvas");
+      const lose2 = loseExtension(second);
+      await loseNow(second, lose2);
+      expect(() => chart.toPNG()).toThrow(/WebGL context is lost/);
+      await restoreNow(second, lose2);
+      await until(() => host.querySelector("canvas") !== second, "the second redraw");
+      await chart.whenReady();
+      expect(host.querySelectorAll("canvas")).toHaveLength(1);
+      expect(chart.screenPixel(100, 100)?.slice(0, 3)).toEqual([255, 0, 0]);
+      expect(reports).toEqual([]);
+    } finally {
+      chart.destroy();
+    }
+  });
+
+  it("reports once when the restore swap fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reports: number[] = [];
+    const host = makeHost();
+    const { chart, canvas, lose } = await lostPlot(host, { onContextUnrestored: () => reports.push(1) });
+    try {
+      vi.spyOn(WebGLBackend, "create").mockRejectedValueOnce(new Error("no device"));
+      await restoreNow(canvas, lose);
+      await until(() => reports.length > 0, "the report");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(reports).toHaveLength(1);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("could not be created"))).toBe(true);
+    } finally {
+      chart.destroy();
+    }
+  });
+
+  it("waits for a context lost before its backend was installed, and reports it", async () => {
+    const reports: number[] = [];
+    const host = makeHost();
+    const chart = new PlotProbe(host, { width: W, height: H, backend: "canvas", onContextUnrestored: () => reports.push(1) }, 50);
+    try {
+      await chart.whenReady();
+      chart.layer("a", [0], { draw: square(100, 100, 30), fill: "#ff0000", id: () => "a0" });
+      const create = WebGLBackend.create.bind(WebGLBackend);
+      let lostCanvas: HTMLCanvasElement | null = null;
+      vi.spyOn(WebGLBackend, "create").mockImplementationOnce(async (canvas, opts) => {
+        const backend = await create(canvas, opts);
+        loseExtension(canvas).loseContext(); // lost in flight, before installBackend
+        lostCanvas = canvas;
+        return backend;
+      });
+      chart.setBackend("webgl");
+      await chart.whenReady();
+      expect(host.querySelector("canvas")).toBe(lostCanvas);
+      await until(() => reports.length > 0, "the report");
+      expect(reports).toHaveLength(1);
+      // A lost WebGL backend is not "current": an explicit pick rebuilds it.
+      chart.setBackend("webgl");
+      await chart.whenReady();
+      expect(host.querySelector("canvas")).not.toBe(lostCanvas);
+      expect(chart.screenPixel(100, 100)?.slice(0, 3)).toEqual([255, 0, 0]);
+    } finally {
+      chart.destroy();
+    }
+  });
+
+  it("releases the restored context of the replaced backend", async () => {
+    const host = makeHost();
+    const { chart, canvas, lose } = await lostPlot(host, {});
+    try {
+      const gl = canvas.getContext("webgl2");
+      await restoreNow(canvas, lose);
+      await until(() => host.querySelector("canvas") !== canvas, "the redraw on a new canvas");
+      await chart.whenReady();
+      await nextFrame();
+      expect(gl?.isContextLost()).toBe(true); // released, not left live until GC
+    } finally {
+      chart.destroy();
+    }
+  });
+
+  it("takes no device probe on a lost context", async () => {
+    const host = makeHost();
+    const canvas = document.createElement("canvas");
+    host.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: W, height: H });
+    try {
+      const device = backend.gpuDevice;
+      loseExtension(canvas).loseContext();
+      await nextFrame();
+      const texture = vi.spyOn(device, "createTexture");
+      const framebuffer = vi.spyOn(device, "createFramebuffer");
+      expect(gpuCaps(device)?.blendProbe).toBe("error");
+      expect(deviceReadsRG(device)).toBe(false);
+      expect(texture).not.toHaveBeenCalled();
+      expect(framebuffer).not.toHaveBeenCalled();
+    } finally {
+      backend.destroy();
+    }
+  });
+});
+

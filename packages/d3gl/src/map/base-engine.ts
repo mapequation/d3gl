@@ -321,10 +321,11 @@ export interface BaseEngineOptions extends EngineSizing {
   /**
    * Called once when the browser takes the WebGL context away (a GPU-process reset, too many contexts on
    * the page) and has not given it back 10 s later, or giving it back failed:
-   * the place to show a message, or to call `setBackend("canvas")`. Until then the engine draws nothing,
-   * keeps its data, view and selection, and throws nothing; when the context comes back — even after this
-   * call — it redraws them on a fresh WebGL backend by itself (#599). A context that comes back in time
-   * calls nothing.
+   * the place to show a message, or to call `setBackend("canvas")` (`setBackend("webgl")` rebuilds at once).
+   * Until then the engine draws nothing, keeps its data, styles, view and selection (`toSVG()` exports
+   * them), and throws nothing, except `toPNG()`, which has no drawn image to copy. When the context comes
+   * back — even after this call — it redraws them on a fresh WebGL backend by itself (#599). A context that
+   * comes back in time calls nothing.
    */
   onContextUnrestored?: () => void;
 }
@@ -1541,7 +1542,8 @@ export abstract class BaseEngine {
    *  no-op. Excludes "auto" (always an action) and the in-flight upgrade window (where the
    *  live "canvas" is about to become "webgl", so a pick must still take effect). */
   protected isCurrentBackend(type: BackendType): boolean {
-    return type !== "auto" && type === this.currentBackend && !this.upgrading;
+    // A lost WebGL backend (#599) draws nothing, so picking WebGL again rebuilds it.
+    return type !== "auto" && type === this.currentBackend && !this.upgrading && this.handle?.backend.contextLost !== true;
   }
   setBackend(type: BackendType): this {
     if (this.isCurrentBackend(type)) return this; // already live on this backend — no churn
@@ -2814,6 +2816,9 @@ export abstract class BaseEngine {
     this.currentBackend = type;
     this.clearRestoreTimer(); // a loss on the outgoing backend is moot now
     this.watchContext(next.element);
+    // Lost while it was built or waiting to install (an in-flight swap, the "auto" upgrade): its loss event
+    // fired before the engine listened, so start the wait now (#599).
+    if (next.backend.contextLost) this.startRestoreWait();
     // #273: the same withhold as pushLayers(), for the install that CREATES the placeholder —
     // `setBackend("auto")` on an engine that already carries a large scene. The placeholder is
     // left correctly sized but blank; the WebGL install right after runs this with
@@ -2887,13 +2892,18 @@ export abstract class BaseEngine {
   /** The live backend's WebGL context is gone (#599): report it unless it comes back in time. */
   private readonly onContextLost = (e: Event): void => {
     if (e.target !== this.handle?.element || this.destroyed) return;
+    this.startRestoreWait();
+  };
+
+  /** Start (or restart) the wait for the live backend's lost context to come back. */
+  private startRestoreWait(): void {
     this.contextLossReported = false;
     this.clearRestoreTimer();
     this.restoreTimer = setTimeout(() => {
       this.restoreTimer = null;
       this.reportContextLoss();
     }, this.contextRestoreWaitMs());
-  };
+  }
 
   /**
    * The browser gave the context back (#599). The lost backend's GPU objects are gone and luma's device no
