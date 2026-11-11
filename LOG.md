@@ -587,6 +587,15 @@ it frees its textures and fences, then continues warm on the next backend's devi
   The continuation is worked out when the next run starts, not when the move does, because a drag can end
   while the device is pending (~200 ms for an `"auto"` upgrade). And `whenBackendSettled` re-waits while the
   swap token changes: an explicit pick ends an `"auto"` upgrade while the Canvas placeholder is still live.
+- **A lost context throws only when luma builds a program it has not built before (#599).** luma caches
+  shaders and pipelines per device, so after `loseContext()` a frame, a new lane of a primitive already drawn,
+  or new data of the same kind passes silently; the overlay and `Failed to reflect WebGL uniform blocks` come
+  from the first *new* program (in a test: directed data, whose arrow lane was never drawn). A test of the
+  lost path must build one, or it passes on the broken code. The render backend checks `device.isLost`
+  (`gl.isContextLost()`) before anything that draws or creates, calls `preventDefault()` on the event (Chrome
+  refuses `restoreContext()` otherwise), and the engine redraws on `webglcontextrestored` through a backend
+  swap on a new canvas, not on the restored one: luma's device state no longer matches the restored context.
+
 ## GPU nested layout: dead passes hide behind complete fallbacks; fence what you time (#355)
 
 The nested layout solves every module at once on the GPU (`network/gpu/gpu-nested-layout.ts`). Five things
