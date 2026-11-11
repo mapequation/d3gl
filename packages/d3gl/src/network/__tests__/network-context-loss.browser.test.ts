@@ -1,7 +1,7 @@
 /**
  * A lost WebGL context (#599): the render backend stops cleanly — no luma.gl shader-error overlay, no uncaught
  * error — and when the browser gives the context back, the engine redraws the same layout, camera and selection
- * on a fresh WebGL backend (the backend-swap path). If it does not come back, `onContextLost` fires once.
+ * on a fresh WebGL backend (the backend-swap path). If it does not come back, `onContextUnrestored` fires once.
  * The loss is driven with `WEBGL_lose_context`, during a network layout, as Chrome's GPU-process reset did.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
@@ -113,7 +113,7 @@ describe("a lost WebGL context (#599)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const reports: number[] = [];
     const host = makeHost();
-    const net = new Probe(host, { width: W, height: H, backend: "webgl", onContextLost: () => reports.push(1) });
+    const net = new Probe(host, { width: W, height: H, backend: "webgl", onContextUnrestored: () => reports.push(1) });
     try {
       await net.whenReady();
       const graph = clustered(2000);
@@ -175,7 +175,7 @@ describe("a lost WebGL context (#599)", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const reports: number[] = [];
     const host = makeHost();
-    const net = new Probe(host, { width: W, height: H, backend: "webgl", onContextLost: () => reports.push(1) }, 50);
+    const net = new Probe(host, { width: W, height: H, backend: "webgl", onContextUnrestored: () => reports.push(1) }, 50);
     try {
       await net.whenReady();
       const graph = clustered(500);

@@ -326,10 +326,10 @@ export interface BaseEngineOptions extends EngineSizing {
    * call — it redraws them on a fresh WebGL backend by itself (#599). A context that comes back in time
    * calls nothing.
    */
-  onContextLost?: () => void;
+  onContextUnrestored?: () => void;
 }
 
-/** How long a lost WebGL context may stay away before {@link BaseEngineOptions.onContextLost} is called
+/** How long a lost WebGL context may stay away before {@link BaseEngineOptions.onContextUnrestored} is called
  *  (#599). Chrome's GPU-process reset blanks the page for a few seconds before it restores the context. */
 const CONTEXT_RESTORE_WAIT_MS = 10_000;
 
@@ -434,8 +434,8 @@ export abstract class BaseEngine {
   private nodeDrag: { hit: HoverHit; startClientX: number; startClientY: number; session: NodeDragSession | null } | null = null;
   private swapToken = 0;
   private destroyed = false;
-  /** {@link BaseEngineOptions.onContextLost}. */
-  private readonly contextLostCb: (() => void) | undefined;
+  /** {@link BaseEngineOptions.onContextUnrestored}. */
+  private readonly contextUnrestoredCb: (() => void) | undefined;
   /** Pending while the live WebGL backend's context is lost (#599): reports the loss when it runs out. */
   private restoreTimer: ReturnType<typeof setTimeout> | null = null;
   /** The current loss has been reported, so a failed restore does not report it again. */
@@ -530,7 +530,7 @@ export abstract class BaseEngine {
     this.width = size.width;
     this.height = size.height;
     this.tooltipClass = opts.tooltipClass;
-    this.contextLostCb = opts.onContextLost;
+    this.contextUnrestoredCb = opts.onContextUnrestored;
     if (backend === "auto") {
       // Instant canvas first paint; whenReady() resolves now. WebGL is built in the background.
       this.ready = Promise.resolve();
@@ -2881,7 +2881,7 @@ export abstract class BaseEngine {
   private reportContextLoss(): void {
     if (this.contextLossReported || this.destroyed) return;
     this.contextLossReported = true;
-    this.contextLostCb?.();
+    this.contextUnrestoredCb?.();
   }
 
   /** The live backend's WebGL context is gone (#599): report it unless it comes back in time. */

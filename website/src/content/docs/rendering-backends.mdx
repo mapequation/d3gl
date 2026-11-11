@@ -106,6 +106,25 @@ moves with a swap: it frees its GPU memory before the old backend goes and conti
 new one — on the GPU again for WebGL (including `"auto"`), on the CPU worker for Canvas and SVG. See
 [Network](/d3gl/examples/network/).
 
+## When the browser takes the GPU away
+
+A browser can take a page's WebGL context away at any time, for example when its GPU process resets. The
+WebGL backend then stops drawing and builds nothing until the context is back, so nothing throws. When
+the browser gives the context back, the engine redraws on a fresh WebGL backend, as it does after a
+`setBackend` swap: the same layers, view and selection. A running GPU layout continues on the CPU worker.
+
+If the context has not come back after 10 s, the engine calls `onContextUnrestored` once, so you can tell
+the user, for example to reload the page:
+
+```ts
+const net = network(host, {
+  backend: "webgl",
+  onContextUnrestored: () => showMessage("The graphics card stopped responding. Reload to redraw."),
+});
+```
+
+A context that comes back later still redraws.
+
 ## React
 
 The `<GeoMap>` component takes the same `backend` prop, including `"auto"`:
