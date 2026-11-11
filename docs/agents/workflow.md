@@ -113,7 +113,8 @@ Lifecycle steps 5 and 7 are gated by **one shared check**, `scripts/check-pr-pol
 - **Local pre-merge hook**: `scripts/premerge-gate.sh`, wired in `.claude/settings.json` as a Claude
   Code `PreToolUse(Bash)` hook. It runs the same check before any `gh pr merge` and blocks the call on
   failure. It allows the call if it can't evaluate (node missing, a gh error), since CI is the real gate.
-  (`.claude/` is git-ignored except this committed `settings.json`, through a `.gitignore` negation.)
+  (`.claude/settings.json` is committed; under `.claude/`, only `worktrees/` and `settings.local.json`
+  are git-ignored.)
 
 The rules:
 1. A change to `packages/d3gl/**` (except the generated `CHANGELOG.md`) needs a changeset. An empty one
