@@ -21,7 +21,7 @@ permissions:
 jobs:
   luma-latest:
     runs-on: ubuntu-24.04 # Playwright 1.60 cannot install Chromium on ubuntu-26.04 (#567)
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
 
@@ -64,11 +64,11 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm --filter @mapequation/d3gl exec playwright install --with-deps chromium
 
-      # Every browser test except the wall-clock perf guards (named as scripts/run-browser-perf-tier.mjs
-      # finds them), which ci.yml runs on their own shards with a budget scale for these runners.
+      # Every browser test except the wall-clock perf guards, which ci.yml runs on their own shards. Only a
+      # file that fails on the newest luma.gl and passes on the locked one counts: see the script.
       - name: Browser tests (headless Chromium, software GL)
         id: browser
-        run: pnpm --filter @mapequation/d3gl test:browser --exclude "**/{*-,}perf.browser.test.{ts,tsx}"
+        run: scripts/luma-latest-browser.sh "$RUNNER_TEMP/luma-breaks.txt"
         env:
           # The whole suite outlasts the runner's default 180 s watchdog, which suits single files.
           D3GL_BROWSER_TEST_TIMEOUT: "1800000"
@@ -87,6 +87,9 @@ jobs:
         run: |
           title="d3gl fails on luma.gl ${LUMA:-(version unknown)}"
           body="The weekly luma.gl check failed on luma.gl ${LUMA:-(version unknown)}: $RUN"
+          if [ -s "$RUNNER_TEMP/luma-breaks.txt" ]; then
+            body="$body"$'\n\n'"Browser test files that fail on it and pass on the locked luma.gl:"$'\n'"$(sed 's/^/- /' "$RUNNER_TEMP/luma-breaks.txt")"
+          fi
           open=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
           if [ -n "$open" ]; then
             gh issue comment "$open" --body "$body"
