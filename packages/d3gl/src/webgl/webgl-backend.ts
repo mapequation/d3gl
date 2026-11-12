@@ -73,13 +73,58 @@ export class WebGLBackend implements Backend {
    *  edge ramp is one device px wide). {@link syncPixelRatio} pushes it only when a draw's target differs:
    *  a resize to another devicePixelRatio, the CSS-px readback target, the globe's bake target. */
   private pixelRatio = 1;
+  /**
+   * The browser took the WebGL context away (#599). Sticky: a restored context has none of this backend's GPU
+   * objects, and luma's device state no longer matches it, so the engine replaces the whole backend instead
+   * (`BaseEngine`'s restore swap). From the loss on, the backend draws nothing and creates no GPU object.
+   */
+  private lost = false;
 
   private constructor(
     private readonly device: Device,
+    private readonly canvas: HTMLCanvasElement,
     private width: number,
     private height: number,
   ) {
     this.clipMatrix = clipFromView({ k: 1, x: 0, y: 0 }, width, height);
+    canvas.addEventListener("webglcontextlost", this.onContextLost);
+  }
+
+  /**
+   * The context is gone (#599). `preventDefault()` is what lets the browser restore it (without it Chrome refuses
+   * "context restoration not allowed"). Drop every GPU object without a GL call: a lost context takes none, and
+   * its objects are invalid even after a restore.
+   */
+  private readonly onContextLost = (e: Event): void => {
+    e.preventDefault();
+    this.lost = true;
+    this.dropGpuObjects();
+  };
+
+  /** Forget every GPU object without a GL call (a lost context, #599). The CPU-side export stash stays. */
+  private dropGpuObjects(): void {
+    this.renderers.clear();
+    this.instanced.clear();
+    this.pickable.clear();
+    this.globe = null;
+    this.pt = null;
+    this.picker = null;
+    this.pickFbo = null;
+    this.offscreen = null;
+  }
+
+  /**
+   * True from the moment the context is lost: the event is queued, so the context itself is asked too
+   * (`device.isLost` reads `gl.isContextLost()`). Constant time; every path that would create a GPU object or
+   * draw checks it first, so luma never compiles a shader on a lost context (its error overlay, #599).
+   */
+  private get dead(): boolean {
+    return this.lost || this.device.isLost;
+  }
+
+  /** {@link Backend.contextLost}: the engine rebuilds a lost backend instead of keeping it (#599). */
+  get contextLost(): boolean {
+    return this.dead;
   }
 
   /** The luma.gl Device powering this backend — exposed for GPU-side consumers (e.g. GPU layout). */
@@ -98,23 +143,25 @@ export class WebGLBackend implements Backend {
       // render path can clip via the stencil test (WebGL defaults stencil:false).
       webgl: { stencil: true },
     });
-    return new WebGLBackend(device, opts.width, opts.height);
+    return new WebGLBackend(device, canvas, opts.width, opts.height);
   }
 
   setLayers(newLayers: RenderLayer[]): void {
-    // Destroy old renderers
+    // Destroy old renderers (a lost context has none left, #599)
     for (const r of this.renderers.values()) r.destroy();
     this.renderers.clear();
     this.layers.clear();
     this.layerFlags.clear(); // fresh drawables carry fresh flags
     this.order = [];
     for (const layer of newLayers) {
+      this.layers.set(layer.name, layer);
+      this.order.push(layer.name);
+      // While lost, only the CPU-side stash is kept current: toSVG() reads it (#599).
+      if (this.dead) continue;
       const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
       renderer.setTransform(this.clipMatrix);
       renderer.setPixelRatio(this.pixelRatio);
       this.renderers.set(layer.name, renderer);
-      this.layers.set(layer.name, layer);
-      this.order.push(layer.name);
     }
     this.bakeDirty = true;
   }
@@ -133,6 +180,13 @@ export class WebGLBackend implements Backend {
    * overlay created points-only later highlighting a path).
    */
   updateLayer(name: string, layer: RenderLayer): void {
+    if (this.dead) {
+      // No GPU object on a lost context (#599); keep the export stash current.
+      this.layers.set(name, layer);
+      this.layerFlags.delete(name);
+      if (!this.order.includes(name)) this.order.push(name);
+      return;
+    }
     const existing = this.renderers.get(name);
     if (existing?.replace(layer.buffers)) {
       this.layers.set(name, layer); // an existing renderer implies `name` is already in `order`
@@ -161,8 +215,9 @@ export class WebGLBackend implements Backend {
    *  previously-stored vector view (export may lag the textures until the next update with it). */
   updateLayerStyles(name: string, tables: StyleTables, drawables?: DrawableVector[]): void {
     const renderer = this.renderers.get(name);
-    if (!renderer) return;
-    renderer.updateColors(tables);
+    // A lost context (#599) has no renderers left, so the stash decides whether the layer exists.
+    if (this.dead ? !this.layers.has(name) : !renderer) return;
+    renderer?.updateColors(tables);
     if (drawables) {
       const prev = this.layers.get(name);
       if (prev) this.layers.set(name, { ...prev, drawables });
@@ -183,8 +238,8 @@ export class WebGLBackend implements Backend {
    *  export-only consumer; the live view is retained and folded in at toSVG(). */
   updateLayerFlags(name: string, flags: Uint8Array): void {
     const renderer = this.renderers.get(name);
-    if (!renderer) return;
-    renderer.updateFlags(flags);
+    if (this.dead ? !this.layers.has(name) : !renderer) return; // see updateLayerStyles (#599)
+    renderer?.updateFlags(flags);
     this.layerFlags.set(name, flags);
     this.bakeDirty = true;
   }
@@ -201,9 +256,9 @@ export class WebGLBackend implements Backend {
    */
   appendToLayer(delta: RenderDelta): void {
     const renderer = this.renderers.get(delta.name);
-    if (!renderer) return;
-    const ok = renderer.append(delta.buffers);
-    if (!ok) {
+    if (this.dead ? !this.layers.has(delta.name) : !renderer) return; // see updateLayerStyles (#599)
+    const ok = renderer?.append(delta.buffers) ?? true;
+    if (renderer && !ok) {
       // A pass needed by the delta did not exist in the renderer yet — e.g. the layer
       // was created empty (all passes null) and the first geometry of some type arrives
       // now. We can't grow a null pass from a tail delta. But when fromDrawable === 0 the
@@ -230,7 +285,7 @@ export class WebGLBackend implements Backend {
 
   setPassThroughLayer(layer: PassThroughLayer): void {
     this.ptLayers.set(layer.name, layer);
-    this.pt ??= new PassThroughGL(this.device, this.width, this.height);
+    if (!this.dead) this.pt ??= new PassThroughGL(this.device, this.width, this.height);
   }
 
   removePassThroughLayer(name: string): void {
@@ -242,7 +297,7 @@ export class WebGLBackend implements Backend {
   }
 
   drawPassThrough(name: string, batch: DrawBatch, mode: "replace-first" | "replace-rest" | "append"): void {
-    if (!this.pt) return;
+    if (!this.pt || this.dead) return;
     const clear = mode === "replace-first";
     // Per-LAYER sizing (#110): read this layer's mode rather than a single last-registration-wins
     // flag, so a screen-sized layer and a world-sized one can share the accumulation surface.
@@ -263,6 +318,7 @@ export class WebGLBackend implements Backend {
   snapshotPassThrough(): void {}
 
   setInstancedLayer(layer: InstancedLayer): void {
+    if (this.dead) return;
     this.instanced.get(layer.name)?.destroy();
     // Link layers (lines/arrows/half-arrows) may opt into the GPU-readback pick pass (#141); the
     // primitive builds an extra id-encoded pick model when `pick` is set. Node glyphs (circles, pie) never do.
@@ -308,6 +364,7 @@ export class WebGLBackend implements Backend {
    * id-encoded pick model, which `update()` can't do in place — see #141/#179).
    */
   updateInstancedLayer(layer: InstancedLayer): void {
+    if (this.dead) return;
     const existing = this.instanced.get(layer.name);
     // A pick-model presence mismatch (pickLinks toggled) must recreate: the in-place update path
     // never builds/drops the pick model, so an in-place update would leave the wrong pick state.
@@ -399,6 +456,7 @@ export class WebGLBackend implements Backend {
     if (width === this.width && height === this.height) return;
     this.width = width;
     this.height = height;
+    if (this.dead) return; // nothing to size or reproject; the engine's restore swap builds at the new size
     const canvas = this.device.getDefaultCanvasContext().canvas as HTMLCanvasElement;
     canvas.style.width = `${width}px`;
     canvas.style.height = `${height}px`;
@@ -426,6 +484,7 @@ export class WebGLBackend implements Backend {
 
   /** Enter/leave globe mode. texW/texH = equirect bake size. Idempotent re-entry resizes. */
   setGlobeMode(on: boolean, texW = 2048, texH = 1024): void {
+    if (this.dead) return;
     if (on) {
       if (!this.globe) this.globe = new GlobeRenderer(this.device, texW, texH, this.width, this.height);
       else this.globe.setTextureSize(texW, texH);
@@ -442,6 +501,7 @@ export class WebGLBackend implements Backend {
   setGlobeRotation(m: Float32Array): void { this.globe?.setRotation(m); this.render(); }
 
   render(): void {
+    if (this.dead) return;
     if (this.globe) { this.renderGlobe(); return; }
     const cc = this.device.getDefaultCanvasContext();
     const fb = cc.getCurrentFramebuffer({ depthStencilFormat: "depth24plus-stencil8" });
@@ -544,6 +604,11 @@ export class WebGLBackend implements Backend {
     // so it has the screen's device-px size, antialiasing and colours. The stashed labels (#219) are
     // painted on top, where the HTML overlay shows them. Export-time cost only. A hidden chart's canvas
     // has a 1×1 buffer, so the buffer is sized first.
+    // A lost context (#599) has no drawn image to copy, and an export drawn some other way would not be the
+    // screen's: say so instead of returning a blank image.
+    if (this.dead) {
+      throw new Error("d3gl: toPNG() cannot export while the WebGL context is lost; call it again once the engine has redrawn on the restored context, or switch to the canvas backend");
+    }
     this.sizeDrawingBuffer();
     this.render();
     return canvasToPNG(this.device.getDefaultCanvasContext().canvas, this.width, this.height, this.textData);
@@ -590,7 +655,7 @@ export class WebGLBackend implements Backend {
    * pointer position's result with no stall. See {@link PickReadback}.
    */
   pickInstanced(x: number, y: number, exact: boolean): number | undefined {
-    if (this.pickable.size === 0 || this.globe) return undefined;
+    if (this.pickable.size === 0 || this.globe || this.dead) return undefined;
     const fbo = this.ensurePickFbo();
     if (this.pickDirty) this.renderPickPass(fbo);
     const dpr = this.device.getDefaultCanvasContext().devicePixelRatio;
@@ -633,6 +698,7 @@ export class WebGLBackend implements Backend {
   /** Read a pixel from the ONSCREEN canvas default framebuffer after render(). Test aid.
    *  Coords are in CSS px; the onscreen buffer is device px, so scale by the buffer ratio. */
   readScreenPixel(x: number, y: number): number[] {
+    if (this.dead) return [0, 0, 0, 0];
     this.render();
     const gl = (this.device as unknown as { gl: WebGL2RenderingContext }).gl;
     const sx = gl.drawingBufferWidth / this.width, sy = gl.drawingBufferHeight / this.height;
@@ -644,6 +710,7 @@ export class WebGLBackend implements Backend {
 
   /** Read a pixel from the offscreen export framebuffer (renders first). Flips y for WebGL origin. */
   readPixel(x: number, y: number): number[] {
+    if (this.dead) return [0, 0, 0, 0];
     const fb = this.ensureOffscreen();
     this.drawInto(fb);
     const p = this.device.readPixelsToArrayWebGL(fb, {
@@ -656,6 +723,9 @@ export class WebGLBackend implements Backend {
   }
 
   destroy(): void {
+    this.canvas.removeEventListener("webglcontextlost", this.onContextLost);
+    // A lost context (#599) takes no GL call, and its objects are invalid even once restored: only drop them.
+    if (this.dead) this.dropGpuObjects();
     for (const r of this.renderers.values()) r.destroy();
     this.renderers.clear();
     for (const r of this.instanced.values()) r.destroy();
@@ -674,7 +744,27 @@ export class WebGLBackend implements Backend {
     this.pickFbo = null;
     this.offscreen?.destroy();
     this.offscreen = null;
+    if (this.lost) this.releaseContext();
     this.device.destroy();
+  }
+
+  /**
+   * Give a once-lost context back to the browser (#599): luma's `device.destroy()` leaves the context alive
+   * until GC, and a restored one would hold one of the page's ~16 context slots, so the next engine's context
+   * could push out another's. A context still lost is released the moment the browser restores it.
+   */
+  private releaseContext(): void {
+    const gl = this.device instanceof WebGLDevice ? this.device.gl : null;
+    if (!gl) return;
+    if (!gl.isContextLost()) {
+      gl.getExtension("WEBGL_lose_context")?.loseContext();
+      return;
+    }
+    this.canvas.addEventListener(
+      "webglcontextrestored",
+      () => { gl.getExtension("WEBGL_lose_context")?.loseContext(); },
+      { once: true },
+    );
   }
 }
 

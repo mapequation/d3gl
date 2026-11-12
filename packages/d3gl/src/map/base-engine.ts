@@ -318,7 +318,21 @@ export interface BaseEngineOptions extends EngineSizing {
    * screen-`sizeMode` layer drawn **without** anchors is world-scaled geometry, so it refines.
    */
   curveTolerance?: number;
+  /**
+   * Called once when the browser takes the WebGL context away (a GPU-process reset, too many contexts on
+   * the page) and has not given it back 10 s later, or giving it back failed:
+   * the place to show a message, or to call `setBackend("canvas")` (`setBackend("webgl")` rebuilds at once).
+   * Until then the engine draws nothing, keeps its data, styles, view and selection (`toSVG()` exports
+   * them), and throws nothing, except `toPNG()`, which has no drawn image to copy. When the context comes
+   * back — even after this call — it redraws them on a fresh WebGL backend by itself (#599). A context that
+   * comes back in time calls nothing.
+   */
+  onContextUnrestored?: () => void;
 }
+
+/** How long a lost WebGL context may stay away before {@link BaseEngineOptions.onContextUnrestored} is called
+ *  (#599). Chrome's GPU-process reset blanks the page for a few seconds before it restores the context. */
+const CONTEXT_RESTORE_WAIT_MS = 10_000;
 
 
 
@@ -421,6 +435,12 @@ export abstract class BaseEngine {
   private nodeDrag: { hit: HoverHit; startClientX: number; startClientY: number; session: NodeDragSession | null } | null = null;
   private swapToken = 0;
   private destroyed = false;
+  /** {@link BaseEngineOptions.onContextUnrestored}. */
+  private readonly contextUnrestoredCb: (() => void) | undefined;
+  /** Pending while the live WebGL backend's context is lost (#599): reports the loss when it runs out. */
+  private restoreTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The current loss has been reported, so a failed restore does not report it again. */
+  private contextLossReported = false;
   /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
    *  enterAutoMode() starts the upgrade; not reset afterwards. */
   private upgradeDone: Promise<void> | null = null;
@@ -511,6 +531,7 @@ export abstract class BaseEngine {
     this.width = size.width;
     this.height = size.height;
     this.tooltipClass = opts.tooltipClass;
+    this.contextUnrestoredCb = opts.onContextUnrestored;
     if (backend === "auto") {
       // Instant canvas first paint; whenReady() resolves now. WebGL is built in the background.
       this.ready = Promise.resolve();
@@ -1521,7 +1542,8 @@ export abstract class BaseEngine {
    *  no-op. Excludes "auto" (always an action) and the in-flight upgrade window (where the
    *  live "canvas" is about to become "webgl", so a pick must still take effect). */
   protected isCurrentBackend(type: BackendType): boolean {
-    return type !== "auto" && type === this.currentBackend && !this.upgrading;
+    // A lost WebGL backend (#599) draws nothing, so picking WebGL again rebuilds it.
+    return type !== "auto" && type === this.currentBackend && !this.upgrading && this.handle?.backend.contextLost !== true;
   }
   setBackend(type: BackendType): this {
     if (this.isCurrentBackend(type)) return this; // already live on this backend — no churn
@@ -2260,6 +2282,8 @@ export abstract class BaseEngine {
     this.nodeDrag?.session?.end(); this.endNodeDrag(); // release a held drag + its window listeners (#140)
     this.tooltipEl?.destroy(); this.tooltipEl = null;
     this.labelLayer?.destroy(); this.labelLayer = null; // engine-owned label overlay (#105 N7b, #223)
+    this.clearRestoreTimer();
+    if (this.handle) this.unwatchContext(this.handle.element);
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
     this.handle = null;
@@ -2786,9 +2810,15 @@ export abstract class BaseEngine {
       this.host.insertBefore(next.element, old.element);
     }
     old?.backend.destroy();
+    if (old) this.unwatchContext(old.element);
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
     this.currentBackend = type;
+    this.clearRestoreTimer(); // a loss on the outgoing backend is moot now
+    this.watchContext(next.element);
+    // Lost while it was built or waiting to install (an in-flight swap, the "auto" upgrade): its loss event
+    // fired before the engine listened, so start the wait now (#599).
+    if (next.backend.contextLost) this.startRestoreWait();
     // #273: the same withhold as pushLayers(), for the install that CREATES the placeholder —
     // `setBackend("auto")` on an engine that already carries a large scene. The placeholder is
     // left correctly sized but blank; the WebGL install right after runs this with
@@ -2826,6 +2856,70 @@ export abstract class BaseEngine {
       for (const name of [...this.instancedLanes.keys()]) this.emitInstancedLane(name);
     }
   }
+
+  /**
+   * Hear the WebGL context events of the backend's canvas (#599; a Canvas 2D canvas never fires them, SVG
+   * draws into the host). The backend itself calls `preventDefault()` on a loss and stops drawing; the engine
+   * waits for the context to come back and then redraws through a backend swap.
+   */
+  private watchContext(element: HTMLElement): void {
+    if (element === this.host) return;
+    element.addEventListener("webglcontextlost", this.onContextLost);
+    element.addEventListener("webglcontextrestored", this.onContextRestored);
+  }
+
+  private unwatchContext(element: HTMLElement): void {
+    element.removeEventListener("webglcontextlost", this.onContextLost);
+    element.removeEventListener("webglcontextrestored", this.onContextRestored);
+  }
+
+  private clearRestoreTimer(): void {
+    if (this.restoreTimer !== null) clearTimeout(this.restoreTimer);
+    this.restoreTimer = null;
+  }
+
+  /** How long a lost context may stay away before it is reported; an override point for tests. */
+  protected contextRestoreWaitMs(): number {
+    return CONTEXT_RESTORE_WAIT_MS;
+  }
+
+  private reportContextLoss(): void {
+    if (this.contextLossReported || this.destroyed) return;
+    this.contextLossReported = true;
+    this.contextUnrestoredCb?.();
+  }
+
+  /** The live backend's WebGL context is gone (#599): report it unless it comes back in time. */
+  private readonly onContextLost = (e: Event): void => {
+    if (e.target !== this.handle?.element || this.destroyed) return;
+    this.startRestoreWait();
+  };
+
+  /** Start (or restart) the wait for the live backend's lost context to come back. */
+  private startRestoreWait(): void {
+    this.contextLossReported = false;
+    this.clearRestoreTimer();
+    this.restoreTimer = setTimeout(() => {
+      this.restoreTimer = null;
+      this.reportContextLoss();
+    }, this.contextRestoreWaitMs());
+  }
+
+  /**
+   * The browser gave the context back (#599). The lost backend's GPU objects are gone and luma's device no
+   * longer matches the context, so the engine swaps in a fresh WebGL backend on a new canvas: the swap
+   * re-pushes the layers, the view, the selection and the labels, and a GPU layout continues as on any swap.
+   * The restored context's canvas goes with the old backend.
+   */
+  private readonly onContextRestored = (e: Event): void => {
+    if (e.target !== this.handle?.element || this.destroyed) return;
+    this.clearRestoreTimer();
+    this.ready = this.swapBackend("webgl").catch((err: unknown) => {
+      if (this.destroyed) return;
+      console.warn("d3gl: the WebGL context came back, but a new WebGL backend could not be created", err);
+      this.reportContextLoss();
+    });
+  };
 
   private async swapBackend(type: BackendType): Promise<void> {
     const token = ++this.swapToken;

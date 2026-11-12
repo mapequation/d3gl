@@ -477,6 +477,11 @@ export interface Backend {
    */
   readonly stylesNeedDrawables?: boolean;
   /**
+   * True once the browser has taken the backend's WebGL context away (#599): the backend draws nothing
+   * from then on, so the engine treats it as not current and replaces it. Absent means never lost (Canvas, SVG).
+   */
+  readonly contextLost?: boolean;
+  /**
    * Flags-only fast path (optional): ONLY the per-drawable visibility flags changed —
    * colours and geometry did not (the per-frame declutter show/hide, #208). `flags` is a
    * LIVE view of the Scene's persistent flags table (one byte per drawable, drawableId-

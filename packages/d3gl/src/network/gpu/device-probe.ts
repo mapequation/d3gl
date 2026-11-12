@@ -13,8 +13,9 @@
  *   more than a half float's range and mantissa).
  *
  * A probe that throws is reported as `blendProbe: "error"` (its own reason, not "driver bug") and cached
- * like any verdict, so later layouts neither probe again nor throw. A lost context is the exception: its
- * record is not cached, because nothing it measured says anything about the device.
+ * like any verdict, so later layouts neither probe again nor throw. A lost context is the exception: it is
+ * not probed (a shader compiled on it fails and luma shows its error overlay, #599) and its record is not
+ * cached, because nothing measured on it says anything about the device.
  */
 import type { Device, Framebuffer, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
@@ -102,7 +103,8 @@ export function gpuCaps(device: Device | null | undefined): GpuCaps | null {
   let blendProbe: BlendProbe | null = null;
   // An rg32f target needs float render targets; the blend draw also needs float blending (without it the
   // draw is an INVALID_OPERATION, which the extension check already reports more clearly).
-  if (device.type === "webgl" && base.floatRenderable) {
+  // A lost context takes no probe (#599): luma would compile the probe's shader on it and show its error overlay.
+  if (device.type === "webgl" && base.floatRenderable && !device.isLost) {
     const probed = withProbeTarget(device, (fbo) => ({
       readRG: cachedReadsRG(device, fbo),
       blendProbe: base.floatBlend ? probeFloatBlend(device, fbo) : null,
@@ -125,6 +127,7 @@ export function gpuCaps(device: Device | null | undefined): GpuCaps | null {
 export function deviceReadsRG(device: Device): boolean {
   const hit = readFormats.get(device);
   if (hit !== undefined) return hit;
+  if (device.isLost) return false; // no probe on a lost context (#599)
   return withProbeTarget(device, (fbo) => cachedReadsRG(device, fbo)) ?? false;
 }
 
