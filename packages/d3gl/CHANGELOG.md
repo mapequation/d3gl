@@ -1,5 +1,19 @@
 # @mapequation/d3gl
 
+## 0.16.0
+
+### Minor Changes
+
+- [#601](https://github.com/mapequation/d3gl/pull/601) [`749f47b`](https://github.com/mapequation/d3gl/commit/749f47b21b682affb2ab56439e529fa66f9fdc85) Thanks [@danieledler](https://github.com/danieledler)! - The GPU network layout starts again on luma.gl 9.4. Before this fix, it always fell back to the CPU worker with "shadertools: assertion failed".
+
+  d3gl now declares luma.gl `~9.4.2`, which takes patch releases only. A new luma.gl minor reaches apps only through a d3gl release that has been tested on it.
+
+  **Breaking:** an app that also uses luma.gl 9.3 itself, for example through deck.gl 9.3, must move to luma.gl 9.4. Otherwise it loads two copies of luma.gl, and luma.gl throws "multiple versions detected".
+
+### Patch Changes
+
+- [#602](https://github.com/mapequation/d3gl/pull/602) [`128920a`](https://github.com/mapequation/d3gl/commit/128920a614ba19077274ee1a970cecd02a8d284d) Thanks [@danieledler](https://github.com/danieledler)! - A lost WebGL context no longer breaks the page ([#599](https://github.com/mapequation/d3gl/issues/599)). The WebGL backend stops drawing and builds nothing while the context is gone, so luma.gl shows no shader-error overlay and nothing throws. When the browser gives the context back, the engine redraws the same layers, view and selection on a fresh WebGL backend. Data and style changes made while the context is gone are kept, so `toSVG()` exports them and the redraw shows them; `toPNG()` throws a clear error while the context is gone instead of returning a blank image. The new engine option `onContextUnrestored` is called once when the context has not come back after 10 s, or when it came back but the new WebGL backend could not be built. `setBackend("webgl")` while the context is lost rebuilds at once, and the replaced backend's context is released instead of staying alive until garbage collection.
+
 ## 0.15.0
 
 ### Minor Changes
